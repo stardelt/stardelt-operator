@@ -1,6 +1,6 @@
-# Stardelt Operator
+# stardelt Operator
 
-Kubernetes operator for Stardelt. Reconciles the `Lakehouse`, `PlatformInstance`, `Tenant`,
+Kubernetes operator for stardelt. Reconciles the `Lakehouse`, `PlatformInstance`, `Tenant`,
 `Pipeline`, `StreamApp`, and `MLWorkspace` CRDs — composing upstream best-of-breed projects
 (Trino, Lakekeeper, Iceberg, Spark, Airflow, RisingWave, KubeRay, …) into a single declarative
 experience.
@@ -16,7 +16,7 @@ for the implementation milestone.
 
 | CRD | Purpose |
 |---|---|
-| `PlatformInstance` | Cluster-scoped: declares which Stardelt pillars + foundations are installed |
+| `PlatformInstance` | Cluster-scoped: declares which stardelt pillars + foundations are installed |
 | `Tenant` | Namespaced scope of data + identities; isolation boundary |
 | `Lakehouse` | A managed Trino + Lakekeeper + Iceberg unit on object storage |
 | `Pipeline` | Batch ETL workload (Spark/Airflow/dbt) bound to a Tenant + Lakehouse |
