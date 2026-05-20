@@ -12,7 +12,7 @@ async fn main() -> Result<()> {
     tracing::info!("stardelt-operator v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!(
         "stardelt-operator is a placeholder — see ROADMAP Stage 4 at \
-        https://docs.stardelt.io/roadmap"
+        https://stardelt.io/roadmap"
     );
 
     // Placeholder: sleep forever so the binary stays alive if deployed in a pod.

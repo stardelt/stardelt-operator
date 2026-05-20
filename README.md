@@ -49,6 +49,6 @@ chart/                           # Helm chart for the operator — TBD
 
 ## Links
 
-- [docs.stardelt.io/roadmap](https://docs.stardelt.io/roadmap)
-- [docs.stardelt.io/architecture/overview](https://docs.stardelt.io/architecture/overview)
-- [docs.stardelt.io/design/master-spec](https://docs.stardelt.io/design/master-spec)
+- [stardelt.io/roadmap](https://stardelt.io/roadmap)
+- [stardelt.io/architecture/overview](https://stardelt.io/architecture/overview)
+- [stardelt.io/design/master-spec](https://stardelt.io/design/master-spec)
