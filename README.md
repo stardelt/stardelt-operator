@@ -7,7 +7,7 @@ experience.
 
 ## Status
 
-**Phase 0 / Stage 4 — skeleton only, no reconcile logic yet.**
+**Pre-alpha — skeleton only, no reconcile logic yet.** Part of the broader stardelt MVP / vibecoding push; everything here is expected to change fast.
 
 Watch [github.com/stardelt/stardelt-operator/issues/1](https://github.com/stardelt/stardelt-operator/issues/1)
 for the implementation milestone.
