@@ -40,7 +40,7 @@ pub const REPOS: &[Repo] = &[
     },
     Repo {
         name: "lakekeeper",
-        url: "https://charts.lakekeeper.io",
+        url: "https://lakekeeper.github.io/lakekeeper-charts/",
     },
     Repo {
         name: "trino",
