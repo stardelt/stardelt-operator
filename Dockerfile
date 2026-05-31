@@ -3,7 +3,11 @@
 # Multi-stage build for the stardelt-operator, mirroring stardelt-nova's image.
 
 # ------- Stage 1: build -------
-FROM rust:1-slim AS build
+# Pin to bookworm so the build-stage glibc matches the bookworm-slim runtime
+# below. The unqualified `rust:1-slim` tracks the latest Debian (trixie,
+# glibc 2.39), which produces a binary that fails on bookworm (glibc 2.36) with
+# `version GLIBC_2.39 not found`.
+FROM rust:1-bookworm AS build
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
 
