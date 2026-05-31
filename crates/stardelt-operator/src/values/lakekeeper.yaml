@@ -1,0 +1,34 @@
+# Lakekeeper — Iceberg REST catalog.
+# Chart: lakekeeper/lakekeeper 0.11.0, appVersion 0.12.2.
+#
+# Decisions for the MVP:
+#   - bundled postgres OFF → use CNPG Cluster `lakekeeper-pg`
+#   - bundled OpenFGA OFF → authz backend = "allowall" (no real authz)
+#   - helmWait true so `helm upgrade --wait` blocks until migrations land
+
+helmWait: true
+
+postgresql:
+  enabled: false
+
+externalDatabase:
+  type: postgres
+  host_read:  lakekeeper-pg-rw.stardelt.svc.cluster.local
+  host_write: lakekeeper-pg-rw.stardelt.svc.cluster.local
+  port: 5432
+  database: lakekeeper
+  userSecret: lakekeeper-pg-app
+  userSecretKey: username
+  passwordSecret: lakekeeper-pg-app
+  passwordSecretKey: password
+
+authz:
+  backend: allowall
+
+internalOpenFGA: false
+
+catalog:
+  replicas: 1
+  resources:
+    requests: { cpu: "50m",  memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "512Mi" }

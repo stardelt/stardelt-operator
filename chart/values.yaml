@@ -1,0 +1,38 @@
+# Default values for the stardelt-operator chart.
+
+image:
+  repository: ghcr.io/stardelt/operator
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# Number of operator replicas. Leader election is not yet implemented, so keep
+# this at 1 (a second replica would double-reconcile).
+replicaCount: 1
+
+# Install the PlatformInstance CRD as part of the release. Set to false if you
+# manage CRDs out-of-band (e.g. `cargo run -- crd | kubectl apply -f -`).
+installCRD: true
+
+serviceAccount:
+  create: true
+  name: stardelt-operator
+
+# Operator process configuration (maps to STARDELT_OPERATOR_* env vars).
+config:
+  fieldManager: stardelt-operator
+  resyncSecs: 300
+  pollSecs: 10
+
+logLevel: info
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

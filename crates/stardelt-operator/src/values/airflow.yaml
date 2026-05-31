@@ -1,0 +1,126 @@
+# Apache Airflow — DAG-based orchestrator. The NYC TLC loader runs as the
+# `nyc_taxi_load` DAG, baked into a custom image `stardelt/airflow:dev`
+# (see airflow-image/Dockerfile, dags/nyc_taxi_load.py).
+#
+# Chart: apache-airflow/airflow 1.21.0, appVersion 3.2.0.
+#
+# kind tuning:
+#   - executor: KubernetesExecutor — no celery, no redis, no workers
+#   - bundled Postgres (Bitnami sub-chart) — single instance, low resources.
+#     Could be migrated to CNPG later; bundled keeps this minimal for now.
+#   - single replicas of api-server / scheduler / dag-processor / triggerer
+#   - heavy resource trims for laptop-scale
+
+executor: KubernetesExecutor
+
+# stardelt-owned image with DAGs baked in
+images:
+  airflow:
+    repository: stardelt/airflow
+    tag: dev
+    pullPolicy: IfNotPresent
+
+# Stable Fernet/JWT/internal-API secret (kind-only, NEVER use in real envs).
+# Without these the chart auto-generates, but a re-install would invalidate
+# the database; pinning here makes upgrades safe.
+fernetKey: "5oYDV8KzcRrChx4tWN5gP1NQXMRr9CkBaVYU6jLDB2I="
+jwtSecret: "stardelt-mvp-jwt-do-not-use-in-prod"
+
+# DAGs come from the image, not gitSync
+dags:
+  gitSync:
+    enabled: false
+  persistence:
+    enabled: false
+
+# Logs in emptyDir — fine for kind, lost on pod restart
+logs:
+  persistence:
+    enabled: false
+
+# Stateful components turned off
+redis:
+  enabled: false
+
+# Celery workers — KubernetesExecutor doesn't use them; 0 replicas
+workers:
+  replicas: 0
+  persistence:
+    enabled: false
+
+# Bundled Postgres — single instance, small storage
+postgresql:
+  enabled: true
+  primary:
+    persistence:
+      size: 2Gi
+    resources:
+      requests: { cpu: "50m",  memory: "256Mi" }
+      limits:   { cpu: "1",    memory: "512Mi" }
+
+# Single-replica + smaller resources for each Airflow component
+apiServer:
+  replicas: 1
+  service:
+    type: ClusterIP
+  resources:
+    requests: { cpu: "100m", memory: "384Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"   }
+
+scheduler:
+  replicas: 1
+  resources:
+    requests: { cpu: "100m", memory: "384Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"   }
+
+dagProcessor:
+  enabled: true
+  replicas: 1
+  resources:
+    requests: { cpu: "50m",  memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "512Mi" }
+
+triggerer:
+  enabled: true
+  replicas: 1
+  persistence:
+    enabled: false
+  resources:
+    requests: { cpu: "50m",  memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "512Mi" }
+
+# Static admin user for the dev environment. Same convention as the
+# static-dev-user in Nova (Stage 3): no real auth in MVP.
+webserverSecretKey: "stardelt-mvp-webserver-key"
+
+# Plain-value envs on every Airflow container (including spawned K8s task pods).
+env:
+  - name: CATALOG_URI
+    value: http://lakekeeper.stardelt.svc.cluster.local:8181/catalog
+  - name: CATALOG_WAREHOUSE
+    value: warehouse
+  - name: YEARS
+    value: "2023"
+
+# Secret-backed envs use extraEnv (templated string accepting valueFrom).
+extraEnv: |
+  - name: S3_ENDPOINT
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: endpoint
+  - name: S3_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: access-key
+  - name: S3_SECRET_KEY
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: secret-key
+  - name: S3_REGION
+    valueFrom:
+      secretKeyRef:
+        name: ozone-s3-creds
+        key: region

@@ -1,0 +1,16 @@
+apiVersion: v2
+name: stardelt-operator
+description: Kubernetes operator that reconciles the stardelt PlatformInstance CRD into the core data-platform stack.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://stardelt.io
+sources:
+  - https://github.com/stardelt/stardelt-operator
+keywords:
+  - stardelt
+  - lakehouse
+  - operator
+maintainers:
+  - name: stardelt
+    url: https://stardelt.io

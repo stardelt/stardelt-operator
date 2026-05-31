@@ -1,0 +1,57 @@
+# SeaweedFS — S3-compatible storage for the MVP.
+# Chart: seaweedfs/seaweedfs 4.25.1, appVersion 4.25.
+#
+# Chosen as the documented fallback when Apache Ozone's S3 Gateway proved
+# unable to honor replication=ONE on single-datanode kind (see docs/MVP.md).
+# SeaweedFS gives us the same S3 surface without the Hadoop-era complexity.
+
+master:
+  replicas: 1
+  data:
+    type: persistentVolumeClaim
+    size: 1Gi
+  defaultReplication: "000"
+  resources:
+    requests: { cpu: "50m", memory: "128Mi" }
+    limits:   { cpu: "1",   memory: "256Mi" }
+
+volume:
+  replicas: 1
+  # PVC so the Iceberg data files survive pod restarts. emptyDir wipes on
+  # pod restart, which orphans the Iceberg metadata pointing at the files
+  # and surfaces as FileNotFoundException on Trino reads.
+  dataDirs:
+    - name: data
+      type: persistentVolumeClaim
+      size: 20Gi
+      maxVolumes: 0
+  resources:
+    requests: { cpu: "200m", memory: "512Mi" }
+    limits:   { cpu: "2",    memory: "2Gi"  }
+
+filer:
+  replicas: 1
+  data:
+    type: persistentVolumeClaim
+    size: 1Gi
+  resources:
+    requests: { cpu: "50m", memory: "128Mi" }
+    limits:   { cpu: "1",   memory: "256Mi" }
+
+s3:
+  enabled: true
+  replicas: 1
+  port: 8333
+  enableAuth: true
+  # Pin credentials so they match the existing s3-creds Secret instead of
+  # auto-generating random ones.
+  credentials:
+    admin:
+      accessKey: stardelt-access-key
+      secretKey: stardelt-secret-key
+  createBuckets:
+    - name: lakehouse
+      anonymousRead: false
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"  }

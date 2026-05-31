@@ -1,0 +1,112 @@
+# Apache Superset — BI / dashboards.
+# Chart: superset/superset 0.15.5, appVersion 5.0.0.
+#
+# kind tuning:
+#   - Single replica everywhere; celery-beat + websockets off.
+#   - Bundled Postgres + Redis (Bitnami sub-charts) — could later migrate the
+#     Postgres to CNPG to consolidate, kept bundled for MVP simplicity.
+#   - bootstrapScript installs the `trino` python driver into the running pod
+#     on each startup. For production, bake this into a custom image.
+#   - Talisman / X-Frame-Options disabled so Nova can iframe Superset.
+#     MVP-only: removes click-jacking protection.
+#   - import_datasources.yaml pre-creates the Trino warehouse database
+#     connection so SQL Lab works immediately after install.
+
+# Use the stardelt-owned image (superset-image/Dockerfile) which has
+# psycopg2-binary + trino pre-installed in /app/.venv/. The chart's default
+# bootstrap is fine; we just leave the marker file.
+image:
+  repository: stardelt/superset
+  tag: dev
+  pullPolicy: IfNotPresent
+
+bootstrapScript: |
+  #!/bin/bash
+  if [ ! -f ~/bootstrap ]; then echo "Running Superset" > ~/bootstrap; fi
+
+# Allow iframe embedding from Nova (running on a different port locally).
+configOverrides:
+  iframe_embedding: |
+    TALISMAN_ENABLED = False
+    # Flask-AppBuilder also sets X-Frame-Options via WTF_CSRF; suppress.
+    HTTP_HEADERS = {}
+    # Allow SameSite=None cookies if you ever want cross-site auth.
+    SESSION_COOKIE_SAMESITE = "Lax"
+    # ENABLE_PROXY_FIX so x-forwarded headers are honored when iframed.
+    ENABLE_PROXY_FIX = True
+
+# Pin Superset's secret key (MVP only — generate a real one for prod).
+extraSecretEnv:
+  SUPERSET_SECRET_KEY: "stardelt-mvp-superset-secret-do-not-use-in-prod-32-chars"
+
+# Pre-import the Trino database connection on init.
+extraConfigs:
+  import_datasources.yaml: |
+    databases:
+    - database_name: Trino Warehouse
+      sqlalchemy_uri: trino://stardelt-dev@trino.stardelt.svc.cluster.local:8080/warehouse
+      tables: []
+
+# init Job creates admin user + imports the datasource above.
+init:
+  adminUser:
+    username: admin
+    firstname: stardelt
+    lastname: Admin
+    email: admin@stardelt.local
+    password: admin
+  loadExamples: false
+
+# Components
+supersetNode:
+  replicas:
+    enabled: true
+    replicaCount: 1
+  resources:
+    requests: { cpu: "100m", memory: "512Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"  }
+
+supersetWorker:
+  replicas:
+    enabled: true
+    replicaCount: 1
+  # Default celery prefork concurrency = CPU count = 24+ on this host, which
+  # OOMs the worker pod (each prefork is a full Python process). Cap to 2.
+  command:
+    - "/bin/sh"
+    - "-c"
+    - ". {{ .Values.configMountPath }}/superset_bootstrap.sh; celery --app=superset.tasks.celery_app:app worker --concurrency=2"
+  resources:
+    requests: { cpu: "100m", memory: "512Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"  }
+
+supersetCeleryBeat:
+  enabled: false
+
+supersetWebsockets:
+  enabled: false
+
+# Bundled deps
+postgresql:
+  enabled: true
+  primary:
+    persistence:
+      size: 2Gi
+    resources:
+      requests: { cpu: "50m", memory: "256Mi" }
+      limits:   { cpu: "1",   memory: "512Mi" }
+
+redis:
+  enabled: true
+  master:
+    persistence:
+      size: 1Gi
+    resources:
+      requests: { cpu: "50m", memory: "128Mi" }
+      limits:   { cpu: "1",   memory: "256Mi" }
+  replica:
+    replicaCount: 0
+
+service:
+  type: ClusterIP
+  port: 8088

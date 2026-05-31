@@ -1,0 +1,25 @@
+# A minimal PlatformInstance for a kind / dev cluster.
+# Brings up the full core stack in the `stardelt` namespace. The s3 credentials
+# here MUST match the SeaweedFS admin credentials the operator configures (these
+# defaults already do — see crates/.../api/platform_instance.rs S3Spec::default).
+apiVersion: platform.stardelt.io/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: stardelt
+spec:
+  namespace: stardelt
+  s3:
+    accessKey: stardelt-access-key
+    secretKey: stardelt-secret-key
+    bucket: lakehouse
+    region: us-east-1
+  storage:
+    volumeSize: 20Gi
+    postgresSize: 2Gi
+  components:
+    trino:
+      workers: 1
+    airflowEnabled: true
+    supersetEnabled: true
+    nova:
+      image: stardelt/nova:dev

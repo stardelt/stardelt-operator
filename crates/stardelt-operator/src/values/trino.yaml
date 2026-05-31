@@ -1,0 +1,61 @@
+# Trino — MPP SQL engine.
+# Chart: trino/trino 1.42.2, appVersion 480.
+#
+# Catalog `warehouse` connects to Lakekeeper (REST Iceberg catalog) and
+# reads/writes Parquet on Ozone via its native S3 filesystem. Credentials
+# come from the `ozone-s3-creds` Secret via env-var substitution
+# (`${ENV:OZONE_ACCESS_KEY}`).
+#
+# kind tuning: 1 worker, conservative JVM heap.
+
+server:
+  workers: 1
+  config:
+    query:
+      maxMemory: "2GB"
+
+coordinator:
+  jvm:
+    maxHeapSize: "2G"
+    gcMethod:
+      type: UseG1GC
+  # Cap per-node so it stays well below heap (heap headroom defaults to ~30%).
+  additionalJVMConfig:
+    - "-Xms1G"
+  additionalExposedPorts: {}
+
+worker:
+  jvm:
+    maxHeapSize: "2G"
+    gcMethod:
+      type: UseG1GC
+  additionalJVMConfig:
+    - "-Xms1G"
+
+# Pull S3 creds from the Ozone secret so catalog properties can substitute
+# ${ENV:OZONE_ACCESS_KEY} / ${ENV:OZONE_SECRET_KEY}.
+env:
+  - name: OZONE_ACCESS_KEY
+    valueFrom: { secretKeyRef: { name: ozone-s3-creds, key: access-key } }
+  - name: OZONE_SECRET_KEY
+    valueFrom: { secretKeyRef: { name: ozone-s3-creds, key: secret-key } }
+
+catalogs:
+  warehouse: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://lakekeeper.stardelt.svc.cluster.local:8181/catalog
+    iceberg.rest-catalog.warehouse=warehouse
+    iceberg.rest-catalog.vended-credentials-enabled=false
+    fs.native-s3.enabled=true
+    s3.endpoint=http://seaweedfs-s3.stardelt.svc.cluster.local:8333
+    s3.region=us-east-1
+    s3.path-style-access=true
+    s3.aws-access-key=${ENV:OZONE_ACCESS_KEY}
+    s3.aws-secret-key=${ENV:OZONE_SECRET_KEY}
+    # Single-replica SeaweedFS volume server can't sustain Trino's default
+    # parallel HTTP range requests (broken pipe / connection reset). Throttle
+    # both connection pool and the Iceberg metadata enumeration threads.
+    s3.max-connections=16
+    iceberg.split-manager-threads=4
+    iceberg.metadata.parallelism=2
