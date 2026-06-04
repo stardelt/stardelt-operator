@@ -75,7 +75,16 @@ async fn reconcile(pi: Arc<PlatformInstance>, ctx: Arc<Context>) -> Result<Actio
 
     info!(name = %name, namespace = %ns, "reconciling PlatformInstance");
 
-    let mut conditions: Vec<Condition> = Vec::new();
+    // Seed from the object's current status so `upsert` can preserve the
+    // `lastTransitionTime` of conditions whose status is unchanged. Starting from
+    // an empty vec re-stamps every condition with `now` each pass, which makes the
+    // status patch always differ, bumps resourceVersion, and re-triggers our own
+    // watch — a self-sustaining reconcile hot loop.
+    let mut conditions: Vec<Condition> = pi
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
 
     // Step 0: target namespace.
     ensure_namespace(client, fm, &ns).await?;

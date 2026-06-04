@@ -285,6 +285,44 @@ mod tests {
     }
 
     #[test]
+    fn airflow_values_are_production_clean() {
+        // The operator deploys a clean platform: airflow must use the chart's
+        // stock image (no custom `stardelt/airflow:dev`, which never existed in
+        // a registry and caused ImagePullBackOff) and carry none of the demo
+        // DAG's env. Demos re-inject those via a gitSync overlay.
+        let pi = instance();
+        let airflow = values_for(&pi, &AIRFLOW).unwrap();
+        let serialized = serde_json::to_string(&airflow).unwrap();
+        assert!(
+            !serialized.contains("stardelt/airflow"),
+            "airflow values must not pin a custom image"
+        );
+        for demo_key in ["CATALOG_URI", "CATALOG_WAREHOUSE", "S3_ENDPOINT"] {
+            assert!(
+                !serialized.contains(demo_key),
+                "demo env `{demo_key}` must not be in production airflow values"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_charts_use_stock_images() {
+        // No stardelt-owned `:dev` image should be pinned for any upstream
+        // chart — those were never published and caused ImagePullBackOff. The
+        // platform stays as vanilla as possible; mandatory drivers (e.g.
+        // Superset's psycopg2/trino) are installed at startup, not baked.
+        for chart in [&SEAWEEDFS, &LAKEKEEPER, &TRINO, &AIRFLOW, &SUPERSET] {
+            let pi = instance();
+            let serialized = serde_json::to_string(&values_for(&pi, chart).unwrap()).unwrap();
+            assert!(
+                !serialized.contains("stardelt/"),
+                "{} values must not pin a stardelt-owned image",
+                chart.release
+            );
+        }
+    }
+
+    #[test]
     fn spec_knobs_override_embedded_defaults() {
         let mut pi = instance();
         pi.spec.components.trino.workers = 7;

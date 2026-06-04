@@ -1,8 +1,10 @@
-# Apache Airflow — DAG-based orchestrator. The NYC TLC loader runs as the
-# `nyc_taxi_load` DAG, baked into a custom image `stardelt/airflow:dev`
-# (see airflow-image/Dockerfile, dags/nyc_taxi_load.py).
+# Apache Airflow — DAG-based orchestrator.
 #
 # Chart: apache-airflow/airflow 1.21.0, appVersion 3.2.0.
+# Uses the chart's default apache/airflow:3.2.0 image (no custom image), so
+# nothing here needs syncing when the chart version bumps. This is the clean
+# platform deployment — DAGs are NOT baked in. Demos inject the nyc_taxi_load
+# DAG (and its catalog/S3 env) separately via gitSync; see stardelt-demos.
 #
 # kind tuning:
 #   - executor: KubernetesExecutor — no celery, no redis, no workers
@@ -13,12 +15,18 @@
 
 executor: KubernetesExecutor
 
-# stardelt-owned image with DAGs baked in
-images:
-  airflow:
-    repository: stardelt/airflow
-    tag: dev
-    pullPolicy: IfNotPresent
+# DB migrations + the default-user job must run as plain manifests, NOT Helm
+# hooks. The chart defaults these to post-install hooks; under Flux/helm `--wait`
+# Helm waits for the Deployments to become Ready *before* firing the hooks, but
+# every component blocks on its `wait-for-airflow-migrations` init until the
+# migrate job has run — a deadlock that leaves the DB unmigrated. Disabling the
+# hooks lets the jobs apply alongside the Deployments and break the cycle.
+migrateDatabaseJob:
+  useHelmHooks: false
+  applyCustomEnv: false
+createUserJob:
+  useHelmHooks: false
+  applyCustomEnv: false
 
 # Stable Fernet/JWT/internal-API secret (kind-only, NEVER use in real envs).
 # Without these the chart auto-generates, but a re-install would invalidate
@@ -92,35 +100,3 @@ triggerer:
 # Static admin user for the dev environment. Same convention as the
 # static-dev-user in Nova (Stage 3): no real auth in MVP.
 webserverSecretKey: "stardelt-mvp-webserver-key"
-
-# Plain-value envs on every Airflow container (including spawned K8s task pods).
-env:
-  - name: CATALOG_URI
-    value: http://lakekeeper.stardelt.svc.cluster.local:8181/catalog
-  - name: CATALOG_WAREHOUSE
-    value: warehouse
-  - name: YEARS
-    value: "2023"
-
-# Secret-backed envs use extraEnv (templated string accepting valueFrom).
-extraEnv: |
-  - name: S3_ENDPOINT
-    valueFrom:
-      secretKeyRef:
-        name: ozone-s3-creds
-        key: endpoint
-  - name: S3_ACCESS_KEY
-    valueFrom:
-      secretKeyRef:
-        name: ozone-s3-creds
-        key: access-key
-  - name: S3_SECRET_KEY
-    valueFrom:
-      secretKeyRef:
-        name: ozone-s3-creds
-        key: secret-key
-  - name: S3_REGION
-    valueFrom:
-      secretKeyRef:
-        name: ozone-s3-creds
-        key: region

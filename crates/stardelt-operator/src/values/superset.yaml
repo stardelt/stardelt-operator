@@ -5,23 +5,32 @@
 #   - Single replica everywhere; celery-beat + websockets off.
 #   - Bundled Postgres + Redis (Bitnami sub-charts) — could later migrate the
 #     Postgres to CNPG to consolidate, kept bundled for MVP simplicity.
-#   - bootstrapScript installs the `trino` python driver into the running pod
-#     on each startup. For production, bake this into a custom image.
+#   - bootstrapScript installs the two mandatory drivers into the running pod
+#     on each startup (see below).
 #   - Talisman / X-Frame-Options disabled so Nova can iframe Superset.
 #     MVP-only: removes click-jacking protection.
 #   - import_datasources.yaml pre-creates the Trino warehouse database
 #     connection so SQL Lab works immediately after install.
 
-# Use the stardelt-owned image (superset-image/Dockerfile) which has
-# psycopg2-binary + trino pre-installed in /app/.venv/. The chart's default
-# bootstrap is fine; we just leave the marker file.
+# Stock Apache Superset image — keep the platform deployment as vanilla as
+# possible (no stardelt-owned image to build/publish). The two drivers the
+# upstream venv omits are MANDATORY platform deps, not demo extras, so they are
+# installed at pod startup via bootstrapScript instead:
+#   - psycopg2-binary: connect to the chart's bundled Postgres backend (without
+#     it the init-db job and gunicorn workers crash).
+#   - trino:           SQLAlchemy driver for the Trino warehouse catalog.
+# Versions match what the old custom image (images/superset/Dockerfile) baked.
+# A future "demos v2" image-injection layer can bake these for faster starts.
 image:
-  repository: stardelt/superset
-  tag: dev
+  repository: apache/superset
+  tag: "5.0.0"
   pullPolicy: IfNotPresent
 
 bootstrapScript: |
   #!/bin/bash
+  uv pip install --python /app/.venv/bin/python --no-cache \
+      psycopg2-binary==2.9.10 \
+      trino==0.330.0
   if [ ! -f ~/bootstrap ]; then echo "Running Superset" > ~/bootstrap; fi
 
 # Allow iframe embedding from Nova (running on a different port locally).
