@@ -23,6 +23,10 @@ pub mod chart_versions {
     pub const TRINO: &str = "1.42.2";
     pub const AIRFLOW: &str = "1.21.0";
     pub const SUPERSET: &str = "0.15.5";
+    /// cert-manager Helm chart (jetstack), installed only when spec.ingress is set.
+    pub const CERT_MANAGER: &str = "1.16.2";
+    /// oauth2-proxy image (deployed as a native Deployment, not a chart).
+    pub const OAUTH2_PROXY_IMAGE: &str = "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0";
 }
 
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -59,6 +63,52 @@ pub struct PlatformInstanceSpec {
     /// [`chart_versions`] constants are used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chart_versions: Option<ChartVersionOverrides>,
+
+    /// Optional ingress + SSO. When present, the operator installs cert-manager,
+    /// a wildcard TLS cert, oauth2-proxy, and host-routed Ingresses. When absent,
+    /// the platform is reachable only via port-forward / bring-your-own ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<IngressSpec>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IngressSpec {
+    /// Base domain; UIs are exposed at `<service>.<domain>`. E.g. `lab.stardelt.io`.
+    pub domain: String,
+    #[serde(default)]
+    pub tls: TlsSpec,
+    pub sso: SsoSpec,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TlsSpec {
+    /// ACME directory URL. Default: Let's Encrypt production.
+    #[serde(default = "default_acme_server")]
+    pub acme_server: String,
+    /// ACME registration email.
+    #[serde(default = "default_acme_email")]
+    pub email: String,
+}
+
+impl Default for TlsSpec {
+    fn default() -> Self {
+        Self { acme_server: default_acme_server(), email: default_acme_email() }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SsoSpec {
+    /// oauth2-proxy provider. MVP supports `github`.
+    #[serde(default = "default_sso_provider")]
+    pub provider: String,
+    /// GitHub org whose members are allowed in.
+    pub org_name: String,
+    /// Name of a pre-created Secret with `client-id`, `client-secret`, `cookie-secret`.
+    #[serde(default = "default_oauth_secret")]
+    pub credentials_secret: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -202,4 +252,52 @@ fn default_true() -> bool {
 }
 fn default_nova_image() -> String {
     "stardelt/nova:dev".into()
+}
+fn default_acme_server() -> String {
+    "https://acme-v02.api.letsencrypt.org/directory".into()
+}
+fn default_acme_email() -> String {
+    "admin@stardelt.io".into()
+}
+fn default_sso_provider() -> String {
+    "github".into()
+}
+fn default_oauth_secret() -> String {
+    "oauth2-proxy-creds".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn from_json(v: serde_json::Value) -> PlatformInstanceSpec {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn ingress_is_absent_by_default() {
+        let spec = from_json(serde_json::json!({ "namespace": "stardelt" }));
+        assert!(spec.ingress.is_none(), "ingress must default to None");
+    }
+
+    #[test]
+    fn ingress_parses_and_defaults_fill_in() {
+        let spec = from_json(serde_json::json!({
+            "namespace": "stardelt",
+            "ingress": { "domain": "lab.stardelt.io", "sso": { "orgName": "stardelt" } }
+        }));
+        let ing = spec.ingress.expect("ingress present");
+        assert_eq!(ing.domain, "lab.stardelt.io");
+        assert_eq!(ing.sso.org_name, "stardelt");
+        assert_eq!(ing.sso.provider, "github"); // default
+        assert_eq!(ing.sso.credentials_secret, "oauth2-proxy-creds"); // default
+        assert_eq!(ing.tls.acme_server, "https://acme-v02.api.letsencrypt.org/directory");
+        assert_eq!(ing.tls.email, "admin@stardelt.io");
+    }
+
+    #[test]
+    fn ingress_versions_are_pinned() {
+        assert_eq!(chart_versions::CERT_MANAGER, "1.16.2");
+        assert_eq!(chart_versions::OAUTH2_PROXY_IMAGE, "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0");
+    }
 }
