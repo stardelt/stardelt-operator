@@ -27,6 +27,11 @@ pub mod chart_versions {
     pub const CERT_MANAGER: &str = "1.16.2";
     /// oauth2-proxy image (deployed as a native Deployment, not a chart).
     pub const OAUTH2_PROXY_IMAGE: &str = "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0";
+    /// Keycloak Helm chart (bitnami). Installed only when spec.sso is set.
+    // `allow(dead_code)`: first consumed by resources/keycloak.rs (Task 1.3);
+    // until then only the test references it. Remove once keycloak.rs lands.
+    #[allow(dead_code)]
+    pub const KEYCLOAK: &str = "24.4.13";
 }
 
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -69,6 +74,28 @@ pub struct PlatformInstanceSpec {
     /// the platform is reachable only via port-forward / bring-your-own ingress.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress: Option<IngressSpec>,
+
+    /// Optional Keycloak-based SSO. When present, the operator installs Keycloak
+    /// (with its own CNPG Postgres) brokering GitHub, and wires the core apps as
+    /// OIDC clients. When absent, no Keycloak is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso: Option<KeycloakSsoSpec>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KeycloakSsoSpec {
+    /// Base domain; Keycloak is served at `auth.<domain>`. E.g. `lab.stardelt.io`.
+    pub domain: String,
+    /// Keycloak realm name. Default `stardelt`.
+    #[serde(default = "default_realm")]
+    pub realm: String,
+    /// Name of a pre-created Secret with `client-id` / `client-secret` for the
+    /// GitHub identity-provider broker.
+    pub github_broker_secret: String,
+    /// OIDC client id issued to Nova. Default `nova`.
+    #[serde(default = "default_nova_client_id")]
+    pub nova_client_id: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -268,6 +295,12 @@ fn default_sso_provider() -> String {
 fn default_oauth_secret() -> String {
     "oauth2-proxy-creds".into()
 }
+fn default_realm() -> String {
+    "stardelt".into()
+}
+fn default_nova_client_id() -> String {
+    "nova".into()
+}
 
 #[cfg(test)]
 mod tests {
@@ -308,5 +341,29 @@ mod tests {
             chart_versions::OAUTH2_PROXY_IMAGE,
             "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0"
         );
+    }
+
+    #[test]
+    fn sso_is_absent_by_default() {
+        let spec = from_json(serde_json::json!({ "namespace": "stardelt" }));
+        assert!(spec.sso.is_none(), "sso must default to None");
+    }
+
+    #[test]
+    fn sso_parses_and_defaults_fill_in() {
+        let spec = from_json(serde_json::json!({
+            "namespace": "stardelt",
+            "sso": { "domain": "lab.stardelt.io", "githubBrokerSecret": "keycloak-github-broker" }
+        }));
+        let sso = spec.sso.expect("sso present");
+        assert_eq!(sso.domain, "lab.stardelt.io");
+        assert_eq!(sso.realm, "stardelt"); // default
+        assert_eq!(sso.github_broker_secret, "keycloak-github-broker");
+        assert_eq!(sso.nova_client_id, "nova"); // default
+    }
+
+    #[test]
+    fn keycloak_versions_are_pinned() {
+        assert_eq!(chart_versions::KEYCLOAK, "24.4.13");
     }
 }
