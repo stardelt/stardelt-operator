@@ -16,6 +16,7 @@ pub mod cnpg;
 pub mod flux;
 pub mod ingress;
 pub mod keycloak;
+pub mod keycloak_bootstrap;
 pub mod keycloak_pg;
 pub mod nova;
 pub mod secret;
