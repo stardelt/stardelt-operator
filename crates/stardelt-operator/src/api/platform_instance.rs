@@ -28,9 +28,6 @@ pub mod chart_versions {
     /// oauth2-proxy image (deployed as a native Deployment, not a chart).
     pub const OAUTH2_PROXY_IMAGE: &str = "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0";
     /// Keycloak Helm chart (bitnami). Installed only when spec.sso is set.
-    // `allow(dead_code)`: first consumed by resources/keycloak.rs (Task 1.3);
-    // until then only the test references it. Remove once keycloak.rs lands.
-    #[allow(dead_code)]
     pub const KEYCLOAK: &str = "24.4.13";
 }
 
