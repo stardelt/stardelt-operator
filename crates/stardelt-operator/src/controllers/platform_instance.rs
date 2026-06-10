@@ -31,7 +31,7 @@ use crate::api::PlatformInstance;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::readiness::{Condition, condition, ready_condition_true, upsert};
-use crate::resources::{self, bootstrap, cnpg, flux, nova, secret};
+use crate::resources::{self, bootstrap, cnpg, flux, ingress, nova, secret};
 
 /// Shared reconcile context.
 pub struct Context {
@@ -175,6 +175,11 @@ async fn reconcile(pi: Arc<PlatformInstance>, ctx: Arc<Context>) -> Result<Actio
     // Step 11: Nova Deployment + Service.
     gate!("NovaReady", apply_nova(&ctx, &pi, &owner).await?);
 
+    // Step 12: Ingress + SSO (optional).
+    if pi.spec.ingress.is_some() {
+        gate!("IngressReady", apply_ingress(&ctx, &pi, &owner_json).await?);
+    }
+
     // All steps ready.
     finish(&ctx, &pi, conditions, true).await
 }
@@ -272,6 +277,138 @@ async fn apply_nova(ctx: &Context, pi: &PlatformInstance, owner: &OwnerReference
     } else {
         Gate::Pending("Starting")
     })
+}
+
+/// Apply the full ingress stack and gate on the wildcard Certificate becoming
+/// Ready (cert issuance is the slow part). Only called when `spec.ingress` is set.
+async fn apply_ingress(ctx: &Context, pi: &PlatformInstance, owner_json: &Value) -> Result<Gate> {
+    let ns = &pi.spec.namespace;
+    let fm = &ctx.config.field_manager;
+    let client = &ctx.client;
+    let ing = pi
+        .spec
+        .ingress
+        .as_ref()
+        .expect("apply_ingress called without spec.ingress");
+
+    // jetstack repo + cert-manager release (own namespace, with CRDs).
+    resources::apply_dynamic(
+        client,
+        fm,
+        &flux::helm_repository_gvk(),
+        ns,
+        ingress::JETSTACK_REPO,
+        ingress::jetstack_repository(ns, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &flux::helm_release_gvk(),
+        ns,
+        "cert-manager",
+        ingress::cert_manager_release(ns, owner_json),
+    )
+    .await?;
+    // Gate on cert-manager being Ready before applying issuer/cert (its CRDs must exist).
+    let cm = resources::get_dynamic(client, &flux::helm_release_gvk(), ns, "cert-manager").await?;
+    if !matches!(gate_on_ready(cm), Gate::Ready) {
+        return Ok(Gate::Pending("CertManagerInstalling"));
+    }
+
+    // ClusterIssuer (cluster-scoped → apply_dynamic with the platform ns as the
+    // request namespace is fine; the object itself is cluster-scoped).
+    resources::apply_dynamic(
+        client,
+        fm,
+        &ingress::cluster_issuer_gvk(),
+        ns,
+        ingress::CLUSTER_ISSUER_NAME,
+        ingress::cluster_issuer(ing, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &ingress::certificate_gvk(),
+        ns,
+        ingress::CERTIFICATE_NAME,
+        ingress::certificate(ing, ns, owner_json),
+    )
+    .await?;
+
+    // oauth2-proxy Deployment + Service (native, applied as dynamic for uniformity).
+    resources::apply_dynamic(
+        client,
+        fm,
+        &flux_apps_deployment_gvk(),
+        ns,
+        ingress::OAUTH2_PROXY_NAME,
+        ingress::oauth2_proxy_deployment(ing, ns, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &core_service_gvk(),
+        ns,
+        ingress::OAUTH2_PROXY_NAME,
+        ingress::oauth2_proxy_service(ns, owner_json),
+    )
+    .await?;
+
+    // Traefik middleware + the two Ingresses.
+    resources::apply_dynamic(
+        client,
+        fm,
+        &ingress::middleware_gvk(),
+        ns,
+        ingress::MIDDLEWARE_NAME,
+        ingress::forward_auth_middleware(ns, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &networking_ingress_gvk(),
+        ns,
+        "stardelt-auth",
+        ingress::auth_ingress(ing, ns, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &networking_ingress_gvk(),
+        ns,
+        "stardelt-uis",
+        ingress::uis_ingress(ing, ns, owner_json),
+    )
+    .await?;
+
+    // Gate on the wildcard Certificate's Ready condition.
+    let cert = resources::get_dynamic(
+        client,
+        &ingress::certificate_gvk(),
+        ns,
+        ingress::CERTIFICATE_NAME,
+    )
+    .await?;
+    Ok(if matches!(gate_on_ready(cert), Gate::Ready) {
+        Gate::Ready
+    } else {
+        Gate::Pending("CertificateIssuing")
+    })
+}
+
+fn flux_apps_deployment_gvk() -> kube::core::GroupVersionKind {
+    kube::core::GroupVersionKind::gvk("apps", "v1", "Deployment")
+}
+fn core_service_gvk() -> kube::core::GroupVersionKind {
+    kube::core::GroupVersionKind::gvk("", "v1", "Service")
+}
+fn networking_ingress_gvk() -> kube::core::GroupVersionKind {
+    kube::core::GroupVersionKind::gvk("networking.k8s.io", "v1", "Ingress")
 }
 
 // ---------------------------------------------------------------------------
@@ -396,4 +533,30 @@ async fn patch_status(ctx: &Context, pi: &PlatformInstance, status: Value) -> Re
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::PlatformInstance;
+
+    fn pi_with_ingress(yes: bool) -> PlatformInstance {
+        let mut v = serde_json::json!({
+            "apiVersion": "platform.stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "t" },
+            "spec": { "namespace": "stardelt" }
+        });
+        if yes {
+            v["spec"]["ingress"] = serde_json::json!({
+                "domain": "lab.stardelt.io", "sso": { "orgName": "stardelt" }
+            });
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn ingress_step_runs_only_when_requested() {
+        assert!(pi_with_ingress(true).spec.ingress.is_some());
+        assert!(pi_with_ingress(false).spec.ingress.is_none());
+    }
 }

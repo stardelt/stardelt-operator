@@ -9,7 +9,6 @@
 use kube::core::GroupVersionKind;
 use serde_json::{Value, json};
 
-use crate::api::PlatformInstance;
 use crate::api::platform_instance::{IngressSpec, chart_versions as cv};
 
 pub const CERT_MANAGER_NAMESPACE: &str = "cert-manager";
@@ -226,11 +225,13 @@ pub fn auth_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value 
 /// All protected UIs, sharing the wildcard cert + forward-auth middleware.
 pub fn uis_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
     let d = &ing.domain;
-    let route = |sub: &str, svc: &str, port: u32| json!({
-        "host": format!("{sub}.{d}"),
-        "http": { "paths": [{ "path": "/", "pathType": "Prefix",
-            "backend": { "service": { "name": svc, "port": { "number": port }}}}]}
-    });
+    let route = |sub: &str, svc: &str, port: u32| {
+        json!({
+            "host": format!("{sub}.{d}"),
+            "http": { "paths": [{ "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": svc, "port": { "number": port }}}}]}
+        })
+    };
     json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "Ingress",
@@ -261,6 +262,7 @@ pub fn uis_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::PlatformInstance;
 
     fn instance() -> PlatformInstance {
         serde_json::from_value(serde_json::json!({
@@ -298,11 +300,15 @@ mod tests {
     fn cluster_issuer_uses_acme_server_and_cloudflare_solver() {
         let pi = instance();
         let ci = cluster_issuer(ingress(&pi), &json!({}));
-        assert_eq!(ci["spec"]["acme"]["server"],
-            "https://acme-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            ci["spec"]["acme"]["server"],
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
         assert_eq!(ci["spec"]["acme"]["email"], "admin@stardelt.io");
-        assert_eq!(ci["spec"]["acme"]["solvers"][0]["dns01"]["cloudflare"]
-            ["apiTokenSecretRef"]["name"], "cloudflare-api-token");
+        assert_eq!(
+            ci["spec"]["acme"]["solvers"][0]["dns01"]["cloudflare"]["apiTokenSecretRef"]["name"],
+            "cloudflare-api-token"
+        );
     }
 
     #[test]
@@ -319,16 +325,29 @@ mod tests {
         let pi = instance();
         let dep = oauth2_proxy_deployment(ingress(&pi), "stardelt", &json!({}));
         let args = dep["spec"]["template"]["spec"]["containers"][0]["args"]
-            .as_array().unwrap();
-        let joined: Vec<String> = args.iter().map(|a| a.as_str().unwrap().to_string()).collect();
+            .as_array()
+            .unwrap();
+        let joined: Vec<String> = args
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
         assert!(joined.contains(&"--github-org=stardelt".to_string()));
         assert!(joined.contains(&"--cookie-domain=.lab.stardelt.io".to_string()));
-        assert!(joined.contains(&"--redirect-url=https://auth.lab.stardelt.io/oauth2/callback".to_string()));
-        assert_eq!(dep["spec"]["template"]["spec"]["containers"][0]["image"],
-            "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0");
+        assert!(
+            joined.contains(
+                &"--redirect-url=https://auth.lab.stardelt.io/oauth2/callback".to_string()
+            )
+        );
+        assert_eq!(
+            dep["spec"]["template"]["spec"]["containers"][0]["image"],
+            "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0"
+        );
         // credentials come from the named secret
         let env = dep["spec"]["template"]["spec"]["containers"][0]["env"][0].clone();
-        assert_eq!(env["valueFrom"]["secretKeyRef"]["name"], "oauth2-proxy-creds");
+        assert_eq!(
+            env["valueFrom"]["secretKeyRef"]["name"],
+            "oauth2-proxy-creds"
+        );
     }
 
     #[test]
@@ -340,8 +359,10 @@ mod tests {
     #[test]
     fn middleware_points_forward_auth_at_oauth2_proxy() {
         let mw = forward_auth_middleware("stardelt", &json!({}));
-        assert_eq!(mw["spec"]["forwardAuth"]["address"],
-            "http://oauth2-proxy.stardelt.svc.cluster.local:4180/oauth2/auth");
+        assert_eq!(
+            mw["spec"]["forwardAuth"]["address"],
+            "http://oauth2-proxy.stardelt.svc.cluster.local:4180/oauth2/auth"
+        );
     }
 
     #[test]
@@ -349,21 +370,30 @@ mod tests {
         let pi = instance();
         let ing_obj = auth_ingress(ingress(&pi), "stardelt", &json!({}));
         assert_eq!(ing_obj["spec"]["rules"][0]["host"], "auth.lab.stardelt.io");
-        assert_eq!(ing_obj["spec"]["rules"][0]["http"]["paths"][0]["backend"]
-            ["service"]["name"], "oauth2-proxy");
+        assert_eq!(
+            ing_obj["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"],
+            "oauth2-proxy"
+        );
     }
 
     #[test]
     fn uis_ingress_covers_four_hosts_with_middleware() {
         let pi = instance();
         let ing_obj = uis_ingress(ingress(&pi), "stardelt", &json!({}));
-        assert_eq!(ing_obj["metadata"]["annotations"]
-            ["traefik.ingress.kubernetes.io/router.middlewares"],
-            "stardelt-oauth2-forward-auth@kubernetescrd");
+        assert_eq!(
+            ing_obj["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"],
+            "stardelt-oauth2-forward-auth@kubernetescrd"
+        );
         let rules = ing_obj["spec"]["rules"].as_array().unwrap();
         let hosts: Vec<&str> = rules.iter().map(|r| r["host"].as_str().unwrap()).collect();
-        assert_eq!(hosts, vec![
-            "nova.lab.stardelt.io", "superset.lab.stardelt.io",
-            "airflow.lab.stardelt.io", "trino.lab.stardelt.io"]);
+        assert_eq!(
+            hosts,
+            vec![
+                "nova.lab.stardelt.io",
+                "superset.lab.stardelt.io",
+                "airflow.lab.stardelt.io",
+                "trino.lab.stardelt.io"
+            ]
+        );
     }
 }
