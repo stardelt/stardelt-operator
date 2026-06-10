@@ -356,7 +356,9 @@ async fn apply_ingress(ctx: &Context, pi: &PlatformInstance, owner_json: &Value)
     )
     .await?;
 
-    // Traefik middleware + the two Ingresses.
+    // Traefik middlewares + the two Ingresses. Both the forward-auth middleware
+    // and the errors middleware (which turns its 401/403 into a sign-in redirect)
+    // are applied; the UIs Ingress chains them in order.
     resources::apply_dynamic(
         client,
         fm,
@@ -364,6 +366,15 @@ async fn apply_ingress(ctx: &Context, pi: &PlatformInstance, owner_json: &Value)
         ns,
         ingress::MIDDLEWARE_NAME,
         ingress::forward_auth_middleware(ns, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &ingress::middleware_gvk(),
+        ns,
+        ingress::ERRORS_MIDDLEWARE_NAME,
+        ingress::auth_errors_middleware(ns, owner_json),
     )
     .await?;
     resources::apply_dynamic(

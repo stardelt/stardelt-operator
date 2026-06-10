@@ -94,7 +94,10 @@ pub struct TlsSpec {
 
 impl Default for TlsSpec {
     fn default() -> Self {
-        Self { acme_server: default_acme_server(), email: default_acme_email() }
+        Self {
+            acme_server: default_acme_server(),
+            email: default_acme_email(),
+        }
     }
 }
 
@@ -291,13 +294,19 @@ mod tests {
         assert_eq!(ing.sso.org_name, "stardelt");
         assert_eq!(ing.sso.provider, "github"); // default
         assert_eq!(ing.sso.credentials_secret, "oauth2-proxy-creds"); // default
-        assert_eq!(ing.tls.acme_server, "https://acme-v02.api.letsencrypt.org/directory");
+        assert_eq!(
+            ing.tls.acme_server,
+            "https://acme-v02.api.letsencrypt.org/directory"
+        );
         assert_eq!(ing.tls.email, "admin@stardelt.io");
     }
 
     #[test]
     fn ingress_versions_are_pinned() {
         assert_eq!(chart_versions::CERT_MANAGER, "1.16.2");
-        assert_eq!(chart_versions::OAUTH2_PROXY_IMAGE, "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0");
+        assert_eq!(
+            chart_versions::OAUTH2_PROXY_IMAGE,
+            "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0"
+        );
     }
 }

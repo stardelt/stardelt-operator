@@ -17,6 +17,7 @@ pub const CERTIFICATE_NAME: &str = "stardelt-wildcard";
 pub const WILDCARD_TLS_SECRET: &str = "stardelt-wildcard-tls";
 pub const OAUTH2_PROXY_NAME: &str = "oauth2-proxy";
 pub const MIDDLEWARE_NAME: &str = "oauth2-forward-auth";
+pub const ERRORS_MIDDLEWARE_NAME: &str = "oauth2-errors";
 pub const JETSTACK_REPO: &str = "jetstack";
 
 pub fn cluster_issuer_gvk() -> GroupVersionKind {
@@ -201,6 +202,26 @@ pub fn forward_auth_middleware(namespace: &str, owner: &Value) -> Value {
     })
 }
 
+/// Traefik `errors` middleware: when forward-auth returns 401/403 (unauthenticated),
+/// serve oauth2-proxy's sign-in page instead of a bare "Unauthorized" body. The
+/// `{url}` placeholder is Traefik's — it expands to the original request URL so
+/// oauth2-proxy can redirect back after login. Chained BEFORE forward-auth.
+pub fn auth_errors_middleware(namespace: &str, owner: &Value) -> Value {
+    json!({
+        "apiVersion": "traefik.io/v1alpha1",
+        "kind": "Middleware",
+        "metadata": {
+            "name": ERRORS_MIDDLEWARE_NAME, "namespace": namespace,
+            "labels": super::labels(), "ownerReferences": [owner],
+        },
+        "spec": { "errors": {
+            "status": ["401-403"],
+            "service": { "name": OAUTH2_PROXY_NAME, "port": 4180 },
+            "query": "/oauth2/sign_in?rd={url}",
+        }}
+    })
+}
+
 /// The auth host itself — NOT behind the middleware (it performs the login).
 pub fn auth_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
     let host = format!("auth.{}", ing.domain);
@@ -240,8 +261,11 @@ pub fn uis_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
             "labels": super::labels(), "ownerReferences": [owner],
             "annotations": {
                 "traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
+                // errors middleware first so it wraps forward-auth: a 401/403 from
+                // forward-auth is caught and turned into the oauth2-proxy sign-in
+                // redirect instead of a bare "Unauthorized" body.
                 "traefik.ingress.kubernetes.io/router.middlewares":
-                    format!("{namespace}-{MIDDLEWARE_NAME}@kubernetescrd"),
+                    format!("{namespace}-{ERRORS_MIDDLEWARE_NAME}@kubernetescrd,{namespace}-{MIDDLEWARE_NAME}@kubernetescrd"),
             },
         },
         "spec": {
@@ -377,12 +401,22 @@ mod tests {
     }
 
     #[test]
+    fn errors_middleware_redirects_401_to_sign_in() {
+        let mw = auth_errors_middleware("stardelt", &json!({}));
+        assert_eq!(mw["spec"]["errors"]["status"][0], "401-403");
+        assert_eq!(mw["spec"]["errors"]["service"]["name"], "oauth2-proxy");
+        assert_eq!(mw["spec"]["errors"]["service"]["port"], 4180);
+        assert_eq!(mw["spec"]["errors"]["query"], "/oauth2/sign_in?rd={url}");
+    }
+
+    #[test]
     fn uis_ingress_covers_four_hosts_with_middleware() {
         let pi = instance();
         let ing_obj = uis_ingress(ingress(&pi), "stardelt", &json!({}));
+        // errors middleware must precede forward-auth so it wraps the 401/403.
         assert_eq!(
             ing_obj["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"],
-            "stardelt-oauth2-forward-auth@kubernetescrd"
+            "stardelt-oauth2-errors@kubernetescrd,stardelt-oauth2-forward-auth@kubernetescrd"
         );
         let rules = ing_obj["spec"]["rules"].as_array().unwrap();
         let hosts: Vec<&str> = rules.iter().map(|r| r["host"].as_str().unwrap()).collect();
