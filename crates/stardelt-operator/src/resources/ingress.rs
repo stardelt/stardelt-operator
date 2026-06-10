@@ -1,10 +1,13 @@
-//! Ingress + SSO resource builders.
+//! Ingress + TLS resource builders.
 //!
 //! Ported from `stardelt-platform/manifests/ingress/*`. Built only when the
 //! PlatformInstance carries `spec.ingress`. cert-manager is installed via a Flux
-//! HelmRelease (jetstack chart) into the `cert-manager` namespace; everything
-//! else (ClusterIssuer, wildcard Certificate, oauth2-proxy, Traefik Middleware,
-//! Ingresses) lands in the platform namespace.
+//! HelmRelease (jetstack chart) into the `cert-manager` namespace; the
+//! ClusterIssuer (DNS-01 via Cloudflare), the wildcard Certificate, and the UIs
+//! Ingress land in the platform namespace.
+//!
+//! Authentication is NOT handled here — each app authenticates itself against
+//! Keycloak (see `resources/keycloak.rs`). This module only does TLS + routing.
 
 use kube::core::GroupVersionKind;
 use serde_json::{Value, json};
@@ -15,9 +18,6 @@ pub const CERT_MANAGER_NAMESPACE: &str = "cert-manager";
 pub const CLUSTER_ISSUER_NAME: &str = "letsencrypt-prod";
 pub const CERTIFICATE_NAME: &str = "stardelt-wildcard";
 pub const WILDCARD_TLS_SECRET: &str = "stardelt-wildcard-tls";
-pub const OAUTH2_PROXY_NAME: &str = "oauth2-proxy";
-pub const MIDDLEWARE_NAME: &str = "oauth2-forward-auth";
-pub const ERRORS_MIDDLEWARE_NAME: &str = "oauth2-errors";
 pub const JETSTACK_REPO: &str = "jetstack";
 
 pub fn cluster_issuer_gvk() -> GroupVersionKind {
@@ -25,9 +25,6 @@ pub fn cluster_issuer_gvk() -> GroupVersionKind {
 }
 pub fn certificate_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk("cert-manager.io", "v1", "Certificate")
-}
-pub fn middleware_gvk() -> GroupVersionKind {
-    GroupVersionKind::gvk("traefik.io", "v1alpha1", "Middleware")
 }
 
 /// jetstack HelmRepository (cert-manager source). Lives in the platform namespace.
@@ -114,136 +111,8 @@ pub fn certificate(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
     })
 }
 
-/// oauth2-proxy — GitHub provider restricted to the SSO org. Fronts every UI via
-/// a Traefik forward-auth middleware. Credentials read from `sso.credentials_secret`.
-pub fn oauth2_proxy_deployment(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
-    let secret = &ing.sso.credentials_secret;
-    json!({
-        "apiVersion": "apps/v1",
-        "kind": "Deployment",
-        "metadata": {
-            "name": OAUTH2_PROXY_NAME, "namespace": namespace,
-            "labels": { "app.kubernetes.io/name": OAUTH2_PROXY_NAME },
-            "ownerReferences": [owner],
-        },
-        "spec": {
-            "replicas": 1,
-            "selector": { "matchLabels": { "app.kubernetes.io/name": OAUTH2_PROXY_NAME }},
-            "template": {
-                "metadata": { "labels": { "app.kubernetes.io/name": OAUTH2_PROXY_NAME }},
-                "spec": { "containers": [{
-                    "name": OAUTH2_PROXY_NAME,
-                    "image": cv::OAUTH2_PROXY_IMAGE,
-                    "args": [
-                        format!("--provider={}", ing.sso.provider),
-                        format!("--github-org={}", ing.sso.org_name),
-                        "--http-address=0.0.0.0:4180",
-                        "--reverse-proxy=true",
-                        format!("--cookie-domain=.{}", ing.domain),
-                        format!("--whitelist-domain=.{}", ing.domain),
-                        "--cookie-secure=true",
-                        "--email-domain=*",
-                        "--upstream=static://202",
-                        format!("--redirect-url=https://auth.{}/oauth2/callback", ing.domain),
-                        "--set-xauthrequest=true",
-                        "--pass-access-token=false",
-                        "--skip-provider-button=false",
-                    ],
-                    "env": [
-                        { "name": "OAUTH2_PROXY_CLIENT_ID",
-                          "valueFrom": { "secretKeyRef": { "name": secret, "key": "client-id" }}},
-                        { "name": "OAUTH2_PROXY_CLIENT_SECRET",
-                          "valueFrom": { "secretKeyRef": { "name": secret, "key": "client-secret" }}},
-                        { "name": "OAUTH2_PROXY_COOKIE_SECRET",
-                          "valueFrom": { "secretKeyRef": { "name": secret, "key": "cookie-secret" }}},
-                    ],
-                    "ports": [{ "containerPort": 4180, "name": "http" }],
-                    "resources": {
-                        "requests": { "cpu": "10m", "memory": "32Mi" },
-                        "limits":   { "cpu": "200m", "memory": "128Mi" }
-                    }
-                }]}
-            }
-        }
-    })
-}
-
-pub fn oauth2_proxy_service(namespace: &str, owner: &Value) -> Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": {
-            "name": OAUTH2_PROXY_NAME, "namespace": namespace,
-            "labels": { "app.kubernetes.io/name": OAUTH2_PROXY_NAME },
-            "ownerReferences": [owner],
-        },
-        "spec": {
-            "type": "ClusterIP",
-            "selector": { "app.kubernetes.io/name": OAUTH2_PROXY_NAME },
-            "ports": [{ "name": "http", "port": 4180, "targetPort": "http" }]
-        }
-    })
-}
-
-/// Traefik forward-auth: protected Ingresses delegate auth to oauth2-proxy.
-pub fn forward_auth_middleware(namespace: &str, owner: &Value) -> Value {
-    json!({
-        "apiVersion": "traefik.io/v1alpha1",
-        "kind": "Middleware",
-        "metadata": {
-            "name": MIDDLEWARE_NAME, "namespace": namespace,
-            "labels": super::labels(), "ownerReferences": [owner],
-        },
-        "spec": { "forwardAuth": {
-            "address": format!("http://{OAUTH2_PROXY_NAME}.{namespace}.svc.cluster.local:4180/oauth2/auth"),
-            "trustForwardHeader": true,
-            "authResponseHeaders": ["X-Auth-Request-User", "X-Auth-Request-Email"],
-        }}
-    })
-}
-
-/// Traefik `errors` middleware: when forward-auth returns 401/403 (unauthenticated),
-/// serve oauth2-proxy's sign-in page instead of a bare "Unauthorized" body. The
-/// `{url}` placeholder is Traefik's — it expands to the original request URL so
-/// oauth2-proxy can redirect back after login. Chained BEFORE forward-auth.
-pub fn auth_errors_middleware(namespace: &str, owner: &Value) -> Value {
-    json!({
-        "apiVersion": "traefik.io/v1alpha1",
-        "kind": "Middleware",
-        "metadata": {
-            "name": ERRORS_MIDDLEWARE_NAME, "namespace": namespace,
-            "labels": super::labels(), "ownerReferences": [owner],
-        },
-        "spec": { "errors": {
-            "status": ["401-403"],
-            "service": { "name": OAUTH2_PROXY_NAME, "port": 4180 },
-            "query": "/oauth2/sign_in?rd={url}",
-        }}
-    })
-}
-
-/// The auth host itself — NOT behind the middleware (it performs the login).
-pub fn auth_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
-    let host = format!("auth.{}", ing.domain);
-    json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": {
-            "name": "stardelt-auth", "namespace": namespace,
-            "labels": super::labels(), "ownerReferences": [owner],
-            "annotations": { "traefik.ingress.kubernetes.io/router.entrypoints": "websecure" },
-        },
-        "spec": {
-            "tls": [{ "hosts": [host.clone()], "secretName": WILDCARD_TLS_SECRET }],
-            "rules": [{ "host": host, "http": { "paths": [{
-                "path": "/", "pathType": "Prefix",
-                "backend": { "service": { "name": OAUTH2_PROXY_NAME, "port": { "number": 4180 }}}
-            }]}}]
-        }
-    })
-}
-
-/// All protected UIs, sharing the wildcard cert + forward-auth middleware.
+/// All UI hosts, sharing the wildcard cert. No auth middleware — each app
+/// authenticates itself against Keycloak (see `resources/keycloak.rs`).
 pub fn uis_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
     let d = &ing.domain;
     let route = |sub: &str, svc: &str, port: u32| {
@@ -261,11 +130,6 @@ pub fn uis_ingress(ing: &IngressSpec, namespace: &str, owner: &Value) -> Value {
             "labels": super::labels(), "ownerReferences": [owner],
             "annotations": {
                 "traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
-                // errors middleware first so it wraps forward-auth: a 401/403 from
-                // forward-auth is caught and turned into the oauth2-proxy sign-in
-                // redirect instead of a bare "Unauthorized" body.
-                "traefik.ingress.kubernetes.io/router.middlewares":
-                    format!("{namespace}-{ERRORS_MIDDLEWARE_NAME}@kubernetescrd,{namespace}-{MIDDLEWARE_NAME}@kubernetescrd"),
             },
         },
         "spec": {
@@ -345,79 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn oauth2_proxy_wires_org_domain_and_secret() {
-        let pi = instance();
-        let dep = oauth2_proxy_deployment(ingress(&pi), "stardelt", &json!({}));
-        let args = dep["spec"]["template"]["spec"]["containers"][0]["args"]
-            .as_array()
-            .unwrap();
-        let joined: Vec<String> = args
-            .iter()
-            .map(|a| a.as_str().unwrap().to_string())
-            .collect();
-        assert!(joined.contains(&"--github-org=stardelt".to_string()));
-        assert!(joined.contains(&"--cookie-domain=.lab.stardelt.io".to_string()));
-        assert!(
-            joined.contains(
-                &"--redirect-url=https://auth.lab.stardelt.io/oauth2/callback".to_string()
-            )
-        );
-        assert_eq!(
-            dep["spec"]["template"]["spec"]["containers"][0]["image"],
-            "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0"
-        );
-        // credentials come from the named secret
-        let env = dep["spec"]["template"]["spec"]["containers"][0]["env"][0].clone();
-        assert_eq!(
-            env["valueFrom"]["secretKeyRef"]["name"],
-            "oauth2-proxy-creds"
-        );
-    }
-
-    #[test]
-    fn oauth2_proxy_service_exposes_4180() {
-        let svc = oauth2_proxy_service("stardelt", &json!({}));
-        assert_eq!(svc["spec"]["ports"][0]["port"], 4180);
-    }
-
-    #[test]
-    fn middleware_points_forward_auth_at_oauth2_proxy() {
-        let mw = forward_auth_middleware("stardelt", &json!({}));
-        assert_eq!(
-            mw["spec"]["forwardAuth"]["address"],
-            "http://oauth2-proxy.stardelt.svc.cluster.local:4180/oauth2/auth"
-        );
-    }
-
-    #[test]
-    fn auth_ingress_routes_to_oauth2_proxy() {
-        let pi = instance();
-        let ing_obj = auth_ingress(ingress(&pi), "stardelt", &json!({}));
-        assert_eq!(ing_obj["spec"]["rules"][0]["host"], "auth.lab.stardelt.io");
-        assert_eq!(
-            ing_obj["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"],
-            "oauth2-proxy"
-        );
-    }
-
-    #[test]
-    fn errors_middleware_redirects_401_to_sign_in() {
-        let mw = auth_errors_middleware("stardelt", &json!({}));
-        assert_eq!(mw["spec"]["errors"]["status"][0], "401-403");
-        assert_eq!(mw["spec"]["errors"]["service"]["name"], "oauth2-proxy");
-        assert_eq!(mw["spec"]["errors"]["service"]["port"], 4180);
-        assert_eq!(mw["spec"]["errors"]["query"], "/oauth2/sign_in?rd={url}");
-    }
-
-    #[test]
-    fn uis_ingress_covers_four_hosts_with_middleware() {
+    fn uis_ingress_covers_four_hosts() {
         let pi = instance();
         let ing_obj = uis_ingress(ingress(&pi), "stardelt", &json!({}));
-        // errors middleware must precede forward-auth so it wraps the 401/403.
-        assert_eq!(
-            ing_obj["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"],
-            "stardelt-oauth2-errors@kubernetescrd,stardelt-oauth2-forward-auth@kubernetescrd"
-        );
         let rules = ing_obj["spec"]["rules"].as_array().unwrap();
         let hosts: Vec<&str> = rules.iter().map(|r| r["host"].as_str().unwrap()).collect();
         assert_eq!(
@@ -428,6 +222,11 @@ mod tests {
                 "airflow.lab.stardelt.io",
                 "trino.lab.stardelt.io"
             ]
+        );
+        // no auth middleware annotation anymore
+        assert!(
+            ing_obj["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"]
+                .is_null()
         );
     }
 }

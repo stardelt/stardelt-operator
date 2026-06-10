@@ -347,56 +347,9 @@ async fn apply_ingress(ctx: &Context, pi: &PlatformInstance, owner_json: &Value)
     )
     .await?;
 
-    // oauth2-proxy Deployment + Service (native, applied as dynamic for uniformity).
-    resources::apply_dynamic(
-        client,
-        fm,
-        &flux_apps_deployment_gvk(),
-        ns,
-        ingress::OAUTH2_PROXY_NAME,
-        ingress::oauth2_proxy_deployment(ing, ns, owner_json),
-    )
-    .await?;
-    resources::apply_dynamic(
-        client,
-        fm,
-        &core_service_gvk(),
-        ns,
-        ingress::OAUTH2_PROXY_NAME,
-        ingress::oauth2_proxy_service(ns, owner_json),
-    )
-    .await?;
-
-    // Traefik middlewares + the two Ingresses. Both the forward-auth middleware
-    // and the errors middleware (which turns its 401/403 into a sign-in redirect)
-    // are applied; the UIs Ingress chains them in order.
-    resources::apply_dynamic(
-        client,
-        fm,
-        &ingress::middleware_gvk(),
-        ns,
-        ingress::MIDDLEWARE_NAME,
-        ingress::forward_auth_middleware(ns, owner_json),
-    )
-    .await?;
-    resources::apply_dynamic(
-        client,
-        fm,
-        &ingress::middleware_gvk(),
-        ns,
-        ingress::ERRORS_MIDDLEWARE_NAME,
-        ingress::auth_errors_middleware(ns, owner_json),
-    )
-    .await?;
-    resources::apply_dynamic(
-        client,
-        fm,
-        &networking_ingress_gvk(),
-        ns,
-        "stardelt-auth",
-        ingress::auth_ingress(ing, ns, owner_json),
-    )
-    .await?;
+    // UIs Ingress (TLS + routing only). Auth is each app's own concern via
+    // Keycloak — no oauth2-proxy / forward-auth here. The auth host itself is
+    // owned by `apply_keycloak` (also named `stardelt-auth`).
     resources::apply_dynamic(
         client,
         fm,
@@ -521,12 +474,6 @@ fn core_secret_gvk() -> kube::core::GroupVersionKind {
     kube::core::GroupVersionKind::gvk("", "v1", "Secret")
 }
 
-fn flux_apps_deployment_gvk() -> kube::core::GroupVersionKind {
-    kube::core::GroupVersionKind::gvk("apps", "v1", "Deployment")
-}
-fn core_service_gvk() -> kube::core::GroupVersionKind {
-    kube::core::GroupVersionKind::gvk("", "v1", "Service")
-}
 fn networking_ingress_gvk() -> kube::core::GroupVersionKind {
     kube::core::GroupVersionKind::gvk("networking.k8s.io", "v1", "Ingress")
 }

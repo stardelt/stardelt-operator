@@ -25,8 +25,6 @@ pub mod chart_versions {
     pub const SUPERSET: &str = "0.15.5";
     /// cert-manager Helm chart (jetstack), installed only when spec.ingress is set.
     pub const CERT_MANAGER: &str = "1.16.2";
-    /// oauth2-proxy image (deployed as a native Deployment, not a chart).
-    pub const OAUTH2_PROXY_IMAGE: &str = "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0";
     /// Keycloak Helm chart (bitnami). Installed only when spec.sso is set.
     pub const KEYCLOAK: &str = "24.4.13";
 }
@@ -334,10 +332,6 @@ mod tests {
     #[test]
     fn ingress_versions_are_pinned() {
         assert_eq!(chart_versions::CERT_MANAGER, "1.16.2");
-        assert_eq!(
-            chart_versions::OAUTH2_PROXY_IMAGE,
-            "quay.io/oauth2-proxy/oauth2-proxy:v7.6.0"
-        );
     }
 
     #[test]
