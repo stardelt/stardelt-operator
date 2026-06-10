@@ -160,6 +160,28 @@ spec:
                 - region
                 - secretKey
                 type: object
+              sso:
+                description: Optional Keycloak-based SSO. When present, the operator installs Keycloak (with its own CNPG Postgres) brokering GitHub, and wires the core apps as OIDC clients. When absent, no Keycloak is installed.
+                nullable: true
+                properties:
+                  domain:
+                    description: Base domain; Keycloak is served at `auth.<domain>`. E.g. `lab.stardelt.io`.
+                    type: string
+                  githubBrokerSecret:
+                    description: Name of a pre-created Secret with `client-id` / `client-secret` for the GitHub identity-provider broker.
+                    type: string
+                  novaClientId:
+                    default: nova
+                    description: OIDC client id issued to Nova. Default `nova`.
+                    type: string
+                  realm:
+                    default: stardelt
+                    description: Keycloak realm name. Default `stardelt`.
+                    type: string
+                required:
+                - domain
+                - githubBrokerSecret
+                type: object
               storage:
                 default:
                   postgresSize: 2Gi

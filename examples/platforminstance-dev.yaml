@@ -23,17 +23,14 @@ spec:
     supersetEnabled: true
     nova:
       image: stardelt/nova:dev
-  # Optional: expose UIs on per-service subdomains behind GitHub SSO.
+  # Optional: TLS + per-service subdomains. Installs cert-manager + a wildcard
+  # DNS-01 cert and host-routes the UIs (TLS + routing only; auth is `sso` below).
   #
   # PREREQUISITES (the operator does NOT provide these — supply them first):
-  #   1. An ingress controller must already be running. The ingress + SSO wiring
-  #      is Traefik-specific (a forward-auth Middleware), so the cluster needs
-  #      Traefik with its CRDs. k3s ships Traefik by default, but some installers
-  #      (e.g. hetzner-k3s) disable it — install it yourself in that case.
-  #   2. oauth2-proxy-creds Secret in THIS namespace (spec.namespace) with keys
-  #      client-id / client-secret / cookie-secret, from a GitHub OAuth App whose
-  #      callback URL is https://auth.<domain>/oauth2/callback.
-  #   3. cloudflare-api-token Secret (key: api-token) for the ACME DNS-01 solver.
+  #   1. An ingress controller (Traefik) must already be running with its CRDs.
+  #      k3s ships Traefik by default, but some installers (e.g. hetzner-k3s)
+  #      disable it — install it yourself in that case.
+  #   2. cloudflare-api-token Secret (key: api-token) for the ACME DNS-01 solver.
   #      IMPORTANT: with the cluster-scoped ClusterIssuer the operator creates,
   #      cert-manager resolves this secret in ITS OWN namespace (the cert-manager
   #      namespace / --cluster-resource-namespace), NOT this one. Create it in the
@@ -44,7 +41,14 @@ spec:
   #   domain: lab.stardelt.io
   #   tls:
   #     acmeServer: https://acme-v02.api.letsencrypt.org/directory
-  #   sso:
-  #     provider: github
+  #   sso:                       # (ingress-level fields retained for compatibility)
   #     orgName: stardelt
-  #     credentialsSecret: oauth2-proxy-creds
+  #
+  # Optional: real app-level SSO via Keycloak (brokers GitHub). Keycloak becomes
+  # the single OIDC issuer; Nova (and later Airflow/Superset/Trino) log users in
+  # as themselves. Requires a keycloak-github-broker Secret (client-id /
+  # client-secret from a GitHub OAuth App whose callback is
+  # https://auth.<domain>/realms/stardelt/broker/github/endpoint) in spec.namespace.
+  # sso:
+  #   domain: lab.stardelt.io
+  #   githubBrokerSecret: keycloak-github-broker
