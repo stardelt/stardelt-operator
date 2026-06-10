@@ -7,8 +7,6 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   name: platforminstances.platform.stardelt.io
-  labels:
-    {{- include "stardelt-operator.labels" . | nindent 4 }}
 spec:
   group: platform.stardelt.io
   names:
@@ -94,6 +92,47 @@ spec:
                         minimum: 0.0
                         type: integer
                     type: object
+                type: object
+              ingress:
+                description: Optional ingress + SSO. When present, the operator installs cert-manager, a wildcard TLS cert, oauth2-proxy, and host-routed Ingresses. When absent, the platform is reachable only via port-forward / bring-your-own ingress.
+                nullable: true
+                properties:
+                  domain:
+                    description: Base domain; UIs are exposed at `<service>.<domain>`. E.g. `lab.stardelt.io`.
+                    type: string
+                  sso:
+                    properties:
+                      credentialsSecret:
+                        default: oauth2-proxy-creds
+                        description: Name of a pre-created Secret with `client-id`, `client-secret`, `cookie-secret`.
+                        type: string
+                      orgName:
+                        description: GitHub org whose members are allowed in.
+                        type: string
+                      provider:
+                        default: github
+                        description: oauth2-proxy provider. MVP supports `github`.
+                        type: string
+                    required:
+                    - orgName
+                    type: object
+                  tls:
+                    default:
+                      acmeServer: https://acme-v02.api.letsencrypt.org/directory
+                      email: admin@stardelt.io
+                    properties:
+                      acmeServer:
+                        default: https://acme-v02.api.letsencrypt.org/directory
+                        description: 'ACME directory URL. Default: Let''s Encrypt production.'
+                        type: string
+                      email:
+                        default: admin@stardelt.io
+                        description: ACME registration email.
+                        type: string
+                    type: object
+                required:
+                - domain
+                - sso
                 type: object
               namespace:
                 default: stardelt
@@ -186,4 +225,5 @@ spec:
     storage: true
     subresources:
       status: {}
+
 {{- end }}

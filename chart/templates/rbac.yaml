@@ -44,6 +44,17 @@ rules:
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
+  # Ingress stack — applied only when a PlatformInstance sets spec.ingress.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["clusterissuers", "certificates"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["traefik.io"]
+    resources: ["middlewares"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
   # Read pod/event state for diagnostics.
   - apiGroups: [""]
     resources: ["pods", "events"]

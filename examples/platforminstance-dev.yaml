@@ -23,3 +23,13 @@ spec:
     supersetEnabled: true
     nova:
       image: stardelt/nova:dev
+  # Optional: expose UIs on per-service subdomains behind GitHub SSO.
+  # Requires cloudflare-api-token + oauth2-proxy-creds Secrets in the namespace.
+  # ingress:
+  #   domain: lab.stardelt.io
+  #   tls:
+  #     acmeServer: https://acme-v02.api.letsencrypt.org/directory
+  #   sso:
+  #     provider: github
+  #     orgName: stardelt
+  #     credentialsSecret: oauth2-proxy-creds
