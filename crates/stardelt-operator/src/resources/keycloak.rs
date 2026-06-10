@@ -1,10 +1,6 @@
 //! Keycloak install: Flux HelmRepository + HelmRelease (bitnami chart) wired to
 //! the external `keycloak-pg` CNPG Postgres, plus the `auth.<domain>` Ingress.
 //! Built only when the PlatformInstance carries `spec.sso`.
-//!
-// `allow(dead_code)`: consumed by controllers::platform_instance::apply_keycloak
-// and resources::nova (Task 1.6). Until then only tests reference these.
-#![allow(dead_code)]
 
 use kube::core::GroupVersionKind;
 use serde_json::{Value, json};

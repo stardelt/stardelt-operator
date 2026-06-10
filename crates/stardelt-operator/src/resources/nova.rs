@@ -8,6 +8,8 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 
 use crate::api::PlatformInstance;
+use crate::resources::keycloak;
+use crate::resources::keycloak_bootstrap::NOVA_OIDC_SECRET;
 
 pub const NAME: &str = "nova";
 
@@ -65,6 +67,27 @@ pub fn deployment(pi: &PlatformInstance, owner: OwnerReference) -> Deployment {
             }
         }
     });
+
+    // When SSO is enabled, inject Nova's OIDC config so it authenticates users
+    // against Keycloak instead of using the dev-user stub.
+    let mut json = json;
+    if let Some(sso) = &pi.spec.sso {
+        let issuer = keycloak::issuer_url(sso);
+        let env = json["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array_mut()
+            .expect("nova env is an array");
+        env.push(serde_json::json!({ "name": "NOVA_OIDC_ISSUER", "value": issuer }));
+        env.push(serde_json::json!({ "name": "NOVA_OIDC_CLIENT_ID", "value": sso.nova_client_id }));
+        env.push(serde_json::json!({
+            "name": "NOVA_OIDC_CLIENT_SECRET",
+            "valueFrom": { "secretKeyRef": { "name": NOVA_OIDC_SECRET, "key": "client-secret" }}
+        }));
+        env.push(serde_json::json!({
+            "name": "NOVA_PUBLIC_URL",
+            "value": format!("https://nova.{}", sso.domain)
+        }));
+    }
+
     serde_json::from_value(json).expect("static Nova Deployment JSON is valid")
 }
 
@@ -114,5 +137,25 @@ mod tests {
         assert_eq!(dep.metadata.namespace.as_deref(), Some("lake"));
         let svc = service(&pi, owner);
         assert_eq!(svc.metadata.name.as_deref(), Some(NAME));
+    }
+
+    #[test]
+    fn deployment_has_oidc_env_when_sso_set() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "platform.stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "t" },
+            "spec": { "namespace": "stardelt",
+                "sso": { "domain": "lab.stardelt.io", "githubBrokerSecret": "keycloak-github-broker" } }
+        }))
+        .unwrap();
+        let dep = deployment(&pi, OwnerReference::default());
+        let env = dep.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap();
+        let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"NOVA_OIDC_ISSUER"));
+        assert!(names.contains(&"NOVA_OIDC_CLIENT_SECRET"));
     }
 }

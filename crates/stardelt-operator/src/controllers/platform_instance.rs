@@ -31,7 +31,9 @@ use crate::api::PlatformInstance;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::readiness::{Condition, condition, ready_condition_true, upsert};
-use crate::resources::{self, bootstrap, cnpg, flux, ingress, nova, secret};
+use crate::resources::{
+    self, bootstrap, cnpg, flux, ingress, keycloak, keycloak_bootstrap, keycloak_pg, nova, secret,
+};
 
 /// Shared reconcile context.
 pub struct Context {
@@ -169,6 +171,15 @@ async fn reconcile(pi: Arc<PlatformInstance>, ctx: Arc<Context>) -> Result<Actio
         gate!(
             "SupersetReady",
             apply_release(&ctx, &pi, &flux::SUPERSET, &["trino"], &owner_json).await?
+        );
+    }
+
+    // Step 10.5: Keycloak SSO (optional) — must precede Nova, which reads its
+    // OIDC config (issuer URL + client secret) at startup.
+    if pi.spec.sso.is_some() {
+        gate!(
+            "KeycloakReady",
+            apply_keycloak(&ctx, &pi, &owner_json).await?
         );
     }
 
@@ -409,6 +420,105 @@ async fn apply_ingress(ctx: &Context, pi: &PlatformInstance, owner_json: &Value)
     } else {
         Gate::Pending("CertificateIssuing")
     })
+}
+
+/// Bring up Keycloak: its CNPG Postgres, the nova-oidc Secret, the Keycloak
+/// HelmRelease, the realm-bootstrap Job, and the auth Ingress. Gated stepwise.
+/// Only called when `spec.sso` is set.
+async fn apply_keycloak(ctx: &Context, pi: &PlatformInstance, owner_json: &Value) -> Result<Gate> {
+    let ns = &pi.spec.namespace;
+    let fm = &ctx.config.field_manager;
+    let client = &ctx.client;
+    let sso = pi
+        .spec
+        .sso
+        .as_ref()
+        .expect("apply_keycloak without spec.sso");
+    let uid = pi.metadata.uid.clone().unwrap_or_default();
+
+    // keycloak-pg CNPG Cluster, gate on Ready.
+    resources::apply_dynamic(
+        client,
+        fm,
+        &keycloak_pg::gvk(),
+        ns,
+        keycloak_pg::CLUSTER_NAME,
+        keycloak_pg::build(pi, owner_json.clone()),
+    )
+    .await?;
+    let pg =
+        resources::get_dynamic(client, &keycloak_pg::gvk(), ns, keycloak_pg::CLUSTER_NAME).await?;
+    if !matches!(gate_on_ready(pg), Gate::Ready) {
+        return Ok(Gate::Pending("KeycloakPostgresNotReady"));
+    }
+
+    // nova-oidc Secret (deterministic; needed by bootstrap Job and Nova).
+    resources::apply_dynamic(
+        client,
+        fm,
+        &core_secret_gvk(),
+        ns,
+        keycloak_bootstrap::NOVA_OIDC_SECRET,
+        keycloak_bootstrap::nova_oidc_secret(ns, &uid, owner_json),
+    )
+    .await?;
+
+    // Keycloak HelmRepository + HelmRelease, gate on Ready.
+    resources::apply_dynamic(
+        client,
+        fm,
+        &flux::helm_repository_gvk(),
+        ns,
+        keycloak::BITNAMI_REPO,
+        keycloak::bitnami_repository(ns, owner_json),
+    )
+    .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &flux::helm_release_gvk(),
+        ns,
+        keycloak::RELEASE,
+        keycloak::release(ns, owner_json),
+    )
+    .await?;
+    let kc =
+        resources::get_dynamic(client, &flux::helm_release_gvk(), ns, keycloak::RELEASE).await?;
+    if !matches!(gate_on_ready(kc), Gate::Ready) {
+        return Ok(Gate::Pending("KeycloakInstalling"));
+    }
+
+    // Realm bootstrap Job, gate on success.
+    let owner = owner_ref(pi);
+    let job = keycloak_bootstrap::build(pi, sso, owner);
+    resources::apply::<k8s_openapi::api::batch::v1::Job>(client, fm, &job).await?;
+    let api: Api<k8s_openapi::api::batch::v1::Job> = Api::namespaced(client.clone(), ns);
+    let succeeded = api
+        .get_opt(keycloak_bootstrap::JOB_NAME)
+        .await?
+        .and_then(|j| j.status)
+        .and_then(|s| s.succeeded)
+        .unwrap_or(0);
+    if succeeded < 1 {
+        return Ok(Gate::Pending("RealmBootstrapping"));
+    }
+
+    // auth Ingress.
+    resources::apply_dynamic(
+        client,
+        fm,
+        &keycloak::ingress_gvk(),
+        ns,
+        "stardelt-auth",
+        keycloak::auth_ingress(sso, ns, owner_json),
+    )
+    .await?;
+
+    Ok(Gate::Ready)
+}
+
+fn core_secret_gvk() -> kube::core::GroupVersionKind {
+    kube::core::GroupVersionKind::gvk("", "v1", "Secret")
 }
 
 fn flux_apps_deployment_gvk() -> kube::core::GroupVersionKind {

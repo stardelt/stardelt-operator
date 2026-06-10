@@ -3,10 +3,6 @@
 //! Backs Keycloak's realm/user data. Single-instance for the MVP. CNPG
 //! auto-creates the `keycloak-pg-app` Secret (user creds) that the Keycloak
 //! HelmRelease references. Mirrors `cnpg.rs` (lakekeeper-pg).
-//!
-// `allow(dead_code)`: consumed by controllers::platform_instance::apply_keycloak
-// (Task 1.6). Until that wiring lands, only tests reference these.
-#![allow(dead_code)]
 
 use kube::core::GroupVersionKind;
 use serde_json::{Value, json};
