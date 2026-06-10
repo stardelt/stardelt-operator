@@ -24,7 +24,22 @@ spec:
     nova:
       image: stardelt/nova:dev
   # Optional: expose UIs on per-service subdomains behind GitHub SSO.
-  # Requires cloudflare-api-token + oauth2-proxy-creds Secrets in the namespace.
+  #
+  # PREREQUISITES (the operator does NOT provide these — supply them first):
+  #   1. An ingress controller must already be running. The ingress + SSO wiring
+  #      is Traefik-specific (a forward-auth Middleware), so the cluster needs
+  #      Traefik with its CRDs. k3s ships Traefik by default, but some installers
+  #      (e.g. hetzner-k3s) disable it — install it yourself in that case.
+  #   2. oauth2-proxy-creds Secret in THIS namespace (spec.namespace) with keys
+  #      client-id / client-secret / cookie-secret, from a GitHub OAuth App whose
+  #      callback URL is https://auth.<domain>/oauth2/callback.
+  #   3. cloudflare-api-token Secret (key: api-token) for the ACME DNS-01 solver.
+  #      IMPORTANT: with the cluster-scoped ClusterIssuer the operator creates,
+  #      cert-manager resolves this secret in ITS OWN namespace (the cert-manager
+  #      namespace / --cluster-resource-namespace), NOT this one. Create it in the
+  #      `cert-manager` namespace (or both). The token needs Zone:Read + DNS:Edit
+  #      on the zone — DNS:Edit alone yields an empty zone id and ACME never
+  #      finalizes.
   # ingress:
   #   domain: lab.stardelt.io
   #   tls:
