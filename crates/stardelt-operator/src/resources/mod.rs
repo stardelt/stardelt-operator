@@ -123,6 +123,35 @@ pub async fn apply_dynamic(
     Ok(applied)
 }
 
+/// Server-side-apply a **cluster-scoped** foreign CRD given as a JSON body.
+/// Mirrors [`apply_dynamic`] but targets the cluster-scoped collection
+/// (`Api::all_with`) — required for resources like cert-manager's ClusterIssuer,
+/// where a namespaced request path returns 404.
+pub async fn apply_dynamic_cluster(
+    client: &Client,
+    field_manager: &str,
+    gvk: &GroupVersionKind,
+    name: &str,
+    mut body: Value,
+) -> Result<DynamicObject> {
+    let ar = ApiResource::from_gvk(gvk);
+    if let Value::Object(map) = &mut body {
+        map.entry("apiVersion")
+            .or_insert_with(|| Value::String(ar.api_version.clone()));
+        map.entry("kind")
+            .or_insert_with(|| Value::String(ar.kind.clone()));
+    }
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &ar);
+    let applied = api
+        .patch(
+            name,
+            &PatchParams::apply(field_manager).force(),
+            &Patch::Apply(&body),
+        )
+        .await?;
+    Ok(applied)
+}
+
 /// Fetch a foreign CRD object (for readiness checks). `None` if not found.
 pub async fn get_dynamic(
     client: &Client,

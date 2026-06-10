@@ -316,13 +316,12 @@ async fn apply_ingress(ctx: &Context, pi: &PlatformInstance, owner_json: &Value)
         return Ok(Gate::Pending("CertManagerInstalling"));
     }
 
-    // ClusterIssuer (cluster-scoped → apply_dynamic with the platform ns as the
-    // request namespace is fine; the object itself is cluster-scoped).
-    resources::apply_dynamic(
+    // ClusterIssuer is cluster-scoped — must use the cluster-scoped apply, or the
+    // namespaced request path 404s.
+    resources::apply_dynamic_cluster(
         client,
         fm,
         &ingress::cluster_issuer_gvk(),
-        ns,
         ingress::CLUSTER_ISSUER_NAME,
         ingress::cluster_issuer(ing, owner_json),
     )
