@@ -107,11 +107,20 @@ pub fn release(namespace: &str, owner: &Value) -> Value {
                 "sourceRef": { "kind": "HelmRepository", "name": CODECENTRIC_REPO, "namespace": namespace }
             }},
             "values": {
-                // The chart already configures production start, health, cache,
-                // proxy headers and DB env. We only add what it does NOT set: the
-                // admin bootstrap creds and a relaxed hostname-strict so issuer
-                // URLs resolve behind Traefik. (KC_PROXY_HEADERS is chart-set.)
-                "extraEnv": "- name: KEYCLOAK_ADMIN\n  value: admin\n- name: KEYCLOAK_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: keycloak-admin\n      key: admin-password\n- name: KC_HOSTNAME_STRICT\n  value: \"false\"\n",
+                // keycloakx ships an EMPTY command by default; without one the
+                // official image just prints help and exits. Provide the prod
+                // start command (the chart's README example).
+                "command": [
+                    "/opt/keycloak/bin/kc.sh",
+                    "start",
+                    "--http-enabled=true",
+                    "--http-port=8080",
+                    "--hostname-strict=false"
+                ],
+                // The chart sets KC_HEALTH_ENABLED/KC_CACHE/KC_PROXY_HEADERS/KC_DB
+                // itself — do NOT duplicate them here (duplicate env key →
+                // StatefulSet apply fails). Only add the admin bootstrap creds.
+                "extraEnv": "- name: KEYCLOAK_ADMIN\n  value: admin\n- name: KEYCLOAK_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: keycloak-admin\n      key: admin-password\n",
                 "database": {
                     "vendor": "postgres",
                     "hostname": pg_host,
