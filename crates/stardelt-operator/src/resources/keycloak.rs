@@ -121,6 +121,10 @@ pub fn release(namespace: &str, owner: &Value) -> Value {
                 // itself — do NOT duplicate them here (duplicate env key →
                 // StatefulSet apply fails). Only add the admin bootstrap creds.
                 "extraEnv": "- name: KEYCLOAK_ADMIN\n  value: admin\n- name: KEYCLOAK_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: keycloak-admin\n      key: admin-password\n",
+                // keycloakx defaults the relative path to /auth; serve at root so
+                // the issuer URL (https://auth.<domain>/realms/<realm>) and OIDC
+                // discovery have no /auth prefix. Keeps kcadm + Nova URLs simple.
+                "http": { "relativePath": "/" },
                 "database": {
                     "vendor": "postgres",
                     "hostname": pg_host,
