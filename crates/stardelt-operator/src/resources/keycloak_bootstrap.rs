@@ -18,7 +18,7 @@ pub const JOB_NAME: &str = "keycloak-bootstrap";
 pub const NOVA_OIDC_SECRET: &str = "nova-oidc";
 
 const SCRIPT: &str = r#"set -e
-KC=/opt/bitnami/keycloak/bin/kcadm.sh
+KC=/opt/keycloak/bin/kcadm.sh
 $KC config credentials --server "$KC_URL" --realm master --user "$KC_ADMIN" --password "$KC_ADMIN_PASSWORD"
 
 echo "▶ ensure realm $REALM"
@@ -74,7 +74,7 @@ pub fn build(pi: &PlatformInstance, sso: &KeycloakSsoSpec, owner: OwnerReference
                     "restartPolicy": "OnFailure",
                     "containers": [{
                         "name": "kcadm",
-                        "image": format!("docker.io/bitnami/keycloak:{}", crate::api::platform_instance::chart_versions::KEYCLOAK),
+                        "image": keycloak::KEYCLOAK_IMAGE,
                         "command": ["/bin/bash", "-c", SCRIPT],
                         "env": [
                             { "name": "KC_URL", "value": kc_url },

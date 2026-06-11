@@ -405,7 +405,8 @@ async fn apply_keycloak(ctx: &Context, pi: &PlatformInstance, owner_json: &Value
         return Ok(Gate::Pending("KeycloakPostgresNotReady"));
     }
 
-    // nova-oidc Secret (deterministic; needed by bootstrap Job and Nova).
+    // nova-oidc Secret (deterministic; needed by bootstrap Job and Nova) and the
+    // Keycloak admin-password Secret (read by the pod + the bootstrap Job).
     resources::apply_dynamic(
         client,
         fm,
@@ -415,6 +416,15 @@ async fn apply_keycloak(ctx: &Context, pi: &PlatformInstance, owner_json: &Value
         keycloak_bootstrap::nova_oidc_secret(ns, &uid, owner_json),
     )
     .await?;
+    resources::apply_dynamic(
+        client,
+        fm,
+        &core_secret_gvk(),
+        ns,
+        keycloak::ADMIN_SECRET,
+        keycloak::admin_secret(ns, &uid, owner_json),
+    )
+    .await?;
 
     // Keycloak HelmRepository + HelmRelease, gate on Ready.
     resources::apply_dynamic(
@@ -422,8 +432,8 @@ async fn apply_keycloak(ctx: &Context, pi: &PlatformInstance, owner_json: &Value
         fm,
         &flux::helm_repository_gvk(),
         ns,
-        keycloak::BITNAMI_REPO,
-        keycloak::bitnami_repository(ns, owner_json),
+        keycloak::CODECENTRIC_REPO,
+        keycloak::codecentric_repository(ns, owner_json),
     )
     .await?;
     resources::apply_dynamic(

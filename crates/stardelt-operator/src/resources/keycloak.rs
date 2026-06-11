@@ -9,21 +9,29 @@ use crate::api::platform_instance::{KeycloakSsoSpec, chart_versions as cv};
 use crate::resources::keycloak_pg;
 
 pub const RELEASE: &str = "keycloak";
-pub const BITNAMI_REPO: &str = "bitnami";
-// Bitnami distributes charts as OCI artifacts now (the classic HTTP repo at
-// charts.bitnami.com no longer serves them). Flux needs a `type: oci`
-// HelmRepository pointing at the OCI registry root; the chart name is appended.
-pub const BITNAMI_URL: &str = "oci://registry-1.docker.io/bitnamicharts";
-/// Chart-managed admin Secret (Keycloak admin user `user` / `admin-password`).
-pub const ADMIN_SECRET: &str = "keycloak";
+pub const CODECENTRIC_REPO: &str = "codecentric";
+// codecentric/keycloakx uses the OFFICIAL quay.io/keycloak/keycloak image
+// (vendor-neutral, maintained) — unlike the Bitnami chart, whose images were
+// paywalled/removed in Broadcom's 2025 migration. Classic HTTP Helm repo.
+pub const CODECENTRIC_URL: &str = "https://codecentric.github.io/helm-charts";
+/// Secret the operator creates holding the Keycloak bootstrap admin password.
+/// keycloakx has no chart-managed admin secret, so we supply our own.
+pub const ADMIN_SECRET: &str = "keycloak-admin";
+/// Deterministic admin password key in [`ADMIN_SECRET`].
+pub const ADMIN_PASSWORD_KEY: &str = "admin-password";
+/// The keycloakx chart names its HTTP Service `<release>-keycloakx-http`.
+pub const SERVICE_NAME: &str = "keycloak-keycloakx-http";
+/// Official Keycloak image (matches keycloakx 7.2.0 appVersion). Used by the
+/// realm-bootstrap Job to run `kcadm.sh`. Vendor-neutral (Quay), not Bitnami.
+pub const KEYCLOAK_IMAGE: &str = "quay.io/keycloak/keycloak:26.6.2";
 
 pub fn ingress_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk("networking.k8s.io", "v1", "Ingress")
 }
 
-/// In-cluster Keycloak HTTP URL.
+/// In-cluster Keycloak HTTP URL (the keycloakx chart's Service, port 80).
 pub fn service_url(namespace: &str) -> String {
-    format!("http://keycloak.{namespace}.svc.cluster.local")
+    format!("http://{SERVICE_NAME}.{namespace}.svc.cluster.local")
 }
 
 /// External issuer URL for a realm (what OIDC clients trust).
@@ -31,27 +39,57 @@ pub fn issuer_url(sso: &KeycloakSsoSpec) -> String {
     format!("https://auth.{}/realms/{}", sso.domain, sso.realm)
 }
 
-pub fn bitnami_repository(namespace: &str, owner: &Value) -> Value {
+pub fn codecentric_repository(namespace: &str, owner: &Value) -> Value {
     json!({
         "apiVersion": "source.toolkit.fluxcd.io/v1",
         "kind": "HelmRepository",
         "metadata": {
-            "name": BITNAMI_REPO, "namespace": namespace,
+            "name": CODECENTRIC_REPO, "namespace": namespace,
             "labels": super::labels(), "ownerReferences": [owner],
         },
-        "spec": { "type": "oci", "interval": "1h", "url": BITNAMI_URL }
+        "spec": { "interval": "1h", "url": CODECENTRIC_URL }
     })
 }
 
-/// Keycloak HelmRelease. Uses the external keycloak-pg Postgres (CNPG-managed
-/// `keycloak-pg-app` Secret) and is fronted by the auth host (proxy mode edge).
-/// The install itself is realm-agnostic — realm/broker/client config is applied
+/// Deterministic admin-password Secret for Keycloak's bootstrap admin user.
+/// Derived from the CR uid (no RNG in the reconcile path), like the nova-oidc
+/// secret. The bootstrap Job reads it to authenticate `kcadm`.
+pub fn admin_secret(namespace: &str, uid: &str, owner: &Value) -> Value {
+    use base64::Engine as _;
+    let mut acc: u64 = 0x84222325cbf29ce4;
+    let mut bytes = Vec::with_capacity(24);
+    for chunk in 0..3u8 {
+        for b in format!("kcadmin:{uid}:{chunk}").bytes() {
+            acc ^= b as u64;
+            acc = acc.wrapping_mul(0x100000001b3);
+        }
+        bytes.extend_from_slice(&acc.to_be_bytes());
+    }
+    let pw = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+    let data = base64::engine::general_purpose::STANDARD.encode(pw.as_bytes());
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": ADMIN_SECRET, "namespace": namespace,
+            "labels": super::labels(), "ownerReferences": [owner],
+        },
+        "type": "Opaque",
+        "data": { ADMIN_PASSWORD_KEY: data }
+    })
+}
+
+/// Keycloak HelmRelease (codecentric/keycloakx). Uses the external keycloak-pg
+/// Postgres (CNPG-managed `keycloak-pg-app` Secret) and the official
+/// quay.io/keycloak image. Runs in production mode behind the auth host (edge
+/// proxy). The install is realm-agnostic — realm/broker/client config is applied
 /// later by the bootstrap Job — so this takes no `sso` argument.
 pub fn release(namespace: &str, owner: &Value) -> Value {
     let pg_host = format!(
         "{}-rw.{namespace}.svc.cluster.local",
         keycloak_pg::CLUSTER_NAME
     );
+    let db_secret = format!("{}-app", keycloak_pg::CLUSTER_NAME);
     json!({
         "apiVersion": "helm.toolkit.fluxcd.io/v2",
         "kind": "HelmRelease",
@@ -64,24 +102,33 @@ pub fn release(namespace: &str, owner: &Value) -> Value {
             "timeout": "10m",
             "releaseName": RELEASE,
             "chart": { "spec": {
-                "chart": "keycloak",
+                "chart": "keycloakx",
                 "version": cv::KEYCLOAK,
-                "sourceRef": { "kind": "HelmRepository", "name": BITNAMI_REPO, "namespace": namespace }
+                "sourceRef": { "kind": "HelmRepository", "name": CODECENTRIC_REPO, "namespace": namespace }
             }},
             "values": {
-                "production": true,
-                "proxy": "edge",
-                "auth": { "adminUser": "admin" },
-                "postgresql": { "enabled": false },
-                "externalDatabase": {
-                    "host": pg_host,
+                // Build an optimized image at boot, then start in production mode.
+                // `--proxy-headers xforwarded` + edge TLS at Traefik; hostname is
+                // pinned so issuer URLs are absolute regardless of the request host.
+                "command": [
+                    "/opt/keycloak/bin/kc.sh",
+                    "start",
+                    "--http-enabled=true",
+                    "--http-port=8080",
+                    "--hostname-strict=false",
+                    "--proxy-headers=xforwarded"
+                ],
+                "extraEnv": "- name: KC_HEALTH_ENABLED\n  value: \"true\"\n- name: KC_CACHE\n  value: ispn\n- name: KEYCLOAK_ADMIN\n  value: admin\n- name: KEYCLOAK_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: keycloak-admin\n      key: admin-password\n",
+                "database": {
+                    "vendor": "postgres",
+                    "hostname": pg_host,
                     "port": 5432,
                     "database": keycloak_pg::DB_NAME,
-                    "user": "keycloak",
-                    "existingSecret": format!("{}-app", keycloak_pg::CLUSTER_NAME),
-                    "existingSecretPasswordKey": "password"
+                    "username": "keycloak",
+                    "existingSecret": db_secret,
+                    "existingSecretKey": "password"
                 },
-                "service": { "type": "ClusterIP" }
+                "service": { "type": "ClusterIP", "httpPort": 80 }
             }
         }
     })
@@ -102,7 +149,7 @@ pub fn auth_ingress(sso: &KeycloakSsoSpec, namespace: &str, owner: &Value) -> Va
             "tls": [{ "hosts": [host.clone()], "secretName": super::ingress::WILDCARD_TLS_SECRET }],
             "rules": [{ "host": host, "http": { "paths": [{
                 "path": "/", "pathType": "Prefix",
-                "backend": { "service": { "name": RELEASE, "port": { "number": 80 }}}
+                "backend": { "service": { "name": SERVICE_NAME, "port": { "number": 80 }}}
             }]}}]
         }
     })
@@ -129,21 +176,38 @@ mod tests {
     }
 
     #[test]
-    fn bitnami_repo_is_oci() {
-        let repo = bitnami_repository("stardelt", &json!({}));
-        assert_eq!(repo["spec"]["type"], "oci");
-        assert!(repo["spec"]["url"].as_str().unwrap().starts_with("oci://"));
+    fn repo_is_codecentric_http() {
+        let repo = codecentric_repository("stardelt", &json!({}));
+        assert!(repo["spec"]["type"].is_null()); // default HTTP, not OCI
+        assert_eq!(
+            repo["spec"]["url"],
+            "https://codecentric.github.io/helm-charts"
+        );
     }
 
     #[test]
     fn release_uses_external_keycloak_pg() {
         let hr = release("stardelt", &json!({}));
-        assert_eq!(hr["spec"]["values"]["postgresql"]["enabled"], false);
+        assert_eq!(hr["spec"]["chart"]["spec"]["chart"], "keycloakx");
+        assert_eq!(hr["spec"]["values"]["database"]["vendor"], "postgres");
         assert_eq!(
-            hr["spec"]["values"]["externalDatabase"]["host"],
+            hr["spec"]["values"]["database"]["hostname"],
             "keycloak-pg-rw.stardelt.svc.cluster.local"
         );
+        assert_eq!(
+            hr["spec"]["values"]["database"]["existingSecret"],
+            "keycloak-pg-app"
+        );
         assert_eq!(hr["spec"]["chart"]["spec"]["version"], cv::KEYCLOAK);
+    }
+
+    #[test]
+    fn admin_secret_is_stable_for_same_uid() {
+        let a = admin_secret("stardelt", "uid-x", &json!({}));
+        let b = admin_secret("stardelt", "uid-x", &json!({}));
+        assert_eq!(a["data"], b["data"]);
+        assert_eq!(a["metadata"]["name"], "keycloak-admin");
+        assert!(a["data"]["admin-password"].as_str().unwrap().len() > 10);
     }
 
     #[test]
@@ -152,7 +216,7 @@ mod tests {
         assert_eq!(ing["spec"]["rules"][0]["host"], "auth.lab.stardelt.io");
         assert_eq!(
             ing["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"],
-            "keycloak"
+            "keycloak-keycloakx-http"
         );
     }
 }

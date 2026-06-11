@@ -25,8 +25,9 @@ pub mod chart_versions {
     pub const SUPERSET: &str = "0.15.5";
     /// cert-manager Helm chart (jetstack), installed only when spec.ingress is set.
     pub const CERT_MANAGER: &str = "1.16.2";
-    /// Keycloak Helm chart (bitnami). Installed only when spec.sso is set.
-    pub const KEYCLOAK: &str = "24.4.13";
+    /// Keycloak Helm chart (codecentric/keycloakx — uses the official
+    /// quay.io/keycloak image, not Bitnami). Installed only when spec.sso is set.
+    pub const KEYCLOAK: &str = "7.2.0";
 }
 
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
@@ -355,6 +356,6 @@ mod tests {
 
     #[test]
     fn keycloak_versions_are_pinned() {
-        assert_eq!(chart_versions::KEYCLOAK, "24.4.13");
+        assert_eq!(chart_versions::KEYCLOAK, "7.2.0");
     }
 }
