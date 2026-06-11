@@ -107,18 +107,11 @@ pub fn release(namespace: &str, owner: &Value) -> Value {
                 "sourceRef": { "kind": "HelmRepository", "name": CODECENTRIC_REPO, "namespace": namespace }
             }},
             "values": {
-                // Build an optimized image at boot, then start in production mode.
-                // `--proxy-headers xforwarded` + edge TLS at Traefik; hostname is
-                // pinned so issuer URLs are absolute regardless of the request host.
-                "command": [
-                    "/opt/keycloak/bin/kc.sh",
-                    "start",
-                    "--http-enabled=true",
-                    "--http-port=8080",
-                    "--hostname-strict=false",
-                    "--proxy-headers=xforwarded"
-                ],
-                "extraEnv": "- name: KC_HEALTH_ENABLED\n  value: \"true\"\n- name: KC_CACHE\n  value: ispn\n- name: KEYCLOAK_ADMIN\n  value: admin\n- name: KEYCLOAK_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: keycloak-admin\n      key: admin-password\n",
+                // The chart already configures production start, health, cache,
+                // proxy headers and DB env. We only add what it does NOT set: the
+                // admin bootstrap creds and a relaxed hostname-strict so issuer
+                // URLs resolve behind Traefik. (KC_PROXY_HEADERS is chart-set.)
+                "extraEnv": "- name: KEYCLOAK_ADMIN\n  value: admin\n- name: KEYCLOAK_ADMIN_PASSWORD\n  valueFrom:\n    secretKeyRef:\n      name: keycloak-admin\n      key: admin-password\n- name: KC_HOSTNAME_STRICT\n  value: \"false\"\n",
                 "database": {
                     "vendor": "postgres",
                     "hostname": pg_host,
