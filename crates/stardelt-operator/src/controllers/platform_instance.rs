@@ -442,7 +442,7 @@ async fn apply_keycloak(ctx: &Context, pi: &PlatformInstance, owner_json: &Value
         &flux::helm_release_gvk(),
         ns,
         keycloak::RELEASE,
-        keycloak::release(ns, owner_json),
+        keycloak::release(sso, ns, owner_json),
     )
     .await?;
     let kc =

@@ -82,14 +82,17 @@ pub fn admin_secret(namespace: &str, uid: &str, owner: &Value) -> Value {
 /// Keycloak HelmRelease (codecentric/keycloakx). Uses the external keycloak-pg
 /// Postgres (CNPG-managed `keycloak-pg-app` Secret) and the official
 /// quay.io/keycloak image. Runs in production mode behind the auth host (edge
-/// proxy). The install is realm-agnostic — realm/broker/client config is applied
-/// later by the bootstrap Job — so this takes no `sso` argument.
-pub fn release(namespace: &str, owner: &Value) -> Value {
+/// proxy). Takes `sso` to pin `KC_HOSTNAME` to the external https URL so issuer
+/// URLs in the OIDC discovery doc are `https://...` (Keycloak otherwise
+/// advertises `http://` behind the TLS-terminating proxy, which OIDC clients
+/// reject).
+pub fn release(sso: &KeycloakSsoSpec, namespace: &str, owner: &Value) -> Value {
     let pg_host = format!(
         "{}-rw.{namespace}.svc.cluster.local",
         keycloak_pg::CLUSTER_NAME
     );
     let db_secret = format!("{}-app", keycloak_pg::CLUSTER_NAME);
+    let hostname = format!("https://auth.{}", sso.domain);
     json!({
         "apiVersion": "helm.toolkit.fluxcd.io/v2",
         "kind": "HelmRelease",
@@ -110,12 +113,16 @@ pub fn release(namespace: &str, owner: &Value) -> Value {
                 // keycloakx ships an EMPTY command by default; without one the
                 // official image just prints help and exits. Provide the prod
                 // start command (the chart's README example).
+                // `--hostname=https://auth.<domain>` makes Keycloak advertise the
+                // external https issuer in its OIDC discovery doc (it otherwise
+                // sees the in-cluster http request and emits http://, which OIDC
+                // clients reject). Edge TLS is terminated at Traefik.
                 "command": [
                     "/opt/keycloak/bin/kc.sh",
                     "start",
                     "--http-enabled=true",
                     "--http-port=8080",
-                    "--hostname-strict=false"
+                    format!("--hostname={hostname}")
                 ],
                 // The chart sets KC_HEALTH_ENABLED/KC_CACHE/KC_PROXY_HEADERS/KC_DB
                 // itself — do NOT duplicate them here (duplicate env key →
@@ -193,7 +200,7 @@ mod tests {
 
     #[test]
     fn release_uses_external_keycloak_pg() {
-        let hr = release("stardelt", &json!({}));
+        let hr = release(&sso(), "stardelt", &json!({}));
         assert_eq!(hr["spec"]["chart"]["spec"]["chart"], "keycloakx");
         assert_eq!(hr["spec"]["values"]["database"]["vendor"], "postgres");
         assert_eq!(
@@ -205,6 +212,17 @@ mod tests {
             "keycloak-pg-app"
         );
         assert_eq!(hr["spec"]["chart"]["spec"]["version"], cv::KEYCLOAK);
+    }
+
+    #[test]
+    fn release_pins_external_https_hostname() {
+        let hr = release(&sso(), "stardelt", &json!({}));
+        let cmd = hr["spec"]["values"]["command"].as_array().unwrap();
+        let joined: Vec<&str> = cmd.iter().map(|c| c.as_str().unwrap()).collect();
+        assert!(
+            joined.contains(&"--hostname=https://auth.lab.stardelt.io"),
+            "command must pin the external https hostname, got {joined:?}"
+        );
     }
 
     #[test]
