@@ -10,7 +10,10 @@ use crate::resources::keycloak_pg;
 
 pub const RELEASE: &str = "keycloak";
 pub const BITNAMI_REPO: &str = "bitnami";
-pub const BITNAMI_URL: &str = "https://charts.bitnami.com/bitnami";
+// Bitnami distributes charts as OCI artifacts now (the classic HTTP repo at
+// charts.bitnami.com no longer serves them). Flux needs a `type: oci`
+// HelmRepository pointing at the OCI registry root; the chart name is appended.
+pub const BITNAMI_URL: &str = "oci://registry-1.docker.io/bitnamicharts";
 /// Chart-managed admin Secret (Keycloak admin user `user` / `admin-password`).
 pub const ADMIN_SECRET: &str = "keycloak";
 
@@ -36,7 +39,7 @@ pub fn bitnami_repository(namespace: &str, owner: &Value) -> Value {
             "name": BITNAMI_REPO, "namespace": namespace,
             "labels": super::labels(), "ownerReferences": [owner],
         },
-        "spec": { "interval": "1h", "url": BITNAMI_URL }
+        "spec": { "type": "oci", "interval": "1h", "url": BITNAMI_URL }
     })
 }
 
@@ -123,6 +126,13 @@ mod tests {
             issuer_url(&sso()),
             "https://auth.lab.stardelt.io/realms/stardelt"
         );
+    }
+
+    #[test]
+    fn bitnami_repo_is_oci() {
+        let repo = bitnami_repository("stardelt", &json!({}));
+        assert_eq!(repo["spec"]["type"], "oci");
+        assert!(repo["spec"]["url"].as_str().unwrap().starts_with("oci://"));
     }
 
     #[test]
