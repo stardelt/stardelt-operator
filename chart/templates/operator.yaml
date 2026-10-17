@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: stardelt-operator
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: stardelt-operator
+rules:
+  - apiGroups: ["stardelt.io"]
+    resources: ["platforminstances", "tenants", "lakehouses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["stardelt.io"]
+    resources: ["platforminstances/status", "tenants/status", "lakehouses/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: stardelt-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: stardelt-operator
+subjects:
+  - kind: ServiceAccount
+    name: stardelt-operator
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stardelt-operator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: stardelt-operator
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: stardelt-operator
+  template:
+    metadata:
+      labels:
+        app: stardelt-operator
+    spec:
+      serviceAccountName: stardelt-operator
+      containers:
+        - name: operator
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

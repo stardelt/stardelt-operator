@@ -1,0 +1,114 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: lakehouses.stardelt.io
+spec:
+  group: stardelt.io
+  names:
+    categories: []
+    kind: Lakehouse
+    plural: lakehouses
+    shortNames:
+    - lh
+    singular: lakehouse
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: A managed Trino + catalog + Iceberg unit on object storage.
+        properties:
+          spec:
+            description: 'A managed lakehouse: catalog + storage (+ query) on object storage.'
+            properties:
+              catalog:
+                default:
+                  implementation: lakekeeper
+                properties:
+                  implementation:
+                    default: lakekeeper
+                    description: Catalog implementation (the plug behind the Iceberg REST contract).
+                    enum:
+                    - lakekeeper
+                    - polaris
+                    type: string
+                type: object
+              profile:
+                default: demo
+                description: Deployment size / capability profile.
+                enum:
+                - demo
+                - full
+                - airgap
+                type: string
+              storage:
+                default:
+                  bucket: null
+                  implementation: seaweedfs
+                properties:
+                  bucket:
+                    nullable: true
+                    type: string
+                  implementation:
+                    default: seaweedfs
+                    description: Object-store implementation.
+                    enum:
+                    - seaweedfs
+                    - byoS3
+                    type: string
+                type: object
+            type: object
+          status:
+            nullable: true
+            properties:
+              components:
+                default: []
+                items:
+                  properties:
+                    message:
+                      nullable: true
+                      type: string
+                    name:
+                      type: string
+                    ready:
+                      type: boolean
+                  required:
+                  - name
+                  - ready
+                  type: object
+                type: array
+              conditions:
+                default: []
+                items:
+                  properties:
+                    last_transition_time:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              phase:
+                default: ''
+                type: string
+            type: object
+        required:
+        - spec
+        title: Lakehouse
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

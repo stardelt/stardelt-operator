@@ -1,0 +1,17 @@
+image:
+  repository: ghcr.io/stardelt/operator
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+# RUST_LOG filter for the operator.
+logLevel: info
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
