@@ -80,12 +80,36 @@ spec:
 ## Architecture
 
 Built with [kube-rs](https://kube.rs). The operator does **not** re-implement upstream charts;
-it watches CRDs and applies upstream Helm releases and native manifests via server-side apply.
+it watches CRDs and applies upstream Helm releases via the `helm` binary in its image
+(`src/helm.rs`), then reports a truthful per-component status.
 
 - `src/crd.rs` — the plug specification (types + status).
-- `src/planner.rs` — pure functions: which components a resource needs, in apply order.
-- `src/controller.rs` — the reconcile loop (watches, writes status).
+- `src/planner.rs` — pure functions: which components a resource needs, in apply order, plus
+  the golden chart pins (`chart_version`).
+- `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
+- `src/controller.rs` — reconciles `Tenant` → Namespace and `Lakehouse` → its component plan.
 - `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
+
+### Safety: `dryRun`
+
+A new `Lakehouse` **plans only** (`spec.dryRun` defaults to `true`): the controller computes the
+component plan, runs `helm --dry-run` for each and writes the plan into `.status.components`.
+Set `dryRun: false` to actually apply.
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: Lakehouse
+metadata: { name: main, namespace: stardelt }
+spec:
+  catalog: { implementation: lakekeeper }
+  storage: { implementation: seaweedfs }
+  dryRun: true     # flip to apply
+```
+
+### RBAC
+
+An installer operator is privileged by nature: the chart grants cluster-wide apply rights so
+Helm can create whatever the upstream charts contain. Tenants additionally create Namespaces.
 
 ## Dev
 

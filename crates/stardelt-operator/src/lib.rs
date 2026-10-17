@@ -7,4 +7,5 @@
 
 pub mod controller;
 pub mod crd;
+pub mod helm;
 pub mod planner;

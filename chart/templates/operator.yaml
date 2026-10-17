@@ -23,6 +23,16 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # Tenants own their Namespace.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch", "create"]
+  # The operator installs upstream charts with Helm, so it applies whatever the
+  # charts contain, cluster-wide. This is the documentation-worthy part of the
+  # RBAC: an installer operator is a privileged component by nature.
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
