@@ -24,7 +24,7 @@ kubeconfig.
   (reconcilers), `bin/crdgen.rs` (CRD generator).
 - `chart/` — Helm chart; `chart/crds/` is generated, `templates/operator.yaml` holds
   ServiceAccount + RBAC + Deployment.
-- `image/Dockerfile` — container image (`ghcr.io/stardelt/operator`).
+- `image/Dockerfile` — container image (`ghcr.io/stardelt/stardelt-operator`).
 
 ## Build / test / run
 
