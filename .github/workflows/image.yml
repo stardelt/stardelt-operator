@@ -1,6 +1,11 @@
 name: Image
 
-# Build and publish ghcr.io/stardelt/operator.
+# Build and publish ghcr.io/stardelt/stardelt-operator.
+#
+# The package name matches the repository on purpose: GHCR ties push access to
+# the repository a package was *created* from. An older `ghcr.io/stardelt/operator`
+# package exists unlinked to any repository (it was pushed by hand), so a workflow
+# token cannot write to it — pushing here keeps the pipeline self-service.
 #
 # On main this pushes `dev` plus an immutable `sha-<short>` tag. Pin the digest
 # (printed in the job summary) when rolling the cluster; a moving tag is not a
@@ -26,7 +31,7 @@ concurrency:
 
 jobs:
   operator:
-    name: Build and push ghcr.io/stardelt/operator
+    name: Build and push ghcr.io/stardelt/stardelt-operator
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,7 +50,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/stardelt/operator
+          images: ghcr.io/stardelt/stardelt-operator
           tags: |
             type=ref,event=branch
             type=ref,event=tag
@@ -68,12 +73,12 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           {
-            echo "### ghcr.io/stardelt/operator"
+            echo "### ghcr.io/stardelt/stardelt-operator"
             echo
             echo '```'
             echo "${{ steps.meta.outputs.tags }}"
             echo "digest: ${{ steps.build.outputs.digest }}"
             echo '```'
             echo
-            echo "Pin it: \`kubectl -n stardelt set image deploy/stardelt-operator operator=ghcr.io/stardelt/operator@${{ steps.build.outputs.digest }}\`"
+            echo "Pin it: \`kubectl -n stardelt set image deploy/stardelt-operator operator=ghcr.io/stardelt/stardelt-operator@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
