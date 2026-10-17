@@ -111,6 +111,15 @@ spec:
 An installer operator is privileged by nature: the chart grants cluster-wide apply rights so
 Helm can create whatever the upstream charts contain. Tenants additionally create Namespaces.
 
+### Component scope — a known correction
+
+`plan_lakehouse` currently includes the **CNPG operator**, which is cluster-scoped and belongs
+to the *platform*, not to an individual Lakehouse (two Lakehouses would collide on it). The
+split lands with `PlatformInstance` fan-out (WP-23): platform-level prerequisites are
+reconciled once, and a Lakehouse only manages its own namespace-scoped resources (SeaweedFS,
+the CNPG `Cluster`, Lakekeeper). Until then the `adopt` guard is what keeps an apply from
+clobbering an existing install — keep it `false` on clusters installed by the Makefile.
+
 ## Dev
 
 ```sh
