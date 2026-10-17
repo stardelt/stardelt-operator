@@ -22,7 +22,7 @@ spec:
           spec:
             description: 'Namespaced isolation boundary: a tenant''s data and identities.'
             properties:
-              display_name:
+              displayName:
                 nullable: true
                 type: string
               profile:

@@ -88,7 +88,7 @@ pub struct PlatformInstanceStatus {
     doc = "A tenant: an isolation boundary for data and identities."
 )]
 pub struct TenantSpec {
-    #[serde(default)]
+    #[serde(default, rename = "displayName")]
     pub display_name: Option<String>,
     #[serde(default = "default_profile")]
     pub profile: Profile,
