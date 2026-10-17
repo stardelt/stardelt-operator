@@ -131,7 +131,22 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             version: chart_version(chart).map(str::to_string),
             namespace: namespace.clone(),
             dry_run,
+            set: lh.spec.set.clone(),
         };
+
+        // Adopt guard: never silently take over a release this operator did not
+        // create. `spec.adopt: true` is the explicit opt-in.
+        if !dry_run && !lh.spec.adopt && ctx.helm.run(release.status_args()).await.is_ok() {
+            components.push(ComponentStatus {
+                name: component.name.to_string(),
+                ready: false,
+                message: Some(
+                    "release exists and is not owned by this operator — set spec.adopt: true to take it over"
+                        .into(),
+                ),
+            });
+            continue;
+        }
         match ctx.helm.run(release.args()).await {
             Ok(_) => components.push(ComponentStatus {
                 name: component.name.to_string(),

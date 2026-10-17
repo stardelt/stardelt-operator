@@ -24,6 +24,8 @@ pub struct HelmRelease {
     pub namespace: String,
     /// `helm --dry-run` when true: render only, change nothing.
     pub dry_run: bool,
+    /// Extra values, sorted for deterministic args.
+    pub set: std::collections::BTreeMap<String, String>,
 }
 
 impl HelmRelease {
@@ -56,6 +58,10 @@ impl HelmRelease {
             args.push("--version".into());
             args.push(v.clone());
         }
+        for (key, value) in &self.set {
+            args.push("--set".into());
+            args.push(format!("{key}={value}"));
+        }
         if self.dry_run {
             args.push("--dry-run".into());
         } else {
@@ -64,6 +70,16 @@ impl HelmRelease {
             args.push("10m".into());
         }
         args
+    }
+
+    /// `helm status` — used to detect a release this operator does not own.
+    pub fn status_args(&self) -> Vec<String> {
+        vec![
+            "status".into(),
+            self.name.clone(),
+            "--namespace".into(),
+            self.namespace.clone(),
+        ]
     }
 }
 
@@ -118,6 +134,8 @@ mod tests {
     use super::*;
 
     fn release(dry_run: bool) -> HelmRelease {
+        let mut set = std::collections::BTreeMap::new();
+        set.insert("trino.enabled".to_string(), "true".to_string());
         HelmRelease {
             name: "seaweedfs".into(),
             chart: "seaweedfs/seaweedfs".into(),
@@ -125,6 +143,7 @@ mod tests {
             version: Some("4.25.1".into()),
             namespace: "stardelt".into(),
             dry_run,
+            set,
         }
     }
 
@@ -149,5 +168,21 @@ mod tests {
         assert!(args.contains(&"--dry-run".to_string()));
         assert!(!args.contains(&"--wait".to_string()));
         assert!(!args.contains(&"--timeout".to_string()));
+    }
+
+    #[test]
+    fn set_values_are_passed_and_sorted() {
+        let args = release(true).args();
+        let i = args
+            .iter()
+            .position(|a| a == "--set")
+            .expect("--set present");
+        assert_eq!(args[i + 1], "trino.enabled=true");
+    }
+
+    #[test]
+    fn status_args_target_the_release_namespace() {
+        let args = release(false).status_args();
+        assert_eq!(args, vec!["status", "seaweedfs", "--namespace", "stardelt"]);
     }
 }
