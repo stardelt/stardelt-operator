@@ -15,9 +15,20 @@ pub struct ComponentPlan {
     pub chart: Option<&'static str>,
 }
 
+/// Platform-level prerequisites, installed once per `PlatformInstance` (not per
+/// Lakehouse). The CNPG operator is cluster-scoped, so it lives here.
+pub fn plan_platform(_spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
+    vec![ComponentPlan {
+        name: "cnpg",
+        chart: Some("cnpg/cloudnative-pg"),
+    }]
+}
+
 /// Which components a `Lakehouse` needs, in apply order.
 ///
-/// Storage first (S3 must exist), then the catalog's database, then the catalog.
+/// Storage first (S3 must exist), then the catalog. The CNPG *operator* is a
+/// platform-level prerequisite (`plan_platform`); a Lakehouse only owns
+/// namespace-scoped resources.
 pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
     let mut plan = Vec::new();
 
@@ -27,11 +38,6 @@ pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
             chart: Some("seaweedfs/seaweedfs"),
         });
     }
-
-    plan.push(ComponentPlan {
-        name: "cnpg",
-        chart: Some("cnpg/cloudnative-pg"),
-    });
 
     match spec.catalog.implementation {
         CatalogImpl::Lakekeeper => plan.push(ComponentPlan {
@@ -180,15 +186,28 @@ mod tests {
     }
 
     #[test]
-    fn default_plan_is_seaweedfs_cnpg_lakekeeper() {
+    fn default_plan_is_seaweedfs_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
-        assert_eq!(names(&plan), vec!["seaweedfs", "cnpg", "lakekeeper"]);
+        assert_eq!(names(&plan), vec!["seaweedfs", "lakekeeper"]);
+    }
+
+    #[test]
+    fn platform_plan_owns_the_cluster_scoped_cnpg_operator() {
+        let pi = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Default::default(),
+            dry_run: true,
+        };
+        assert_eq!(names(&plan_platform(&pi)), vec!["cnpg"]);
+        // It must not leak into a per-Lakehouse plan.
+        let lh = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
+        assert!(!names(&lh).contains(&"cnpg"));
     }
 
     #[test]
     fn byos3_skips_seaweedfs_and_polaris_replaces_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Polaris, StorageImpl::ByoS3));
-        assert_eq!(names(&plan), vec!["cnpg", "polaris"]);
+        assert_eq!(names(&plan), vec!["polaris"]);
     }
 
     #[test]

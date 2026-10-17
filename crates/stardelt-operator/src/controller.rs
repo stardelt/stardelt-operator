@@ -2,9 +2,11 @@
 //!
 //! Watches the stardelt CRDs and reconciles them into real resources:
 //! - `Tenant` → a Namespace (the isolation boundary)
-//! - `Lakehouse` → the component plan, applied through Helm (or planned only,
-//!   which is the safe default: `spec.dryRun: true`)
-//! - `PlatformInstance` → status (fan-out to child CRDs lands with WP-23)
+//! - `PlatformInstance` → platform-level prerequisites (CNPG operator), once
+//! - `Lakehouse` → its namespace-scoped plan (storage + catalog)
+//!
+//! Applies go through Helm. Both resources default to `dryRun: true`, so a new
+//! resource plans first and changes nothing until explicitly flipped.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +25,7 @@ use crate::crd::{
     TenantStatus,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner};
-use crate::planner::{chart_repo, chart_version, plan_lakehouse};
+use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 
 pub struct Context {
     pub client: Client,
@@ -82,7 +84,6 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
         };
         match namespaces.create(&PostParams::default(), &namespace).await {
             Ok(_) => tracing::info!(tenant = %name, "namespace created"),
-            // Lost a race with another reconcile: that is fine.
             Err(kube::Error::Api(e)) if e.code == 409 => {}
             Err(e) => return Err(e),
         }
@@ -107,15 +108,17 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
-/// A Lakehouse becomes its component plan.
-async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
-    let name = lh.name_any();
-    let namespace = lh.namespace().unwrap_or_else(|| "default".into());
-    let dry_run = lh.spec.dry_run;
-    let plan = plan_lakehouse(&lh.spec);
-
+/// Apply (or plan) a component plan, returning a truthful per-component status.
+async fn apply_plan(
+    ctx: &Context,
+    namespace: &str,
+    plan: &[ComponentPlan],
+    dry_run: bool,
+    set: &std::collections::BTreeMap<String, String>,
+    adopt: bool,
+) -> Vec<ComponentStatus> {
     let mut components = Vec::with_capacity(plan.len());
-    for component in &plan {
+    for component in plan {
         let Some(chart) = component.chart else {
             components.push(ComponentStatus {
                 name: component.name.to_string(),
@@ -129,14 +132,14 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             chart: chart.to_string(),
             repo: chart_repo(chart).map(str::to_string),
             version: chart_version(chart).map(str::to_string),
-            namespace: namespace.clone(),
+            namespace: namespace.to_string(),
             dry_run,
-            set: lh.spec.set.clone(),
+            set: set.clone(),
         };
 
         // Adopt guard: never silently take over a release this operator did not
         // create. `spec.adopt: true` is the explicit opt-in.
-        if !dry_run && !lh.spec.adopt && ctx.helm.run(release.status_args()).await.is_ok() {
+        if !dry_run && !adopt && ctx.helm.run(release.status_args()).await.is_ok() {
             components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: false,
@@ -147,6 +150,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             });
             continue;
         }
+
         match ctx.helm.run(release.args()).await {
             Ok(_) => components.push(ComponentStatus {
                 name: component.name.to_string(),
@@ -154,7 +158,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
                 message: dry_run.then(|| "planned (dry-run)".into()),
             }),
             Err(e) => {
-                tracing::warn!(lakehouse = %name, component = component.name, error = %e, "apply failed");
+                tracing::warn!(component = component.name, error = %e, "apply failed");
                 components.push(ComponentStatus {
                     name: component.name.to_string(),
                     ready: false,
@@ -163,15 +167,33 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             }
         }
     }
+    components
+}
 
-    let all_ready = !dry_run && components.iter().all(|c| c.ready);
-    let phase = if dry_run {
+fn phase(dry_run: bool, components: &[ComponentStatus]) -> &'static str {
+    if dry_run {
         "Planned"
-    } else if all_ready {
+    } else if components.iter().all(|c| c.ready) {
         "Ready"
     } else {
         "Progressing"
-    };
+    }
+}
+
+async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
+    let name = lh.name_any();
+    let namespace = lh.namespace().unwrap_or_else(|| "default".into());
+    let plan = plan_lakehouse(&lh.spec);
+    let components = apply_plan(
+        &ctx,
+        &namespace,
+        &plan,
+        lh.spec.dry_run,
+        &lh.spec.set,
+        lh.spec.adopt,
+    )
+    .await;
+    let phase = phase(lh.spec.dry_run, &components);
 
     let status = LakehouseStatus {
         phase: phase.into(),
@@ -188,8 +210,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         &Patch::Merge(json!({ "status": status })),
     )
     .await?;
-    tracing::info!(lakehouse = %name, phase, dry_run, "reconciled");
-
+    tracing::info!(lakehouse = %name, phase, dry_run = lh.spec.dry_run, "reconciled");
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
@@ -198,11 +219,23 @@ async fn reconcile_platform(
     ctx: Arc<Context>,
 ) -> Result<Action, kube::Error> {
     let name = instance.name_any();
-    let status = PlatformInstanceStatus {
-        phase: "Ready".into(),
-        conditions: vec![],
-    };
+    let plan = plan_platform(&instance.spec);
+    let components = apply_plan(
+        &ctx,
+        "stardelt",
+        &plan,
+        instance.spec.dry_run,
+        &Default::default(),
+        false,
+    )
+    .await;
+    let phase = phase(instance.spec.dry_run, &components);
 
+    let status = PlatformInstanceStatus {
+        phase: phase.into(),
+        conditions: vec![],
+        components,
+    };
     let api: Api<PlatformInstance> = Api::all(ctx.client.clone());
     api.patch_status(
         &name,
@@ -210,8 +243,7 @@ async fn reconcile_platform(
         &Patch::Merge(json!({ "status": status })),
     )
     .await?;
-    tracing::info!(instance = %name, profile = ?instance.spec.profile, "reconciled");
-
+    tracing::info!(instance = %name, phase, dry_run = instance.spec.dry_run, "reconciled");
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
