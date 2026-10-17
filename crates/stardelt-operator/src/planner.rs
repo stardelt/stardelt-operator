@@ -29,7 +29,7 @@ pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
     }
 
     plan.push(ComponentPlan {
-        name: "cloudnative-pg",
+        name: "cnpg",
         chart: Some("cnpg/cloudnative-pg"),
     });
 
@@ -182,14 +182,14 @@ mod tests {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
         assert_eq!(
             names(&plan),
-            vec!["seaweedfs", "cloudnative-pg", "lakekeeper"]
+            vec!["seaweedfs", "cnpg", "lakekeeper"]
         );
     }
 
     #[test]
     fn byos3_skips_seaweedfs_and_polaris_replaces_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Polaris, StorageImpl::ByoS3));
-        assert_eq!(names(&plan), vec!["cloudnative-pg", "polaris"]);
+        assert_eq!(names(&plan), vec!["cnpg", "polaris"]);
     }
 
     #[test]
