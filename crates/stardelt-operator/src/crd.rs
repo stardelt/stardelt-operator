@@ -170,6 +170,13 @@ pub struct LakehouseSpec {
     pub storage: StorageSpec,
     #[serde(default = "default_profile")]
     pub profile: Profile,
+    /// Plan only (no cluster changes) until explicitly disabled.  Safe default.
+    #[serde(default = "default_true", rename = "dryRun")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -352,6 +359,7 @@ mod tests {
         assert_eq!(lh.spec.catalog.implementation, CatalogImpl::Lakekeeper);
         assert_eq!(lh.spec.storage.implementation, StorageImpl::Seaweedfs);
         assert_eq!(lh.spec.profile, Profile::Demo);
+        assert!(lh.spec.dry_run, "new Lakehouses must plan only");
     }
 
     #[test]

@@ -110,6 +110,18 @@ pub fn plan_pipeline(spec: &PipelineSpec) -> Vec<ComponentPlan> {
     plan
 }
 
+/// Golden chart versions the operator installs. One place to pin; mirrors the
+/// platform Makefile. Bumped by Renovate in the platform repo today.
+pub fn chart_version(chart: &str) -> Option<&'static str> {
+    match chart {
+        "cnpg/cloudnative-pg" => Some("0.28.2"),
+        "seaweedfs/seaweedfs" => Some("4.25.1"),
+        "lakekeeper/lakekeeper" => Some("0.11.0"),
+        "trino/trino" => Some("1.42.2"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -127,6 +139,7 @@ mod tests {
                 bucket: None,
             },
             profile: Default::default(),
+            dry_run: true,
         }
     }
 
@@ -165,6 +178,15 @@ mod tests {
     fn byos3_skips_seaweedfs_and_polaris_replaces_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Polaris, StorageImpl::ByoS3));
         assert_eq!(names(&plan), vec!["cloudnative-pg", "polaris"]);
+    }
+
+    #[test]
+    fn every_default_chart_has_a_pinned_version() {
+        for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs)) {
+            if let Some(chart) = c.chart {
+                assert!(chart_version(chart).is_some(), "no pin for {chart}");
+            }
+        }
     }
 
     #[test]
