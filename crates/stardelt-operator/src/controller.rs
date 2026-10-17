@@ -88,7 +88,12 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
         }
     }
 
-    let api: Api<Tenant> = Api::all(ctx.client.clone());
+    // Status must be patched through the namespaced API: `Api::all` has no
+    // status endpoint for a namespaced resource (it 404s).
+    let api: Api<Tenant> = Api::namespaced(
+        ctx.client.clone(),
+        tenant.namespace().as_deref().unwrap_or("default"),
+    );
     let status = TenantStatus {
         phase: "Ready".into(),
         conditions: vec![],
