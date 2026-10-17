@@ -23,7 +23,7 @@ use crate::crd::{
     TenantStatus,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner};
-use crate::planner::{chart_version, plan_lakehouse};
+use crate::planner::{chart_repo, chart_version, plan_lakehouse};
 
 pub struct Context {
     pub client: Client,
@@ -122,6 +122,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         let release = HelmRelease {
             name: component.name.to_string(),
             chart: chart.to_string(),
+            repo: chart_repo(chart).map(str::to_string),
             version: chart_version(chart).map(str::to_string),
             namespace: namespace.clone(),
             dry_run,

@@ -122,6 +122,18 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
     }
 }
 
+/// Chart repository for a chart reference. Passed to helm as `--repo`, so the
+/// operator needs no `helm repo add` state (and no writable cache).
+pub fn chart_repo(chart: &str) -> Option<&'static str> {
+    match chart {
+        "cnpg/cloudnative-pg" => Some("https://cloudnative-pg.github.io/charts"),
+        "seaweedfs/seaweedfs" => Some("https://seaweedfs.github.io/seaweedfs/helm"),
+        "lakekeeper/lakekeeper" => Some("https://lakekeeper.github.io/lakekeeper-charts/"),
+        "trino/trino" => Some("https://trinodb.github.io/charts"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
