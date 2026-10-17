@@ -16,6 +16,8 @@ pub struct HelmRelease {
     pub name: String,
     /// Chart reference, e.g. `seaweedfs/seaweedfs`.
     pub chart: String,
+    /// Chart repository (`--repo`), so no `helm repo add` state is needed.
+    pub repo: Option<String>,
     /// Pinned chart version.
     pub version: Option<String>,
     /// Target namespace.
@@ -35,6 +37,10 @@ impl HelmRelease {
             self.namespace.clone(),
             "--create-namespace".into(),
         ];
+        if let Some(repo) = &self.repo {
+            args.push("--repo".into());
+            args.push(repo.clone());
+        }
         if let Some(v) = &self.version {
             args.push("--version".into());
             args.push(v.clone());
@@ -104,6 +110,7 @@ mod tests {
         HelmRelease {
             name: "seaweedfs".into(),
             chart: "seaweedfs/seaweedfs".into(),
+            repo: Some("https://seaweedfs.github.io/seaweedfs/helm".into()),
             version: Some("4.25.1".into()),
             namespace: "stardelt".into(),
             dry_run,
@@ -111,10 +118,12 @@ mod tests {
     }
 
     #[test]
-    fn args_pin_version_and_namespace() {
+    fn args_pin_version_namespace_and_repo() {
         let args = release(false).args();
         assert!(args.starts_with(&["upgrade".into(), "--install".into(), "seaweedfs".into()]));
         assert!(args.contains(&"seaweedfs/seaweedfs".to_string()));
+        assert!(args.contains(&"--repo".to_string()));
+        assert!(args.contains(&"https://seaweedfs.github.io/seaweedfs/helm".to_string()));
         assert!(args.contains(&"4.25.1".to_string()));
         assert!(args.contains(&"stardelt".to_string()));
         assert!(args.contains(&"--wait".to_string()));
