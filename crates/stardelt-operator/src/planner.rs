@@ -152,6 +152,8 @@ mod tests {
             },
             profile: Default::default(),
             dry_run: true,
+            set: Default::default(),
+            adopt: false,
         }
     }
 
@@ -180,10 +182,7 @@ mod tests {
     #[test]
     fn default_plan_is_seaweedfs_cnpg_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
-        assert_eq!(
-            names(&plan),
-            vec!["seaweedfs", "cnpg", "lakekeeper"]
-        );
+        assert_eq!(names(&plan), vec!["seaweedfs", "cnpg", "lakekeeper"]);
     }
 
     #[test]

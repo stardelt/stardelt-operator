@@ -173,6 +173,13 @@ pub struct LakehouseSpec {
     /// Plan only (no cluster changes) until explicitly disabled.  Safe default.
     #[serde(default = "default_true", rename = "dryRun")]
     pub dry_run: bool,
+    /// Extra Helm values applied to every component (`--set key=value`).
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    /// Take over Helm releases this operator did not create. Off by default so a
+    /// Lakehouse can never silently clobber an existing install.
+    #[serde(default)]
+    pub adopt: bool,
 }
 
 fn default_true() -> bool {

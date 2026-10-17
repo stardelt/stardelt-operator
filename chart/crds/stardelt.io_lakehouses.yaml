@@ -22,6 +22,10 @@ spec:
           spec:
             description: 'A managed lakehouse: catalog + storage (+ query) on object storage.'
             properties:
+              adopt:
+                default: false
+                description: Take over Helm releases this operator did not create. Off by default so a Lakehouse can never silently clobber an existing install.
+                type: boolean
               catalog:
                 default:
                   implementation: lakekeeper
@@ -46,6 +50,12 @@ spec:
                 - full
                 - airgap
                 type: string
+              set:
+                additionalProperties:
+                  type: string
+                default: {}
+                description: Extra Helm values applied to every component (`--set key=value`).
+                type: object
               storage:
                 default:
                   bucket: null
