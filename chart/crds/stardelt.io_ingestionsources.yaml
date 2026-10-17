@@ -1,0 +1,87 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ingestionsources.stardelt.io
+spec:
+  group: stardelt.io
+  names:
+    categories: []
+    kind: IngestionSource
+    plural: ingestionsources
+    shortNames:
+    - ingest
+    singular: ingestionsource
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: 'An ingestion source: one contract with three domain defaults (saas, enterprise, cdc).'
+        properties:
+          spec:
+            description: |-
+              An ingestion source: one contract, three domain defaults.
+
+              The source itself is deliberately opaque to the operator. `source` carries the connector's own key/value parameters (host, port, database, topics, tables, …) and is read by the plug (SeaTunnel / NiFi / Debezium), not by the reconciler — that keeps the CRD stable while connectors evolve.
+            properties:
+              domain:
+                default: saas
+                description: Ingestion domain — the deliberate three-way split of the ingestion contract (master spec §5, plugs 8–10). One contract, three defaults.
+                enum:
+                - saas
+                - enterprise
+                - cdc
+                type: string
+              schedule:
+                description: Optional cron schedule; when unset the source follows its domain default (continuous for cdc, otherwise the connector's own cadence).
+                nullable: true
+                type: string
+              source:
+                additionalProperties:
+                  type: string
+                description: Connector-specific parameters, passed through to the plug verbatim.
+                type: object
+              target:
+                description: Destination table, e.g. `warehouse.raw.events`. Ingestion lands in Iceberg through the REST catalog — never in a side channel.
+                type: string
+            required:
+            - target
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  properties:
+                    last_transition_time:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              phase:
+                default: ''
+                type: string
+            type: object
+        required:
+        - spec
+        title: IngestionSource
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

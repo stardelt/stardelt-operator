@@ -2,7 +2,10 @@
 //! needs) from the *apply* (server-side apply of upstream charts) keeps the
 //! interesting logic unit-testable without a cluster.
 
-use crate::crd::{CatalogImpl, LakehouseSpec, StorageImpl};
+use crate::crd::{
+    CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine, PipelineSpec,
+    StepKind, StorageImpl,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ComponentPlan {
@@ -19,18 +22,89 @@ pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
     let mut plan = Vec::new();
 
     if spec.storage.implementation == StorageImpl::Seaweedfs {
-        plan.push(ComponentPlan { name: "seaweedfs", chart: Some("seaweedfs/seaweedfs") });
+        plan.push(ComponentPlan {
+            name: "seaweedfs",
+            chart: Some("seaweedfs/seaweedfs"),
+        });
     }
 
-    plan.push(ComponentPlan { name: "cloudnative-pg", chart: Some("cnpg/cloudnative-pg") });
+    plan.push(ComponentPlan {
+        name: "cloudnative-pg",
+        chart: Some("cnpg/cloudnative-pg"),
+    });
 
     match spec.catalog.implementation {
-        CatalogImpl::Lakekeeper => {
-            plan.push(ComponentPlan { name: "lakekeeper", chart: Some("lakekeeper/lakekeeper") })
+        CatalogImpl::Lakekeeper => plan.push(ComponentPlan {
+            name: "lakekeeper",
+            chart: Some("lakekeeper/lakekeeper"),
+        }),
+        CatalogImpl::Polaris => plan.push(ComponentPlan {
+            name: "polaris",
+            chart: Some("polaris/polaris"),
+        }),
+    }
+
+    plan
+}
+
+/// Which components an `IngestionSource` needs, in apply order.
+///
+/// The domain picks the plug (master spec §5, plugs 8–10): SeaTunnel for SaaS
+/// connectors, NiFi for enterprise/edge integration, Debezium for CDC. CDC needs
+/// Kafka first — Debezium streams into it before anything lands in Iceberg.
+pub fn plan_ingestion_source(spec: &IngestionSourceSpec) -> Vec<ComponentPlan> {
+    match spec.domain {
+        IngestionDomain::Saas => {
+            vec![ComponentPlan {
+                name: "seatunnel",
+                chart: Some("seatunnel/seatunnel"),
+            }]
         }
-        CatalogImpl::Polaris => {
-            plan.push(ComponentPlan { name: "polaris", chart: Some("polaris/polaris") })
+        IngestionDomain::Enterprise => {
+            vec![ComponentPlan {
+                name: "nifi",
+                chart: Some("nifi/nifi"),
+            }]
         }
+        IngestionDomain::Cdc => vec![
+            ComponentPlan {
+                name: "kafka",
+                chart: Some("strimzi/strimzi-kafka-operator"),
+            },
+            ComponentPlan {
+                name: "debezium",
+                chart: Some("debezium/debezium-operator"),
+            },
+        ],
+    }
+}
+
+/// Which components a `Pipeline` needs, in apply order.
+///
+/// The engine selects the orchestrator (Airflow by default, Spark for heavy
+/// compute). A dbt step additionally needs dbt-core, which runs as a native
+/// step image rather than a Helm release — hence `chart: None`.
+pub fn plan_pipeline(spec: &PipelineSpec) -> Vec<ComponentPlan> {
+    let mut plan = match spec.engine {
+        PipelineEngine::Airflow => {
+            vec![ComponentPlan {
+                name: "airflow",
+                chart: Some("apache-airflow/airflow"),
+            }]
+        }
+        PipelineEngine::Spark => {
+            vec![ComponentPlan {
+                name: "spark-operator",
+                chart: Some("spark-operator/spark-operator"),
+            }]
+        }
+    };
+
+    if spec.steps.iter().any(|step| step.kind == StepKind::Dbt) {
+        plan.push(ComponentPlan {
+            name: "dbt",
+            chart: None,
+        });
     }
 
     plan
@@ -38,28 +112,118 @@ pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
-    use crate::crd::{CatalogSpec, LakehouseSpec, StorageSpec};
+    use crate::crd::{CatalogSpec, PipelineStep, StorageSpec};
 
     fn spec(catalog: CatalogImpl, storage: StorageImpl) -> LakehouseSpec {
         LakehouseSpec {
-            catalog: CatalogSpec { implementation: catalog },
-            storage: StorageSpec { implementation: storage, bucket: None },
+            catalog: CatalogSpec {
+                implementation: catalog,
+            },
+            storage: StorageSpec {
+                implementation: storage,
+                bucket: None,
+            },
             profile: Default::default(),
+        }
+    }
+
+    /// Component names of a plan, in apply order.
+    fn names(plan: &[ComponentPlan]) -> Vec<&'static str> {
+        plan.iter().map(|c| c.name).collect()
+    }
+
+    fn ingestion(domain: IngestionDomain) -> IngestionSourceSpec {
+        IngestionSourceSpec {
+            domain,
+            target: "warehouse.raw.events".into(),
+            schedule: None,
+            source: BTreeMap::new(),
+        }
+    }
+
+    fn step(name: &str, kind: StepKind) -> PipelineStep {
+        PipelineStep {
+            name: name.into(),
+            kind,
+            config: BTreeMap::new(),
         }
     }
 
     #[test]
     fn default_plan_is_seaweedfs_cnpg_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
-        let names: Vec<_> = plan.iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["seaweedfs", "cloudnative-pg", "lakekeeper"]);
+        assert_eq!(
+            names(&plan),
+            vec!["seaweedfs", "cloudnative-pg", "lakekeeper"]
+        );
     }
 
     #[test]
     fn byos3_skips_seaweedfs_and_polaris_replaces_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Polaris, StorageImpl::ByoS3));
-        let names: Vec<_> = plan.iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["cloudnative-pg", "polaris"]);
+        assert_eq!(names(&plan), vec!["cloudnative-pg", "polaris"]);
+    }
+
+    #[test]
+    fn saas_ingestion_plans_seatunnel() {
+        let plan = plan_ingestion_source(&ingestion(IngestionDomain::Saas));
+        assert_eq!(names(&plan), vec!["seatunnel"]);
+        assert_eq!(plan[0].chart, Some("seatunnel/seatunnel"));
+    }
+
+    #[test]
+    fn enterprise_ingestion_plans_nifi() {
+        let plan = plan_ingestion_source(&ingestion(IngestionDomain::Enterprise));
+        assert_eq!(names(&plan), vec!["nifi"]);
+        assert_eq!(plan[0].chart, Some("nifi/nifi"));
+    }
+
+    #[test]
+    fn cdc_ingestion_plans_kafka_before_debezium() {
+        let plan = plan_ingestion_source(&ingestion(IngestionDomain::Cdc));
+        assert_eq!(names(&plan), vec!["kafka", "debezium"]);
+    }
+
+    #[test]
+    fn airflow_pipeline_plans_only_airflow() {
+        let spec = PipelineSpec {
+            steps: vec![
+                step("load", StepKind::Sql),
+                step("assert", StepKind::Quality),
+            ],
+            schedule: Some("0 3 * * *".into()),
+            engine: PipelineEngine::Airflow,
+        };
+        assert_eq!(names(&plan_pipeline(&spec)), vec!["airflow"]);
+    }
+
+    #[test]
+    fn spark_pipeline_with_dbt_step_plans_spark_operator_and_dbt() {
+        let spec = PipelineSpec {
+            steps: vec![
+                step("build", StepKind::Dbt),
+                step("enrich", StepKind::Python),
+            ],
+            schedule: None,
+            engine: PipelineEngine::Spark,
+        };
+        let plan = plan_pipeline(&spec);
+        assert_eq!(names(&plan), vec!["spark-operator", "dbt"]);
+        assert_eq!(plan[0].chart, Some("spark-operator/spark-operator"));
+        // dbt ships as a step image, not a Helm release.
+        assert_eq!(plan[1].chart, None);
+    }
+
+    #[test]
+    fn sql_only_pipeline_does_not_pull_in_dbt() {
+        let spec = PipelineSpec {
+            steps: vec![step("load", StepKind::Sql)],
+            schedule: None,
+            engine: PipelineEngine::Spark,
+        };
+        assert_eq!(names(&plan_pipeline(&spec)), vec!["spark-operator"]);
     }
 }
