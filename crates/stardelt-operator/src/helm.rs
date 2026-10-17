@@ -28,11 +28,22 @@ pub struct HelmRelease {
 
 impl HelmRelease {
     pub fn args(&self) -> Vec<String> {
+        // `helm upgrade --install <name> <chart>`; with `--repo`, <chart> must be
+        // the bare chart name ("seaweedfs"), not "seaweedfs/seaweedfs".
+        let chart_arg = match &self.repo {
+            Some(_) => self
+                .chart
+                .rsplit('/')
+                .next()
+                .unwrap_or(&self.chart)
+                .to_string(),
+            None => self.chart.clone(),
+        };
         let mut args: Vec<String> = vec![
             "upgrade".into(),
             "--install".into(),
             self.name.clone(),
-            self.chart.clone(),
+            chart_arg,
             "--namespace".into(),
             self.namespace.clone(),
             "--create-namespace".into(),
@@ -121,7 +132,9 @@ mod tests {
     fn args_pin_version_namespace_and_repo() {
         let args = release(false).args();
         assert!(args.starts_with(&["upgrade".into(), "--install".into(), "seaweedfs".into()]));
-        assert!(args.contains(&"seaweedfs/seaweedfs".to_string()));
+        // With --repo the chart argument must be the bare name.
+        assert!(args.contains(&"seaweedfs".to_string()));
+        assert!(!args.contains(&"seaweedfs/seaweedfs".to_string()));
         assert!(args.contains(&"--repo".to_string()));
         assert!(args.contains(&"https://seaweedfs.github.io/seaweedfs/helm".to_string()));
         assert!(args.contains(&"4.25.1".to_string()));
