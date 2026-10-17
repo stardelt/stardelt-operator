@@ -3,8 +3,8 @@
 //! interesting logic unit-testable without a cluster.
 
 use crate::crd::{
-    CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine,
-    PipelineSpec, PlatformInstanceSpec, StepKind, StorageImpl,
+    CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine, PipelineSpec,
+    PlatformInstanceSpec, StepKind, StorageImpl,
 };
 
 #[derive(Debug, PartialEq, Eq)]
