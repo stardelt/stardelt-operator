@@ -22,6 +22,10 @@ spec:
           spec:
             description: 'Cluster-scoped root resource: declares which pillars and profile are installed.'
             properties:
+              dryRun:
+                default: true
+                description: Plan only (no cluster changes) until explicitly disabled. Safe default.
+                type: boolean
               pillars:
                 default:
                   batch: false
@@ -55,6 +59,22 @@ spec:
           status:
             nullable: true
             properties:
+              components:
+                default: []
+                items:
+                  properties:
+                    message:
+                      nullable: true
+                      type: string
+                    name:
+                      type: string
+                    ready:
+                      type: boolean
+                  required:
+                  - name
+                  - ready
+                  type: object
+                type: array
               conditions:
                 default: []
                 items:
