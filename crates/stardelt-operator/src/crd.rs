@@ -66,6 +66,9 @@ pub struct PlatformInstanceSpec {
     pub profile: Profile,
     #[serde(default)]
     pub pillars: Pillars,
+    /// Plan only (no cluster changes) until explicitly disabled. Safe default.
+    #[serde(default = "default_true", rename = "dryRun")]
+    pub dry_run: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -74,6 +77,8 @@ pub struct PlatformInstanceStatus {
     pub phase: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    #[serde(default)]
+    pub components: Vec<ComponentStatus>,
 }
 
 /// Namespaced isolation boundary: a tenant's data and identities.
@@ -400,6 +405,7 @@ mod tests {
         assert_eq!(pi.spec.profile, Profile::Demo);
         assert!(pi.spec.pillars.lakehouse);
         assert!(!pi.spec.pillars.batch);
+        assert!(pi.spec.dry_run, "a new PlatformInstance must plan only");
     }
 
     #[test]
