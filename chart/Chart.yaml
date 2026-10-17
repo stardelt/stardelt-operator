@@ -1,0 +1,6 @@
+apiVersion: v2
+name: stardelt-operator
+description: Kubernetes operator for stardelt — reconciles PlatformInstance, Tenant and Lakehouse into upstream services.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

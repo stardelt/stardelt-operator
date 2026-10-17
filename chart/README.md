@@ -1,6 +1,29 @@
-# Helm Chart — stardelt-operator
+# Helm chart — stardelt-operator
 
-Helm chart for stardelt-operator. To be written when the operator implementation lands.
+Installs the operator and its CRDs.
 
-See `Cargo.toml` for the planned crate layout, and
-[stardelt.io/roadmap](https://stardelt.io/roadmap) (Stage 4) for the timeline.
+```
+chart/
+  Chart.yaml
+  values.yaml
+  crds/                       generated — do not edit by hand
+  templates/operator.yaml     ServiceAccount + RBAC + Deployment
+```
+
+## CRDs
+
+`crds/` is generated from the Rust types. Regenerate after changing `src/crd.rs`:
+
+```sh
+cargo run -p stardelt-operator --bin crdgen
+```
+
+Helm installs everything in `crds/` on `helm install` (not on `helm upgrade`; apply
+them explicitly if they change).
+
+## Install
+
+```sh
+helm upgrade --install stardelt-operator chart/ \
+  --namespace stardelt --create-namespace
+```

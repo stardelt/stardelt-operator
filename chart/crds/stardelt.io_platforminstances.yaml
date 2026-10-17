@@ -1,0 +1,91 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: platforminstances.stardelt.io
+spec:
+  group: stardelt.io
+  names:
+    categories: []
+    kind: PlatformInstance
+    plural: platforminstances
+    shortNames:
+    - platform
+    singular: platforminstance
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: A stardelt platform instance.
+        properties:
+          spec:
+            description: 'Cluster-scoped root resource: declares which pillars and profile are installed.'
+            properties:
+              pillars:
+                default:
+                  batch: false
+                  lakehouse: true
+                  ml: false
+                  streaming: false
+                description: Which pillars a platform instance enables.
+                properties:
+                  batch:
+                    default: false
+                    type: boolean
+                  lakehouse:
+                    default: true
+                    type: boolean
+                  ml:
+                    default: false
+                    type: boolean
+                  streaming:
+                    default: false
+                    type: boolean
+                type: object
+              profile:
+                default: demo
+                description: Deployment size / capability profile.
+                enum:
+                - demo
+                - full
+                - airgap
+                type: string
+            type: object
+          status:
+            nullable: true
+            properties:
+              conditions:
+                default: []
+                items:
+                  properties:
+                    last_transition_time:
+                      nullable: true
+                      type: string
+                    message:
+                      nullable: true
+                      type: string
+                    reason:
+                      nullable: true
+                      type: string
+                    status:
+                      type: string
+                    type:
+                      type: string
+                  required:
+                  - status
+                  - type
+                  type: object
+                type: array
+              phase:
+                default: ''
+                type: string
+            type: object
+        required:
+        - spec
+        title: PlatformInstance
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
