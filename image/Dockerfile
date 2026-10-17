@@ -22,6 +22,16 @@ RUN apt-get update \
 
 COPY --from=build /src/target/release/stardelt-operator /usr/local/bin/stardelt-operator
 
+# Helm needs writable cache/config/data directories; the container runs as a
+# non-root user with no home. Without these, `helm --repo` fails with
+# "open /.cache/helm/repository/...: no such file or directory".
+ENV HOME=/home/operator \
+    HELM_CACHE_HOME=/home/operator/.cache \
+    HELM_CONFIG_HOME=/home/operator/.config \
+    HELM_DATA_HOME=/home/operator/.local/share
+RUN mkdir -p /home/operator/.cache /home/operator/.config /home/operator/.local/share \
+ && chown -R 65532:65532 /home/operator
+
 # No shell, no root.
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/stardelt-operator"]
