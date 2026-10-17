@@ -3,6 +3,9 @@ image:
   tag: dev
   pullPolicy: IfNotPresent
 
+# GHCR packages are private; reference the pull secret when one is needed.
+imagePullSecrets: []
+
 replicaCount: 1
 
 # RUST_LOG filter for the operator.

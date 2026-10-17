@@ -34,6 +34,10 @@ spec:
                     - polaris
                     type: string
                 type: object
+              dryRun:
+                default: true
+                description: Plan only (no cluster changes) until explicitly disabled.  Safe default.
+                type: boolean
               profile:
                 default: demo
                 description: Deployment size / capability profile.
