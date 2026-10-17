@@ -8,7 +8,8 @@ comes up from a small set of YAML files.
 
 **Pre-alpha.** The CRD types, the reconcile *planner* and a controller skeleton are in place
 and unit-tested. Applying the upstream charts (the per-plug adapters) is the next milestone —
-today the controller computes the component plan and writes a truthful status.
+today the controller computes the component plan and writes a truthful status. The controller
+watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
 
 ## CRDs
 
@@ -17,8 +18,11 @@ today the controller computes the component plan and writes a truthful status.
 | `PlatformInstance` | cluster | which pillars + profile are installed |
 | `Tenant` | namespaced | isolation boundary for data and identities |
 | `Lakehouse` | namespaced | a managed catalog + storage (+ query) unit on object storage |
+| `IngestionSource` | namespaced | ingestion into Iceberg — one contract, three domains (`saas` / `enterprise` / `cdc`) |
+| `Pipeline` | namespaced | ordered `sql` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
 
-`Pipeline`, `StreamApp` and `MLWorkspace` are planned (see the master spec §5).
+`StreamApp` and the ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see
+the master spec §5).
 
 ### Plug selection
 
@@ -35,6 +39,42 @@ spec:
   catalog:  { implementation: lakekeeper }   # lakekeeper | polaris
   storage:  { implementation: seaweedfs }    # seaweedfs | byoS3
   profile: demo                              # demo | full | airgap
+```
+
+Ingestion is one contract with three domain defaults (master spec §5, plugs 8–10). `domain`
+selects the plug and therefore the components the operator plans:
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: IngestionSource
+metadata:
+  name: customers
+  namespace: stardelt
+spec:
+  domain: cdc            # saas (default) → seatunnel | enterprise → nifi | cdc → kafka + debezium
+  target: warehouse.raw.customers
+  schedule: "*/5 * * * *"          # optional; cdc follows its own continuous default
+  source:                          # connector-specific, opaque to the operator
+    connector: postgres
+    table: public.customers
+```
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: Pipeline
+metadata:
+  name: daily-orders
+  namespace: stardelt
+spec:
+  engine: airflow        # airflow (default) → airflow | spark → spark-operator
+  schedule: "0 3 * * *"  # optional; without it the pipeline runs on demand
+  steps:
+    - name: build
+      kind: dbt          # sql | python | dbt | quality (also pulls in dbt-core)
+      config: { selector: "tag:nightly" }
+    - name: assert
+      kind: quality
+      config: { gate: "warn" }
 ```
 
 ## Architecture
