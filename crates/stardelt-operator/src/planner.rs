@@ -3,8 +3,8 @@
 //! interesting logic unit-testable without a cluster.
 
 use crate::crd::{
-    CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine, PipelineSpec,
-    StepKind, StorageImpl,
+    CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine,
+    PipelineSpec, PlatformInstanceSpec, StepKind, StorageImpl,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -145,7 +145,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::crd::{CatalogSpec, PipelineStep, StorageSpec};
+    use crate::crd::{CatalogSpec, PipelineStep, PlatformInstanceSpec, StorageSpec};
 
     fn spec(catalog: CatalogImpl, storage: StorageImpl) -> LakehouseSpec {
         LakehouseSpec {
