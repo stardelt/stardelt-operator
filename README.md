@@ -83,9 +83,67 @@ Built with [kube-rs](https://kube.rs). The operator does **not** re-implement up
 it watches CRDs and applies upstream Helm releases via the `helm` binary in its image
 (`src/helm.rs`), then reports a truthful per-component status.
 
+### Component values
+
+Every planned component is configurable from the CR — chart values, resource sizing,
+storage class, ingress, image registry — without editing code. The operator ships **golden
+values** per component (the curated settings that make the stack work, e.g. Trino's
+`http-server.process-forwarded=true` behind an ingress, SeaweedFS' PVC-backed volumes) and
+layers the CR on top. Merge order per component, later wins:
+
+1. the operator's golden defaults (`src/values.rs`),
+2. `spec.values.<component>` — free-form YAML inline in the CR,
+3. `spec.set.<component>.<helm.key>` — passed to Helm as `--set`, which Helm always applies
+   last.
+
+The merge is a **deep merge**: objects merge key by key, arrays and scalars replace (Helm's
+own `-f` merge semantics). A key you do not set keeps its golden default.
+
+Worked example — pin Trino's resources on my cluster, and put SeaweedFS on a storage class:
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: Lakehouse
+metadata: { name: main, namespace: stardelt }
+spec:
+  catalog: { implementation: lakekeeper }
+  storage: { implementation: seaweedfs }
+  values:
+    trino:
+      coordinator:
+        resources:
+          requests: { cpu: 500m, memory: 2Gi }
+          limits:   { cpu: "2",  memory: 4Gi }
+      worker:
+        resources:
+          limits: { cpu: "2", memory: 4Gi }
+    seaweedfs:
+      volume:
+        dataDirs:
+          - name: data
+            type: persistentVolumeClaim
+            size: 100Gi
+            storageClass: fast-ssd
+            maxVolumes: 0
+  set:
+    trino:
+      server.workers: "2"      # convenience for a single scalar
+```
+
+Notes:
+
+- Only the keys you set change: the example above still carries Trino's golden
+  `additionalConfigProperties`, because the override merges into it.
+- Arrays replace wholesale, exactly like `helm -f`: the `dataDirs` entry above must stay
+  complete (`name`, `type`, `maxVolumes`), not just the `storageClass`.
+- Overrides keyed by a component that is not in the plan (e.g. `polaris` while the catalog
+  is Lakekeeper) are ignored, with a warning in the operator log.
+
+
 - `src/crd.rs` — the plug specification (types + status).
 - `src/planner.rs` — pure functions: which components a resource needs, in apply order, plus
   the golden chart pins (`chart_version`).
+- `src/values.rs` — pure functions: the golden per-component values and the merge order.
 - `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
 - `src/controller.rs` — reconciles `Tenant` → Namespace and `Lakehouse` → its component plan.
 - `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
@@ -134,7 +192,7 @@ helm template chart/       # render the operator manifests
 ```
 Cargo.toml                     workspace
 crates/stardelt-operator/
-  src/{lib,crd,planner,controller}.rs
+  src/{lib,crd,planner,values,controller}.rs
   src/bin/crdgen.rs
 chart/                         Helm chart + generated CRDs
 ```

@@ -8,6 +8,7 @@
 //! cluster.
 
 use futures::future::BoxFuture;
+use tokio::io::AsyncWriteExt;
 
 /// One component to install.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,9 @@ pub struct HelmRelease {
     pub dry_run: bool,
     /// Extra values, sorted for deterministic args.
     pub set: std::collections::BTreeMap<String, String>,
+    /// The merged values document (golden defaults + overrides), piped to Helm
+    /// on stdin as `-f -`.
+    pub values: Option<serde_json::Value>,
 }
 
 impl HelmRelease {
@@ -62,6 +66,12 @@ impl HelmRelease {
             args.push("--set".into());
             args.push(format!("{key}={value}"));
         }
+        if self.values.is_some() {
+            // `-f -` reads a single values file from stdin; `--set` above always
+            // beats it, which is exactly the documented precedence.
+            args.push("--values".into());
+            args.push("-".into());
+        }
         if self.dry_run {
             args.push("--dry-run".into());
         } else {
@@ -70,6 +80,13 @@ impl HelmRelease {
             args.push("10m".into());
         }
         args
+    }
+
+    /// The YAML document for `-f -`, when this release has values.
+    pub fn values_yaml(&self) -> Option<String> {
+        self.values.as_ref().map(|values| {
+            serde_yaml::to_string(values).expect("values documents always serialize to YAML")
+        })
     }
 
     /// `helm status` — used to detect a release this operator does not own.
@@ -85,19 +102,37 @@ impl HelmRelease {
 
 /// Runs helm. `Vec<String>` args (no shell), so nothing is interpolated.
 pub trait HelmRunner: Send + Sync {
-    fn run(&self, args: Vec<String>) -> BoxFuture<'static, anyhow::Result<String>>;
+    fn run(
+        &self,
+        args: Vec<String>,
+        stdin: Option<String>,
+    ) -> BoxFuture<'static, anyhow::Result<String>>;
 }
 
 /// Production runner: shells out to the `helm` binary baked into the image.
 pub struct CommandHelmRunner;
 
 impl HelmRunner for CommandHelmRunner {
-    fn run(&self, args: Vec<String>) -> BoxFuture<'static, anyhow::Result<String>> {
+    fn run(
+        &self,
+        args: Vec<String>,
+        stdin: Option<String>,
+    ) -> BoxFuture<'static, anyhow::Result<String>> {
         Box::pin(async move {
-            let out = tokio::process::Command::new("helm")
+            let mut child = tokio::process::Command::new("helm")
                 .args(&args)
-                .output()
-                .await?;
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
+            // Drop stdin immediately when there is no document, so helm sees EOF.
+            if let Some(mut pipe) = child.stdin.take() {
+                if let Some(document) = stdin {
+                    pipe.write_all(document.as_bytes()).await?;
+                }
+                drop(pipe);
+            }
+            let out = child.wait_with_output().await?;
             if !out.status.success() {
                 anyhow::bail!(
                     "helm {} failed: {}",
@@ -115,15 +150,29 @@ pub mod testing {
     use super::*;
     use std::sync::Mutex;
 
+    /// One recorded helm invocation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct HelmCall {
+        pub args: Vec<String>,
+        pub stdin: Option<String>,
+    }
+
     /// Records calls instead of running helm.
     #[derive(Default)]
     pub struct RecordingRunner {
-        pub calls: Mutex<Vec<Vec<String>>>,
+        pub calls: Mutex<Vec<HelmCall>>,
     }
 
     impl HelmRunner for RecordingRunner {
-        fn run(&self, args: Vec<String>) -> BoxFuture<'static, anyhow::Result<String>> {
-            self.calls.lock().expect("calls poisoned").push(args);
+        fn run(
+            &self,
+            args: Vec<String>,
+            stdin: Option<String>,
+        ) -> BoxFuture<'static, anyhow::Result<String>> {
+            self.calls
+                .lock()
+                .expect("calls poisoned")
+                .push(HelmCall { args, stdin });
             Box::pin(async { Ok(String::new()) })
         }
     }
@@ -144,6 +193,15 @@ mod tests {
             namespace: "stardelt".into(),
             dry_run,
             set,
+            values: Some(serde_json::json!({ "s3": { "enabled": true } })),
+        }
+    }
+
+    fn bare_release() -> HelmRelease {
+        HelmRelease {
+            values: None,
+            set: Default::default(),
+            ..release(false)
         }
     }
 
@@ -178,6 +236,31 @@ mod tests {
             .position(|a| a == "--set")
             .expect("--set present");
         assert_eq!(args[i + 1], "trino.enabled=true");
+    }
+
+    #[test]
+    fn values_documents_are_piped_on_stdin() {
+        let release = release(true);
+        let args = release.args();
+        let i = args
+            .iter()
+            .position(|a| a == "--values")
+            .expect("--values present");
+        assert_eq!(
+            args[i + 1],
+            "-",
+            "helm reads the merged document from stdin"
+        );
+
+        let stdin = release.values_yaml().expect("values yaml");
+        assert!(stdin.contains("enabled: true"), "got: {stdin}");
+    }
+
+    #[test]
+    fn releases_without_values_do_not_read_stdin() {
+        let release = bare_release();
+        assert!(!release.args().contains(&"--values".to_string()));
+        assert_eq!(release.values_yaml(), None);
     }
 
     #[test]
