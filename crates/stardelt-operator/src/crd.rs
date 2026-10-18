@@ -51,6 +51,35 @@ impl Default for Pillars {
     }
 }
 
+/// A reference to one key of a ConfigMap or Secret.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ValuesKeyRef {
+    /// Name of the ConfigMap or Secret.
+    pub name: String,
+    /// Key holding the YAML values document.
+    pub key: String,
+    /// Namespace of the referenced object. Defaults to the resource's own
+    /// namespace; required for cluster-scoped resources (`PlatformInstance`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+/// External source of one component's Helm values: set exactly one of
+/// `configMapRef` or `secretRef`.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
+pub struct ValuesSource {
+    /// Read the values document from this ConfigMap key.
+    #[serde(
+        default,
+        rename = "configMapRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub config_map_ref: Option<ValuesKeyRef>,
+    /// Read the values document from this Secret key (decoded, then parsed as YAML).
+    #[serde(default, rename = "secretRef", skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<ValuesKeyRef>,
+}
+
 /// Per-component Helm value overrides, shared by the root CRDs.
 ///
 /// Administrators configure each plug (chart values, sizing, storage class,
@@ -59,8 +88,9 @@ impl Default for Pillars {
 /// fields layer on top. Merge order per component, later wins:
 ///
 /// 1. the operator's golden defaults,
-/// 2. `values` (free-form YAML inline in the CR),
-/// 3. `set` (passed to Helm as `--set`, which Helm always applies last).
+/// 2. `valuesFrom` (external YAML document),
+/// 3. `values` (free-form YAML inline in the CR),
+/// 4. `set` (passed to Helm as `--set`, which Helm always applies last).
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
 pub struct ComponentValues {
     /// Free-form Helm values per component, e.g. `values.trino.worker.resources`.
@@ -73,6 +103,13 @@ pub struct ComponentValues {
     /// Highest precedence — Helm applies `--set` after any values document.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub set: BTreeMap<String, BTreeMap<String, String>>,
+    /// External values documents per component, read from a ConfigMap or Secret key.
+    #[serde(
+        default,
+        rename = "valuesFrom",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub values_from: BTreeMap<String, ValuesSource>,
 }
 
 /// CRD schema for `values.<component>`: an object of free-form values, kept
@@ -597,6 +634,7 @@ mod tests {
         .expect("deserialize Lakehouse");
         assert!(lh.spec.component_values.values.is_empty());
         assert!(lh.spec.component_values.set.is_empty());
+        assert!(lh.spec.component_values.values_from.is_empty());
 
         let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
             "apiVersion": "stardelt.io/v1alpha1",
@@ -607,10 +645,11 @@ mod tests {
         .expect("deserialize PlatformInstance");
         assert!(pi.spec.component_values.values.is_empty());
         assert!(pi.spec.component_values.set.is_empty());
+        assert!(pi.spec.component_values.values_from.is_empty());
     }
 
     #[test]
-    fn lakehouse_parses_per_component_values_and_set() {
+    fn lakehouse_parses_per_component_values_set_and_values_from() {
         let lh: Lakehouse = serde_json::from_value(serde_json::json!({
             "apiVersion": "stardelt.io/v1alpha1",
             "kind": "Lakehouse",
@@ -621,7 +660,15 @@ mod tests {
                         "coordinator": { "jvm": { "maxHeapSize": "4G" } }
                     }
                 },
-                "set": { "trino": { "server.workers": "3" } }
+                "set": { "trino": { "server.workers": "3" } },
+                "valuesFrom": {
+                    "seaweedfs": {
+                        "configMapRef": { "name": "sw-values", "key": "values.yaml" }
+                    },
+                    "lakekeeper": {
+                        "secretRef": { "name": "keeper-values", "key": "values.yaml", "namespace": "stardelt" }
+                    }
+                }
             }
         }))
         .expect("deserialize Lakehouse");
@@ -632,6 +679,19 @@ mod tests {
             serde_json::json!("4G")
         );
         assert_eq!(overrides.set["trino"]["server.workers"], "3");
+
+        let sw = &overrides.values_from["seaweedfs"];
+        let cm = sw.config_map_ref.as_ref().expect("configMapRef");
+        assert_eq!(cm.name, "sw-values");
+        assert_eq!(cm.key, "values.yaml");
+        assert_eq!(cm.namespace, None);
+        assert!(sw.secret_ref.is_none());
+
+        let keeper = &overrides.values_from["lakekeeper"];
+        let secret = keeper.secret_ref.as_ref().expect("secretRef");
+        assert_eq!(secret.name, "keeper-values");
+        assert_eq!(secret.namespace.as_deref(), Some("stardelt"));
+        assert!(keeper.config_map_ref.is_none());
     }
 
     #[test]
@@ -642,7 +702,10 @@ mod tests {
             "metadata": { "name": "cluster" },
             "spec": {
                 "values": { "cnpg": { "replicaCount": 2 } },
-                "set": { "cnpg": { "image.tag": "1.25.0" } }
+                "set": { "cnpg": { "image.tag": "1.25.0" } },
+                "valuesFrom": {
+                    "cnpg": { "configMapRef": { "name": "cnpg-values", "key": "values.yaml", "namespace": "stardelt" } }
+                }
             }
         }))
         .expect("deserialize PlatformInstance");
@@ -651,6 +714,11 @@ mod tests {
             serde_json::json!(2)
         );
         assert_eq!(pi.spec.component_values.set["cnpg"]["image.tag"], "1.25.0");
+        assert!(
+            pi.spec.component_values.values_from["cnpg"]
+                .config_map_ref
+                .is_some()
+        );
     }
 
     #[test]
@@ -670,7 +738,7 @@ mod tests {
             .expect("spec schema");
         let spec_properties = spec.properties.as_ref().expect("spec properties");
 
-        for field in ["values", "set"] {
+        for field in ["values", "set", "valuesFrom"] {
             assert!(
                 spec_properties.contains_key(field),
                 "spec.{field} must be part of the CRD schema"

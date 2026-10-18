@@ -79,6 +79,49 @@ spec:
                   x-kubernetes-preserve-unknown-fields: true
                 description: Free-form Helm values per component, e.g. `values.trino.worker.resources`. Deep-merged over the golden defaults, so one key can be pinned without restating the rest.
                 type: object
+              valuesFrom:
+                additionalProperties:
+                  description: 'External source of one component''s Helm values: set exactly one of `configMapRef` or `secretRef`.'
+                  properties:
+                    configMapRef:
+                      description: Read the values document from this ConfigMap key.
+                      nullable: true
+                      properties:
+                        key:
+                          description: Key holding the YAML values document.
+                          type: string
+                        name:
+                          description: Name of the ConfigMap or Secret.
+                          type: string
+                        namespace:
+                          description: Namespace of the referenced object. Defaults to the resource's own namespace; required for cluster-scoped resources (`PlatformInstance`).
+                          nullable: true
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                    secretRef:
+                      description: Read the values document from this Secret key (decoded, then parsed as YAML).
+                      nullable: true
+                      properties:
+                        key:
+                          description: Key holding the YAML values document.
+                          type: string
+                        name:
+                          description: Name of the ConfigMap or Secret.
+                          type: string
+                        namespace:
+                          description: Namespace of the referenced object. Defaults to the resource's own namespace; required for cluster-scoped resources (`PlatformInstance`).
+                          nullable: true
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  type: object
+                description: External values documents per component, read from a ConfigMap or Secret key.
+                type: object
             type: object
           status:
             nullable: true
