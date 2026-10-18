@@ -23,6 +23,7 @@ use kube::{
 };
 use serde_json::json;
 
+use crate::crd::Profile;
 use crate::crd::{
     ComponentStatus, ComponentValues, Lakehouse, LakehouseStatus, PlatformInstance,
     PlatformInstanceStatus, Tenant, TenantStatus, ValuesSource,
@@ -118,6 +119,7 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
 struct OverridesContext<'a> {
     scope_namespace: Option<&'a str>,
     overrides: &'a ComponentValues,
+    profile: Profile,
 }
 
 /// Outcome of applying (or planning) one component plan.
@@ -261,7 +263,26 @@ async fn resolve_component_values(
         None => None,
     };
     let inline = overrides.overrides.values.get(component);
-    Ok(effective_values(component, external.as_ref(), inline))
+    let values = effective_values(component, overrides.profile, external.as_ref(), inline);
+    // The effective values are otherwise invisible until something is applied, which makes
+    // "why did it plan that?" unanswerable from the cluster. Debug rather than info: this is
+    // a diagnostic, not an event.
+    tracing::debug!(
+        component,
+        profile = ?overrides.profile,
+        values = %values,
+        "effective values"
+    );
+    Ok(values)
+}
+
+/// The profile as it appears in a status message.
+fn profile_name(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Demo => "demo",
+        Profile::Full => "full",
+        Profile::Airgap => "airgap",
+    }
 }
 
 /// Apply (or plan) a component plan, returning a truthful per-component status.
@@ -342,7 +363,12 @@ async fn apply_plan(
             Ok(_) => outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: !dry_run,
-                message: dry_run.then(|| "planned (dry-run)".into()),
+                message: dry_run.then(|| {
+                    format!(
+                        "planned (dry-run, profile={})",
+                        profile_name(overrides.profile)
+                    )
+                }),
             }),
             Err(e) => {
                 tracing::warn!(component = component.name, error = %e, "apply failed");
@@ -379,6 +405,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     let overrides = OverridesContext {
         scope_namespace: Some(&namespace),
         overrides: &lh.spec.component_values,
+        profile: lh.spec.profile,
     };
     let outcome = apply_plan(
         &ctx,
@@ -421,6 +448,7 @@ async fn reconcile_platform(
         // namespace explicitly.
         scope_namespace: None,
         overrides: &instance.spec.component_values,
+        profile: instance.spec.profile,
     };
     let outcome = apply_plan(
         &ctx,
