@@ -29,6 +29,7 @@ spec:
                   batch: false
                   lakehouse: true
                   ml: false
+                  notebooks: false
                   streaming: false
                 description: Which pillars a platform instance enables.
                 properties:
@@ -40,6 +41,12 @@ spec:
                     type: boolean
                   ml:
                     default: false
+                    type: boolean
+                  notebooks:
+                    default: false
+                    description: |-
+                      Multi-user notebooks (JupyterHub). Off by default: a notebook stack is
+                      heavy, and a cluster that only serves queries should not carry it.
                     type: boolean
                   streaming:
                     default: false

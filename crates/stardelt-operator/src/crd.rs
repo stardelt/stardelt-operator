@@ -30,6 +30,10 @@ pub struct Pillars {
     pub lakehouse: bool,
     #[serde(default)]
     pub batch: bool,
+    /// Multi-user notebooks (JupyterHub). Off by default: a notebook stack is
+    /// heavy, and a cluster that only serves queries should not carry it.
+    #[serde(default)]
+    pub notebooks: bool,
     #[serde(default)]
     pub streaming: bool,
     #[serde(default)]
@@ -45,6 +49,7 @@ impl Default for Pillars {
         Self {
             lakehouse: true,
             batch: false,
+            notebooks: false,
             streaming: false,
             ml: false,
         }

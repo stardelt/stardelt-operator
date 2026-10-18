@@ -30,6 +30,58 @@ pub fn golden_values(component: &str) -> Value {
             "additionalConfigProperties",
             serde_json::json!(["http-server.process-forwarded=true"]),
         )]),
+        // Mirrors the cluster-independent subset of
+        // stardelt-platform/helm-values/jupyterhub.yaml: the dev shape that fits a
+        // notebook stack on one small node. `singleuser.storage: none` keeps the
+        // per-user volume out of the way on a throwaway cluster, and the dummy
+        // authenticator is the chart's, with the same documented throwaway
+        // password the platform uses — an operator replacing it with the
+        // platform's OIDC provider (the realm already defines the `jupyterhub`
+        // client) does that through `spec.values`.
+        "jupyterhub" => json_obj(&[
+            (
+                "hub",
+                serde_json::json!({
+                    "config": {
+                        "JupyterHub": { "authenticator_class": "dummy" },
+                        "DummyAuthenticator": { "password": "stardelt" }
+                    },
+                    "resources": {
+                        "requests": { "cpu": "50m", "memory": "256Mi" },
+                        "limits": { "cpu": "500m", "memory": "512Mi" }
+                    }
+                }),
+            ),
+            (
+                "proxy",
+                serde_json::json!({
+                    "service": { "type": "ClusterIP" },
+                    "chp": {
+                        "resources": {
+                            "requests": { "cpu": "50m", "memory": "128Mi" },
+                            "limits": { "cpu": "500m", "memory": "256Mi" }
+                        }
+                    },
+                    "traefik": {
+                        "resources": {
+                            "requests": { "cpu": "50m", "memory": "128Mi" },
+                            "limits": { "cpu": "500m", "memory": "256Mi" }
+                        }
+                    }
+                }),
+            ),
+            (
+                "singleuser",
+                serde_json::json!({
+                    "image": { "name": "quay.io/jupyter/scipy-notebook", "tag": "2024-10-07" },
+                    "defaultUrl": "/lab",
+                    "startTimeout": 300,
+                    "memory": { "limit": "1G", "guarantee": "256M" },
+                    "cpu": { "limit": 1, "guarantee": 0.1 },
+                    "storage": { "type": "none" }
+                }),
+            ),
+        ]),
         // The data must outlive the pod: emptyDir/hostPath wipe on restart and
         // orphan the Iceberg metadata pointing at the files. The S3 endpoint is
         // what the catalog and engines talk to, so it is on by default.
@@ -183,6 +235,24 @@ mod tests {
             seaweedfs["global"]["seaweedfs"]["createClusterRole"],
             serde_json::json!(false)
         );
+    }
+
+    #[test]
+    fn jupyterhub_golden_values_mirror_the_platform_dev_shape() {
+        let j = golden_values("jupyterhub");
+        assert_eq!(
+            j["hub"]["config"]["JupyterHub"]["authenticator_class"],
+            serde_json::json!("dummy")
+        );
+        assert_eq!(
+            j["proxy"]["service"]["type"],
+            serde_json::json!("ClusterIP")
+        );
+        assert_eq!(
+            j["singleuser"]["storage"]["type"],
+            serde_json::json!("none")
+        );
+        assert_eq!(j["singleuser"]["defaultUrl"], serde_json::json!("/lab"));
     }
 
     #[test]
