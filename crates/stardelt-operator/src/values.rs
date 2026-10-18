@@ -1,14 +1,16 @@
-//! Per-component Helm values: golden defaults, inline overrides, and the
-//! deterministic merge order between them.
+//! Per-component Helm values: golden defaults, external documents, inline
+//! overrides, and the deterministic merge order between them.
 //!
-//! This module is pure on purpose, so every merge rule is unit-testable without
-//! a cluster.
+//! This module is pure on purpose — fetching a ConfigMap/Secret happens in the
+//! controller, which hands the raw document to [`parse_values_document`]. That
+//! keeps every merge rule unit-testable without a cluster.
 //!
 //! Merge order per component, later wins:
 //!
 //! 1. the operator's golden defaults ([`golden_values`]),
-//! 2. `spec.values` (free-form YAML inline in the CR),
-//! 3. `spec.set` (passed to Helm as `--set`, which Helm always applies last).
+//! 2. `spec.valuesFrom` (external YAML document),
+//! 3. `spec.values` (free-form YAML inline in the CR),
+//! 4. `spec.set` (passed to Helm as `--set`, which Helm always applies last).
 
 use serde_json::{Map, Value};
 
@@ -92,15 +94,54 @@ pub fn deep_merge(base: Value, over: Value) -> Value {
     }
 }
 
-/// The effective values for one component: golden defaults, then the CR's
-/// inline `values` (see the module docs for the full order; `set` is handed to
-/// Helm as `--set` and is not part of this document).
-pub fn effective_values(component: &str, inline: Option<&Value>) -> Value {
+/// Parse a free-form values document (`valuesFrom`).
+///
+/// A Helm values document is a mapping; anchors/aliases and multi-document
+/// files are not accepted (serde_yaml rejects the latter).
+pub fn parse_values_document(document: &str) -> Result<Value, ValuesError> {
+    let value: Value =
+        serde_yaml::from_str(document).map_err(|e| ValuesError::InvalidYaml(e.to_string()))?;
+    match value {
+        Value::Object(_) => Ok(value),
+        other => Err(ValuesError::NotAMapping {
+            found: type_name(&other),
+        }),
+    }
+}
+
+/// The effective values for one component: golden defaults, then the external
+/// document, then the CR's inline values (see the module docs for the full
+/// order; `set` is handed to Helm as `--set` and is not part of this document).
+pub fn effective_values(
+    component: &str,
+    external: Option<&Value>,
+    inline: Option<&Value>,
+) -> Value {
     let mut values = golden_values(component);
-    if let Some(inline) = inline {
-        values = deep_merge(values, inline.clone());
+    for over in [external, inline].into_iter().flatten() {
+        values = deep_merge(values, over.clone());
     }
     values
+}
+
+/// A `values` problem worth reporting in the CR status.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ValuesError {
+    #[error("not valid YAML: {0}")]
+    InvalidYaml(String),
+    #[error("a values document must be a YAML mapping, got {found}")]
+    NotAMapping { found: &'static str },
+}
+
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "a mapping",
+    }
 }
 
 #[cfg(test)]
@@ -131,22 +172,44 @@ mod tests {
 
     #[test]
     fn empty_overrides_leave_the_golden_document_untouched() {
-        assert_eq!(effective_values("trino", None), golden_values("trino"));
         assert_eq!(
-            effective_values("trino", Some(&serde_json::json!({}))),
+            effective_values("trino", None, None),
+            golden_values("trino")
+        );
+        assert_eq!(
+            effective_values(
+                "trino",
+                Some(&serde_json::json!({})),
+                Some(&serde_json::json!({}))
+            ),
             golden_values("trino")
         );
     }
 
     #[test]
-    fn inline_values_beat_golden_defaults() {
+    fn inline_values_beat_golden_and_external_documents() {
+        let external = serde_json::json!({
+            "additionalConfigProperties": ["external.setting=true"],
+            "coordinator": { "jvm": { "maxHeapSize": "3G", "gcMethod": { "type": "UseZGC" } } }
+        });
         let inline = serde_json::json!({
             "coordinator": { "jvm": { "maxHeapSize": "4G" } }
         });
-        let merged = effective_values("trino", Some(&inline));
+        let merged = effective_values("trino", Some(&external), Some(&inline));
+
+        // Inline beats the external document, which beats the golden default.
         assert_eq!(
             merged["coordinator"]["jvm"]["maxHeapSize"],
             serde_json::json!("4G")
+        );
+        assert_eq!(
+            merged["additionalConfigProperties"],
+            serde_json::json!(["external.setting=true"])
+        );
+        // Untouched keys from deeper layers survive the deep merge.
+        assert_eq!(
+            merged["coordinator"]["jvm"]["gcMethod"]["type"],
+            serde_json::json!("UseZGC")
         );
     }
 
@@ -155,7 +218,7 @@ mod tests {
         let inline = serde_json::json!({
             "coordinator": { "resources": { "limits": { "cpu": "2" } } }
         });
-        let merged = effective_values("trino", Some(&inline));
+        let merged = effective_values("trino", None, Some(&inline));
         assert_eq!(
             merged["additionalConfigProperties"],
             serde_json::json!(["http-server.process-forwarded=true"]),
@@ -168,5 +231,42 @@ mod tests {
         let base = serde_json::json!({ "list": ["a", "b"] });
         let over = serde_json::json!({ "list": ["c"] });
         assert_eq!(deep_merge(base, over), serde_json::json!({ "list": ["c"] }));
+    }
+
+    #[test]
+    fn parsing_accepts_a_yaml_mapping() {
+        let parsed = parse_values_document(
+            "volume:\n  dataDirs:\n    - name: data\n      storageClass: fast-ssd\n",
+        )
+        .expect("valid mapping");
+        assert_eq!(
+            parsed["volume"]["dataDirs"][0]["storageClass"],
+            serde_json::json!("fast-ssd")
+        );
+    }
+
+    #[test]
+    fn parsing_rejects_non_mappings() {
+        assert_eq!(
+            parse_values_document("- a\n- b\n"),
+            Err(ValuesError::NotAMapping { found: "a list" })
+        );
+        assert_eq!(
+            parse_values_document("42\n"),
+            Err(ValuesError::NotAMapping { found: "a number" })
+        );
+        assert_eq!(
+            parse_values_document(""),
+            Err(ValuesError::NotAMapping { found: "null" })
+        );
+    }
+
+    #[test]
+    fn parsing_rejects_malformed_yaml() {
+        let err = parse_values_document("a: [unclosed").expect_err("must not parse");
+        assert!(
+            matches!(err, ValuesError::InvalidYaml(_)),
+            "unexpected error: {err}"
+        );
     }
 }

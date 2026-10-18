@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use k8s_openapi::{api::core::v1::Namespace, apimachinery::pkg::apis::meta::v1::ObjectMeta};
+use k8s_openapi::{
+    api::core::v1::{ConfigMap, Namespace, Secret},
+    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use kube::{
     Api, Client, ResourceExt,
     api::{Patch, PatchParams, PostParams},
@@ -22,11 +25,11 @@ use serde_json::json;
 
 use crate::crd::{
     ComponentStatus, ComponentValues, Lakehouse, LakehouseStatus, PlatformInstance,
-    PlatformInstanceStatus, Tenant, TenantStatus,
+    PlatformInstanceStatus, Tenant, TenantStatus, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
-use crate::values::effective_values;
+use crate::values::{effective_values, parse_values_document};
 
 pub struct Context {
     pub client: Client,
@@ -109,6 +112,23 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+/// Per-component value overrides for one resource, plus the namespace that
+/// `valuesFrom` references default to (`None` for cluster-scoped resources,
+/// which have no namespace of their own).
+struct OverridesContext<'a> {
+    scope_namespace: Option<&'a str>,
+    overrides: &'a ComponentValues,
+}
+
+/// Outcome of applying (or planning) one component plan.
+struct PlanOutcome {
+    components: Vec<ComponentStatus>,
+    /// False when any component's values could not be resolved. That component
+    /// is reported in `components` with the reason; the rest of the plan still
+    /// proceeds, so one broken reference never blocks the whole Lakehouse.
+    values_resolved: bool,
+}
+
 /// Overrides keyed by a component the plan does not contain are almost always a
 /// typo (`polaris` while the catalog is Lakekeeper, say); log them loudly.
 fn warn_unknown_overrides(plan: &[ComponentPlan], overrides: &ComponentValues) {
@@ -117,7 +137,13 @@ fn warn_unknown_overrides(plan: &[ComponentPlan], overrides: &ComponentValues) {
         .values
         .keys()
         .map(|k| (k.as_str(), "values"))
-        .chain(overrides.set.keys().map(|k| (k.as_str(), "set")));
+        .chain(overrides.set.keys().map(|k| (k.as_str(), "set")))
+        .chain(
+            overrides
+                .values_from
+                .keys()
+                .map(|k| (k.as_str(), "valuesFrom")),
+        );
     for (component, field) in named {
         if !planned.contains(component) {
             tracing::warn!(
@@ -129,27 +155,155 @@ fn warn_unknown_overrides(plan: &[ComponentPlan], overrides: &ComponentValues) {
     }
 }
 
+/// Resolve the raw values document referenced by `spec.valuesFrom.<component>`.
+///
+/// Nothing is cached: the document is read on every reconcile, so a ConfigMap or
+/// Secret that changed in GitOps is picked up on the next requeue — and a
+/// document that cannot be read is never silently replaced by stale or default
+/// values.
+async fn resolve_values_from(
+    client: &Client,
+    scope_namespace: Option<&str>,
+    source: &ValuesSource,
+) -> Result<serde_json::Value, String> {
+    let (kind, reference, is_secret) = match (&source.config_map_ref, &source.secret_ref) {
+        (Some(reference), None) => ("ConfigMap", reference, false),
+        (None, Some(reference)) => ("Secret", reference, true),
+        (Some(_), Some(_)) => {
+            return Err("configMapRef and secretRef are mutually exclusive".into());
+        }
+        (None, None) => return Err("one of configMapRef or secretRef is required".into()),
+    };
+    let Some(namespace) = reference.namespace.as_deref().or(scope_namespace) else {
+        return Err(format!(
+            "a cluster-scoped resource has no default namespace; set namespace ({kind} {})",
+            reference.name
+        ));
+    };
+
+    let document = read_referenced_key(
+        client,
+        kind,
+        namespace,
+        &reference.name,
+        &reference.key,
+        is_secret,
+    )
+    .await?;
+
+    parse_values_document(&document).map_err(|e| {
+        format!(
+            "{kind} {namespace}/{} key {:?}: {e}",
+            reference.name, reference.key
+        )
+    })
+}
+
+/// Read one key of a ConfigMap or Secret in `namespace`. Secret values arrive
+/// base64-decoded and must be UTF-8. Errors are complete status messages.
+async fn read_referenced_key(
+    client: &Client,
+    kind: &str,
+    namespace: &str,
+    name: &str,
+    key: &str,
+    is_secret: bool,
+) -> Result<String, String> {
+    if is_secret {
+        let secret: Secret = Api::namespaced(client.clone(), namespace)
+            .get(name)
+            .await
+            .map_err(|e| not_found_or(e, format!("{kind} {namespace}/{name}")))?;
+        let bytes = secret
+            .data
+            .unwrap_or_default()
+            .remove(key)
+            .ok_or_else(|| format!("{kind} {namespace}/{name} has no key {key:?}"))?;
+        String::from_utf8(bytes.0).map_err(|_| {
+            format!("{kind} {namespace}/{name} key {key:?} is not UTF-8; the document must be text")
+        })
+    } else {
+        let config_map: ConfigMap = Api::namespaced(client.clone(), namespace)
+            .get(name)
+            .await
+            .map_err(|e| not_found_or(e, format!("{kind} {namespace}/{name}")))?;
+        config_map
+            .data
+            .unwrap_or_default()
+            .remove(key)
+            .ok_or_else(|| format!("{kind} {namespace}/{name} has no key {key:?}"))
+    }
+}
+
+/// Keep the common case in status short: a 404 is "not found", not a wall of
+/// `ApiError` JSON.
+fn not_found_or(error: kube::Error, reference: String) -> String {
+    match error {
+        kube::Error::Api(response) if response.code == 404 => format!("{reference} not found"),
+        other => format!("{reference}: {other}"),
+    }
+}
+
+/// The effective values for one component: golden defaults, then the external
+/// document, then the CR's inline `values` (see [`crate::values`] for the full
+/// order; `set` is handed to Helm as `--set` and wins on Helm's side).
+async fn resolve_component_values(
+    ctx: &Context,
+    overrides: &OverridesContext<'_>,
+    component: &str,
+) -> Result<serde_json::Value, String> {
+    let external = match overrides.overrides.values_from.get(component) {
+        Some(source) => Some(
+            resolve_values_from(&ctx.client, overrides.scope_namespace, source)
+                .await
+                .map_err(|reason| format!("valuesFrom {component}: {reason}"))?,
+        ),
+        None => None,
+    };
+    let inline = overrides.overrides.values.get(component);
+    Ok(effective_values(component, external.as_ref(), inline))
+}
+
 /// Apply (or plan) a component plan, returning a truthful per-component status.
 async fn apply_plan(
     ctx: &Context,
     namespace: &str,
     plan: &[ComponentPlan],
-    overrides: &ComponentValues,
+    overrides: &OverridesContext<'_>,
     dry_run: bool,
     adopt: bool,
-) -> Vec<ComponentStatus> {
-    warn_unknown_overrides(plan, overrides);
+) -> PlanOutcome {
+    warn_unknown_overrides(plan, overrides.overrides);
 
-    let mut components = Vec::with_capacity(plan.len());
+    let mut outcome = PlanOutcome {
+        components: Vec::with_capacity(plan.len()),
+        values_resolved: true,
+    };
+
     for component in plan {
         let Some(chart) = component.chart else {
-            components.push(ComponentStatus {
+            outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: false,
                 message: Some("no adapter yet".into()),
             });
             continue;
         };
+
+        let values = match resolve_component_values(ctx, overrides, component.name).await {
+            Ok(values) => values,
+            Err(message) => {
+                tracing::warn!(component = component.name, %message, "values not resolved; component skipped");
+                outcome.values_resolved = false;
+                outcome.components.push(ComponentStatus {
+                    name: component.name.to_string(),
+                    ready: false,
+                    message: Some(message),
+                });
+                continue;
+            }
+        };
+
         let release = HelmRelease {
             name: component.name.to_string(),
             chart: chart.to_string(),
@@ -158,20 +312,18 @@ async fn apply_plan(
             namespace: namespace.to_string(),
             dry_run,
             set: overrides
+                .overrides
                 .set
                 .get(component.name)
                 .cloned()
                 .unwrap_or_default(),
-            values: Some(effective_values(
-                component.name,
-                overrides.values.get(component.name),
-            )),
+            values: Some(values),
         };
 
         // Adopt guard: never silently take over a release this operator did not
         // create. `spec.adopt: true` is the explicit opt-in.
         if !dry_run && !adopt && ctx.helm.run(release.status_args(), None).await.is_ok() {
-            components.push(ComponentStatus {
+            outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: false,
                 message: Some(
@@ -183,14 +335,14 @@ async fn apply_plan(
         }
 
         match ctx.helm.run(release.args(), release.values_yaml()).await {
-            Ok(_) => components.push(ComponentStatus {
+            Ok(_) => outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: !dry_run,
                 message: dry_run.then(|| "planned (dry-run)".into()),
             }),
             Err(e) => {
                 tracing::warn!(component = component.name, error = %e, "apply failed");
-                components.push(ComponentStatus {
+                outcome.components.push(ComponentStatus {
                     name: component.name.to_string(),
                     ready: false,
                     message: Some(e.to_string()),
@@ -198,13 +350,18 @@ async fn apply_plan(
             }
         }
     }
-    components
+
+    outcome
 }
 
-fn phase(dry_run: bool, components: &[ComponentStatus]) -> &'static str {
-    if dry_run {
+fn phase(dry_run: bool, outcome: &PlanOutcome) -> &'static str {
+    if !outcome.values_resolved {
+        // An admin error (a missing or malformed values source) will not fix
+        // itself, unlike a transient apply failure.
+        "Degraded"
+    } else if dry_run {
         "Planned"
-    } else if components.iter().all(|c| c.ready) {
+    } else if outcome.components.iter().all(|c| c.ready) {
         "Ready"
     } else {
         "Progressing"
@@ -215,21 +372,25 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     let name = lh.name_any();
     let namespace = lh.namespace().unwrap_or_else(|| "default".into());
     let plan = plan_lakehouse(&lh.spec);
-    let components = apply_plan(
+    let overrides = OverridesContext {
+        scope_namespace: Some(&namespace),
+        overrides: &lh.spec.component_values,
+    };
+    let outcome = apply_plan(
         &ctx,
         &namespace,
         &plan,
-        &lh.spec.component_values,
+        &overrides,
         lh.spec.dry_run,
         lh.spec.adopt,
     )
     .await;
-    let phase = phase(lh.spec.dry_run, &components);
+    let phase = phase(lh.spec.dry_run, &outcome);
 
     let status = LakehouseStatus {
         phase: phase.into(),
         conditions: vec![],
-        components,
+        components: outcome.components,
     };
     let api: Api<Lakehouse> = match lh.namespace() {
         Some(ns) => Api::namespaced(ctx.client.clone(), &ns),
@@ -251,21 +412,27 @@ async fn reconcile_platform(
 ) -> Result<Action, kube::Error> {
     let name = instance.name_any();
     let plan = plan_platform(&instance.spec);
-    let components = apply_plan(
+    let overrides = OverridesContext {
+        // PlatformInstance is cluster-scoped: valuesFrom refs must name their
+        // namespace explicitly.
+        scope_namespace: None,
+        overrides: &instance.spec.component_values,
+    };
+    let outcome = apply_plan(
         &ctx,
         "stardelt",
         &plan,
-        &instance.spec.component_values,
+        &overrides,
         instance.spec.dry_run,
         false,
     )
     .await;
-    let phase = phase(instance.spec.dry_run, &components);
+    let phase = phase(instance.spec.dry_run, &outcome);
 
     let status = PlatformInstanceStatus {
         phase: phase.into(),
         conditions: vec![],
-        components,
+        components: outcome.components,
     };
     let api: Api<PlatformInstance> = Api::all(ctx.client.clone());
     api.patch_status(

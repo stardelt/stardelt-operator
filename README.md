@@ -86,7 +86,8 @@ it watches CRDs and applies upstream Helm releases via the `helm` binary in its 
 - `src/crd.rs` — the plug specification (types + status).
 - `src/planner.rs` — pure functions: which components a resource needs, in apply order, plus
   the golden chart pins (`chart_version`).
-- `src/values.rs` — pure functions: the golden per-component values and the merge order.
+- `src/values.rs` — pure functions: the golden per-component values, parsing of external
+  documents, and the merge order.
 - `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
 - `src/controller.rs` — reconciles `Tenant` → Namespace and `Lakehouse` → its component plan.
 - `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
@@ -100,14 +101,16 @@ values** per component (the curated settings that make the stack work, e.g. Trin
 layers the CR on top. Merge order per component, later wins:
 
 1. the operator's golden defaults (`src/values.rs`),
-2. `spec.values.<component>` — free-form YAML inline in the CR,
-3. `spec.set.<component>.<helm.key>` — passed to Helm as `--set`, which Helm always applies
+2. `spec.valuesFrom.<component>` — an external YAML document from a ConfigMap or Secret key,
+3. `spec.values.<component>` — free-form YAML inline in the CR,
+4. `spec.set.<component>.<helm.key>` — passed to Helm as `--set`, which Helm always applies
    last.
 
 The merge is a **deep merge**: objects merge key by key, arrays and scalars replace (Helm's
 own `-f` merge semantics). A key you do not set keeps its golden default.
 
-Worked example — pin Trino's resources on my cluster, and put SeaweedFS on a storage class:
+Worked example — pin Trino's resources on my cluster, put SeaweedFS on a storage class, and
+keep the per-environment base in GitOps:
 
 ```yaml
 apiVersion: stardelt.io/v1alpha1
@@ -133,6 +136,9 @@ spec:
             size: 100Gi
             storageClass: fast-ssd
             maxVolumes: 0
+  valuesFrom:
+    trino:
+      configMapRef: { name: trino-values, key: values.yaml }
   set:
     trino:
       server.workers: "2"      # convenience for a single scalar
@@ -144,6 +150,14 @@ Notes:
   `additionalConfigProperties`, because the override merges into it.
 - Arrays replace wholesale, exactly like `helm -f`: the `dataDirs` entry above must stay
   complete (`name`, `type`, `maxVolumes`), not just the `storageClass`.
+- `valuesFrom` references exactly one of `configMapRef` / `secretRef`, plus the `key` holding
+  the document. `namespace` is optional and defaults to the resource's own namespace; the
+  cluster-scoped `PlatformInstance` has none, so it must name one.
+- External documents are re-read on every reconcile — nothing is cached that could go stale,
+  so a document that changed in GitOps is picked up on the next pass. A missing or malformed
+  document is reported per component in `.status.components[].message`, the phase turns
+  `Degraded`, and the other components still reconcile (one bad reference never blocks the
+  Lakehouse).
 - Overrides keyed by a component that is not in the plan (e.g. `polaris` while the catalog
   is Lakekeeper) are ignored, with a warning in the operator log.
 
@@ -151,7 +165,9 @@ Notes:
 
 A new `Lakehouse` **plans only** (`spec.dryRun` defaults to `true`): the controller computes the
 component plan, runs `helm --dry-run` for each and writes the plan into `.status.components`.
-Set `dryRun: false` to actually apply.
+Set `dryRun: false` to actually apply. `.status.phase` is `Planned` while dry-running, `Ready`
+once every component applied, `Progressing` while one still needs to converge, and `Degraded`
+when a values source cannot be resolved — an admin error that will not heal by itself.
 
 ```yaml
 apiVersion: stardelt.io/v1alpha1
