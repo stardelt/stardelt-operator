@@ -83,6 +83,14 @@ Built with [kube-rs](https://kube.rs). The operator does **not** re-implement up
 it watches CRDs and applies upstream Helm releases via the `helm` binary in its image
 (`src/helm.rs`), then reports a truthful per-component status.
 
+- `src/crd.rs` — the plug specification (types + status).
+- `src/planner.rs` — pure functions: which components a resource needs, in apply order, plus
+  the golden chart pins (`chart_version`).
+- `src/values.rs` — pure functions: the golden per-component values and the merge order.
+- `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
+- `src/controller.rs` — reconciles `Tenant` → Namespace and `Lakehouse` → its component plan.
+- `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
+
 ### Component values
 
 Every planned component is configurable from the CR — chart values, resource sizing,
@@ -138,15 +146,6 @@ Notes:
   complete (`name`, `type`, `maxVolumes`), not just the `storageClass`.
 - Overrides keyed by a component that is not in the plan (e.g. `polaris` while the catalog
   is Lakekeeper) are ignored, with a warning in the operator log.
-
-
-- `src/crd.rs` — the plug specification (types + status).
-- `src/planner.rs` — pure functions: which components a resource needs, in apply order, plus
-  the golden chart pins (`chart_version`).
-- `src/values.rs` — pure functions: the golden per-component values and the merge order.
-- `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
-- `src/controller.rs` — reconciles `Tenant` → Namespace and `Lakehouse` → its component plan.
-- `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
 
 ### Safety: `dryRun`
 
