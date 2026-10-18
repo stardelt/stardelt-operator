@@ -34,6 +34,15 @@ pub fn golden_values(component: &str) -> Value {
         // orphan the Iceberg metadata pointing at the files. The S3 endpoint is
         // what the catalog and engines talk to, so it is on by default.
         "seaweedfs" => json_obj(&[
+            // The chart's swap/migration hook ships a cluster-scoped ClusterRole
+            // (`seaweedfs-rw-cr`). Cluster-scoped means one per cluster, so leaving
+            // it on makes the second lakehouse in a cluster fail to install — and
+            // several lakehouses per cluster is the point of this CRD. Off here for
+            // the same reason the platform chart sets it off.
+            (
+                "global",
+                serde_json::json!({ "seaweedfs": { "createClusterRole": false } }),
+            ),
             (
                 "master",
                 serde_json::json!({
@@ -167,6 +176,12 @@ mod tests {
         assert_eq!(
             seaweedfs["volume"]["dataDirs"][0]["type"],
             serde_json::json!("persistentVolumeClaim")
+        );
+        // A cluster-scoped role would make the second Lakehouse in a cluster
+        // uninstallable, so the golden values must keep it off.
+        assert_eq!(
+            seaweedfs["global"]["seaweedfs"]["createClusterRole"],
+            serde_json::json!(false)
         );
     }
 
