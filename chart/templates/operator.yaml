@@ -1,3 +1,4 @@
+{{- if gt (int .Values.replicaCount) 1 }}{{- fail "replicaCount > 1 is not supported yet: the operator has no leader election, and replicas would run concurrent helm upgrades" }}{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:

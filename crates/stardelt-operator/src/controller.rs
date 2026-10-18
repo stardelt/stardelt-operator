@@ -13,12 +13,15 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::{
-    api::core::v1::{ConfigMap, Namespace, Secret},
+    api::{
+        apps::v1::{Deployment, StatefulSet},
+        core::v1::{ConfigMap, Namespace, Secret},
+    },
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 use kube::{
     Api, Client, ResourceExt,
-    api::{Patch, PatchParams, PostParams},
+    api::{ListParams, Patch, PatchParams, PostParams},
     runtime::{Controller, controller::Action, watcher},
 };
 use serde_json::json;
@@ -28,7 +31,7 @@ use crate::crd::{
     ComponentStatus, ComponentValues, Lakehouse, LakehouseStatus, PlatformInstance,
     PlatformInstanceStatus, Tenant, TenantStatus, ValuesSource,
 };
-use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_owned};
+use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::values::{effective_values, parse_values_document};
 
@@ -285,6 +288,64 @@ fn profile_name(profile: Profile) -> &'static str {
     }
 }
 
+/// Ready when every Deployment/StatefulSet of the release reports all replicas ready.
+async fn workloads_ready(
+    client: &Client,
+    namespace: &str,
+    release: &str,
+) -> Result<(usize, usize), kube::Error> {
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(client.clone(), namespace);
+
+    let mut deployments_listed = deployments
+        .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={release}")))
+        .await?;
+    let mut statefulsets_listed = statefulsets
+        .list(&ListParams::default().labels(&format!("app.kubernetes.io/instance={release}")))
+        .await?;
+    if deployments_listed.items.is_empty() && statefulsets_listed.items.is_empty() {
+        // The common label is not universal: JupyterHub's chart stamps
+        // `release=<name>` on its workloads instead.
+        deployments_listed = deployments
+            .list(&ListParams::default().labels(&format!("release={release}")))
+            .await?;
+        statefulsets_listed = statefulsets
+            .list(&ListParams::default().labels(&format!("release={release}")))
+            .await?;
+    }
+
+    let mut ready = 0;
+    let mut total = 0;
+    let deployment_counts = deployments_listed.items.iter().map(|d| {
+        (
+            d.spec.as_ref().and_then(|s| s.replicas),
+            d.status.as_ref().and_then(|s| s.ready_replicas),
+        )
+    });
+    let statefulset_counts = statefulsets_listed.items.iter().map(|s| {
+        (
+            s.spec.as_ref().and_then(|s| s.replicas),
+            s.status.as_ref().and_then(|s| s.ready_replicas),
+        )
+    });
+    for (desired, current) in deployment_counts.chain(statefulset_counts) {
+        total += 1;
+        ready += usize::from(workload_ready(desired, current));
+    }
+    Ok((ready, total))
+}
+
+/// A workload is ready when it reports at least its desired replicas.
+fn workload_ready(desired: Option<i32>, ready: Option<i32>) -> bool {
+    ready.unwrap_or(0) >= desired.unwrap_or(1)
+}
+
+/// Ready when every workload of the release is; a release with no workloads at
+/// all is not ready (no evidence that anything runs).
+fn ready_from_counts(ready: usize, total: usize) -> bool {
+    total > 0 && ready == total
+}
+
 /// Apply (or plan) a component plan, returning a truthful per-component status.
 async fn apply_plan(
     ctx: &Context,
@@ -293,6 +354,7 @@ async fn apply_plan(
     overrides: &OverridesContext<'_>,
     dry_run: bool,
     adopt: bool,
+    previous: &[ComponentStatus],
 ) -> PlanOutcome {
     warn_unknown_overrides(plan, overrides.overrides);
 
@@ -307,6 +369,7 @@ async fn apply_plan(
                 name: component.name.to_string(),
                 ready: false,
                 message: Some("no adapter yet".into()),
+                applied_hash: None,
             });
             continue;
         };
@@ -320,6 +383,7 @@ async fn apply_plan(
                     name: component.name.to_string(),
                     ready: false,
                     message: Some(message),
+                    applied_hash: None,
                 });
                 continue;
             }
@@ -340,6 +404,28 @@ async fn apply_plan(
                 .unwrap_or_default(),
             values: Some(values),
         };
+        let fingerprint = release.fingerprint();
+
+        // Unchanged component: same args and values as the last successful apply,
+        // previously ready, and Helm still reports the release deployed — no new
+        // revision is needed. Only for a real apply; a dry run plans every time.
+        let unchanged = !dry_run
+            && previous.iter().any(|p| {
+                p.name == component.name
+                    && p.ready
+                    && p.applied_hash.as_deref() == Some(fingerprint.as_str())
+            });
+        if unchanged
+            && matches!(ctx.helm.run(release.status_args(), None).await, Ok(out) if is_deployed(&out))
+        {
+            outcome.components.push(ComponentStatus {
+                name: component.name.to_string(),
+                ready: true,
+                message: Some("unchanged".into()),
+                applied_hash: Some(fingerprint),
+            });
+            continue;
+        }
 
         // Adopt guard: never silently take over a release this operator did not
         // create. Releases it installed carry `OWNER_MARKER` in their history, so
@@ -355,27 +441,48 @@ async fn apply_plan(
                     "release exists and is not owned by this operator — set spec.adopt: true to take it over"
                         .into(),
                 ),
+                applied_hash: None,
             });
             continue;
         }
 
         match ctx.helm.run(release.args(), release.values_yaml()).await {
-            Ok(_) => outcome.components.push(ComponentStatus {
+            Ok(_) if dry_run => outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
-                ready: !dry_run,
-                message: dry_run.then(|| {
-                    format!(
-                        "planned (dry-run, profile={})",
-                        profile_name(overrides.profile)
-                    )
-                }),
+                ready: false,
+                message: Some(format!(
+                    "planned (dry-run, profile={})",
+                    profile_name(overrides.profile)
+                )),
+                applied_hash: None,
             }),
+            Ok(_) => {
+                // The apply exited 0; the status tells the truth about the
+                // workloads it left behind, not about Helm's exit code.
+                let component_status =
+                    match workloads_ready(&ctx.client, namespace, component.name).await {
+                        Ok((ready, total)) => ComponentStatus {
+                            name: component.name.to_string(),
+                            ready: ready_from_counts(ready, total),
+                            message: Some(format!("{ready}/{total} workloads ready")),
+                            applied_hash: Some(fingerprint),
+                        },
+                        Err(e) => ComponentStatus {
+                            name: component.name.to_string(),
+                            ready: false,
+                            message: Some(e.to_string()),
+                            applied_hash: None,
+                        },
+                    };
+                outcome.components.push(component_status);
+            }
             Err(e) => {
                 tracing::warn!(component = component.name, error = %e, "apply failed");
                 outcome.components.push(ComponentStatus {
                     name: component.name.to_string(),
                     ready: false,
                     message: Some(e.to_string()),
+                    applied_hash: None,
                 });
             }
         }
@@ -407,6 +514,11 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         overrides: &lh.spec.component_values,
         profile: lh.spec.profile,
     };
+    let previous = lh
+        .status
+        .as_ref()
+        .map(|s| s.components.as_slice())
+        .unwrap_or(&[]);
     let outcome = apply_plan(
         &ctx,
         &namespace,
@@ -414,6 +526,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         &overrides,
         lh.spec.dry_run,
         lh.spec.adopt,
+        previous,
     )
     .await;
     let phase = phase(lh.spec.dry_run, &outcome);
@@ -450,6 +563,11 @@ async fn reconcile_platform(
         overrides: &instance.spec.component_values,
         profile: instance.spec.profile,
     };
+    let previous = instance
+        .status
+        .as_ref()
+        .map(|s| s.components.as_slice())
+        .unwrap_or(&[]);
     let outcome = apply_plan(
         &ctx,
         "stardelt",
@@ -457,6 +575,7 @@ async fn reconcile_platform(
         &overrides,
         instance.spec.dry_run,
         false,
+        previous,
     )
     .await;
     let phase = phase(instance.spec.dry_run, &outcome);
@@ -480,4 +599,349 @@ async fn reconcile_platform(
 fn error_policy<K>(_obj: Arc<K>, err: &kube::Error, _ctx: Arc<Context>) -> Action {
     tracing::warn!(error = %err, "reconcile failed");
     Action::requeue(Duration::from_secs(30))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::helm::OWNER_MARKER;
+    use crate::helm::testing::RecordingRunner;
+
+    /// The tests describe one release, so the plan holds one component.
+    fn plan() -> Vec<ComponentPlan> {
+        vec![ComponentPlan {
+            name: "trino",
+            chart: Some("trino/trino"),
+        }]
+    }
+
+    /// Overrides that change the release fingerprint when `workers` changes.
+    fn overrides(workers: u8) -> ComponentValues {
+        let mut values = ComponentValues::default();
+        values.set.insert(
+            "trino".into(),
+            BTreeMap::from([("server.workers".to_string(), workers.to_string())]),
+        );
+        values
+    }
+
+    fn overrides_context(values: &ComponentValues) -> OverridesContext<'_> {
+        OverridesContext {
+            scope_namespace: Some("stardelt"),
+            overrides: values,
+            profile: Profile::Demo,
+        }
+    }
+
+    /// A helm double that answers `helm history` like a release this operator owns.
+    fn helm_stub() -> Arc<RecordingRunner> {
+        let helm = Arc::new(RecordingRunner::default());
+        helm.reply(
+            "history",
+            format!(r#"[{{"revision":1,"description":"{OWNER_MARKER}"}}]"#),
+        );
+        helm
+    }
+
+    fn upgrades(helm: &RecordingRunner) -> usize {
+        helm.calls
+            .lock()
+            .expect("calls poisoned")
+            .iter()
+            .filter(|call| call.args.first().map(String::as_str) == Some("upgrade"))
+            .count()
+    }
+
+    /// `DeploymentList` items with `ready` of `desired` replicas ready.
+    fn deployment_list(ready: i32, desired: i32) -> String {
+        format!(
+            r#"[{{"metadata":{{"name":"trino-coordinator","namespace":"stardelt"}},"spec":{{"replicas":{desired}}},"status":{{"readyReplicas":{ready}}}}}]"#
+        )
+    }
+
+    /// A kube client whose DeploymentList items come from `primary` or
+    /// `fallback`, chosen by the label selector of the request; the
+    /// StatefulSetList is always empty. Every request URL is recorded.
+    fn mock_client(primary: &str, fallback: &str) -> (Client, Arc<Mutex<Vec<String>>>) {
+        let requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorder = requests.clone();
+        let (primary, fallback) = (primary.to_string(), fallback.to_string());
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let path = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            recorder
+                .lock()
+                .expect("requests poisoned")
+                .push(format!("{path}?{query}"));
+            let (kind, items) = if path.ends_with("deployments") {
+                let items = if query.contains("release%3D") {
+                    fallback.clone()
+                } else {
+                    primary.clone()
+                };
+                ("DeploymentList", items)
+            } else {
+                ("StatefulSetList", "[]".to_string())
+            };
+            let document = format!(
+                r#"{{"apiVersion":"apps/v1","kind":"{kind}","metadata":{{"resourceVersion":"1"}},"items":{items}}}"#
+            );
+            std::future::ready(Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(document.into_bytes()))
+                    .expect("valid mock response"),
+            ))
+        });
+        (Client::new(service, "stardelt"), requests)
+    }
+
+    #[test]
+    fn ready_from_counts_matches_replica_truth() {
+        assert!(!ready_from_counts(0, 0), "no workloads is not ready");
+        assert!(!ready_from_counts(1, 2));
+        assert!(ready_from_counts(2, 2));
+    }
+
+    #[tokio::test]
+    async fn workloads_that_are_not_ready_do_not_report_ready() {
+        let helm = helm_stub();
+        // The primary (instance) selector finds nothing; the JupyterHub-style
+        // `release=` fallback returns the workloads.
+        let (client, requests) = mock_client("[]", &deployment_list(0, 2));
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+
+        let outcome = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides_context(&values),
+            false,
+            false,
+            &[],
+        )
+        .await;
+
+        assert_eq!(upgrades(&helm), 1, "the release was applied");
+        let status = &outcome.components[0];
+        assert!(
+            !status.ready,
+            "0/1 workloads cannot report ready: {status:?}"
+        );
+        assert_eq!(status.message.as_deref(), Some("0/1 workloads ready"));
+        assert_eq!(phase(false, &outcome), "Progressing");
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(requests.iter().any(|r| r.contains("instance%3Dtrino")));
+        assert!(
+            requests.iter().any(|r| r.contains("release%3Dtrino")),
+            "the fallback label must be tried: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_workloads_report_ready() {
+        let helm = helm_stub();
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+
+        let outcome = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides_context(&values),
+            false,
+            false,
+            &[],
+        )
+        .await;
+
+        let status = &outcome.components[0];
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("1/1 workloads ready"));
+        assert!(
+            status.applied_hash.is_some(),
+            "a successful apply records its fingerprint"
+        );
+        assert_eq!(phase(false, &outcome), "Ready");
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_component_is_not_reapplied() {
+        let helm = helm_stub();
+        helm.reply("status", r#"{"info":{"status":"deployed"}}"#);
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let overrides = overrides_context(&values);
+
+        let first = apply_plan(&ctx, "stardelt", &plan(), &overrides, false, false, &[]).await;
+        assert!(first.components[0].ready, "{:?}", first.components[0]);
+        assert_eq!(upgrades(&helm), 1);
+
+        let second = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides,
+            false,
+            false,
+            &first.components,
+        )
+        .await;
+
+        assert_eq!(second.components[0].message.as_deref(), Some("unchanged"));
+        assert!(second.components[0].ready);
+        assert_eq!(
+            second.components[0].applied_hash,
+            first.components[0].applied_hash
+        );
+        assert_eq!(
+            upgrades(&helm),
+            1,
+            "an unchanged component must not be re-upgraded"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_values_reapply() {
+        let helm = helm_stub();
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let before = overrides(1);
+        let after = overrides(3);
+
+        let first = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides_context(&before),
+            false,
+            false,
+            &[],
+        )
+        .await;
+        let second = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides_context(&after),
+            false,
+            false,
+            &first.components,
+        )
+        .await;
+
+        assert_ne!(
+            first.components[0].applied_hash, second.components[0].applied_hash,
+            "the fingerprint follows the values"
+        );
+        assert_eq!(upgrades(&helm), 2, "a changed component is re-applied");
+    }
+
+    #[tokio::test]
+    async fn a_failed_release_reapplies_even_when_unchanged() {
+        let helm = helm_stub();
+        helm.reply("status", r#"{"info":{"status":"deployed"}}"#);
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let overrides = overrides_context(&values);
+
+        let first = apply_plan(&ctx, "stardelt", &plan(), &overrides, false, false, &[]).await;
+        assert_eq!(upgrades(&helm), 1);
+
+        helm.reply("status", r#"{"info":{"status":"failed"}}"#);
+        let second = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides,
+            false,
+            false,
+            &first.components,
+        )
+        .await;
+
+        assert_eq!(
+            second.components[0].applied_hash, first.components[0].applied_hash,
+            "the fingerprint is unchanged…"
+        );
+        assert_eq!(
+            upgrades(&helm),
+            2,
+            "…but a release that is not deployed is re-applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_runs_always_plan() {
+        let helm = helm_stub();
+        let (client, _requests) = mock_client("[]", "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let previous = vec![ComponentStatus {
+            name: "trino".into(),
+            ready: true,
+            message: None,
+            applied_hash: Some("a-hash-from-an-earlier-pass".into()),
+        }];
+
+        let outcome = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides_context(&values),
+            true,
+            false,
+            &previous,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.components[0].message.as_deref(),
+            Some("planned (dry-run, profile=demo)")
+        );
+        assert!(!outcome.components[0].ready);
+        assert!(outcome.components[0].applied_hash.is_none());
+
+        let calls = helm.calls.lock().expect("calls poisoned");
+        assert!(
+            calls.iter().any(
+                |call| call.args.first().map(String::as_str) == Some("upgrade")
+                    && call.args.contains(&"--dry-run".to_string())
+            ),
+            "a dry run renders the plan every time"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("status")),
+            "a dry run does not consult the release"
+        );
+    }
 }

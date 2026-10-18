@@ -106,6 +106,38 @@ impl HelmRelease {
             "json".into(),
         ]
     }
+
+    /// Identifies what would be applied: args (chart, version, namespace, --set)
+    /// plus the values document.
+    // DefaultHasher is not stable across Rust releases; after an operator upgrade
+    // each component re-applies once.
+    pub fn fingerprint(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.args().hash(&mut h);
+        self.values_yaml().hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+
+    /// `helm status -o json` — tells whether the release currently is `deployed`
+    /// (as opposed to `failed`, `pending`, …).
+    pub fn status_args(&self) -> Vec<String> {
+        vec![
+            "status".into(),
+            self.name.clone(),
+            "--namespace".into(),
+            self.namespace.clone(),
+            "-o".into(),
+            "json".into(),
+        ]
+    }
+}
+
+/// True when `helm status -o json` output reports the release as `deployed`.
+pub fn is_deployed(status_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(status_json)
+        .ok()
+        .is_some_and(|v| v["info"]["status"] == "deployed")
 }
 
 /// True when any revision in `helm history -o json` output carries [`OWNER_MARKER`].
@@ -161,6 +193,7 @@ impl HelmRunner for CommandHelmRunner {
 #[cfg(test)]
 pub mod testing {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// One recorded helm invocation.
@@ -170,10 +203,22 @@ pub mod testing {
         pub stdin: Option<String>,
     }
 
-    /// Records calls instead of running helm.
+    /// Records calls instead of running helm, answering each call from a
+    /// per-verb reply (`run` returns the empty string when none is set).
     #[derive(Default)]
     pub struct RecordingRunner {
         pub calls: Mutex<Vec<HelmCall>>,
+        pub replies: Mutex<HashMap<String, String>>,
+    }
+
+    impl RecordingRunner {
+        /// Set what the next call to `helm <verb>` returns.
+        pub fn reply(&self, verb: &str, output: impl Into<String>) {
+            self.replies
+                .lock()
+                .expect("replies poisoned")
+                .insert(verb.into(), output.into());
+        }
     }
 
     impl HelmRunner for RecordingRunner {
@@ -182,11 +227,19 @@ pub mod testing {
             args: Vec<String>,
             stdin: Option<String>,
         ) -> BoxFuture<'static, anyhow::Result<String>> {
+            let verb = args.first().cloned().unwrap_or_default();
             self.calls
                 .lock()
                 .expect("calls poisoned")
                 .push(HelmCall { args, stdin });
-            Box::pin(async { Ok(String::new()) })
+            let output = self
+                .replies
+                .lock()
+                .expect("replies poisoned")
+                .get(&verb)
+                .cloned()
+                .unwrap_or_default();
+            Box::pin(async move { Ok(output) })
         }
     }
 }
@@ -308,5 +361,47 @@ mod tests {
         let foreign = r#"[{"revision":1,"description":"Install complete"}]"#;
         assert!(is_owned(&mine));
         assert!(!is_owned(foreign));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_for_equal_releases() {
+        assert_eq!(release(false).fingerprint(), release(false).fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_values() {
+        let mut changed = release(false);
+        changed.values = Some(serde_json::json!({ "s3": { "enabled": false } }));
+        assert_ne!(release(false).fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_version() {
+        let mut changed = release(false);
+        changed.version = Some("4.25.2".into());
+        assert_ne!(release(false).fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn is_deployed_reads_info_status() {
+        assert!(is_deployed(r#"{"info":{"status":"deployed"}}"#));
+        assert!(!is_deployed(r#"{"info":{"status":"failed"}}"#));
+        assert!(!is_deployed("not json at all"));
+    }
+
+    #[test]
+    fn status_args_target_the_release_namespace() {
+        let args = release(false).status_args();
+        assert_eq!(
+            args,
+            vec![
+                "status",
+                "seaweedfs",
+                "--namespace",
+                "stardelt",
+                "-o",
+                "json"
+            ]
+        );
     }
 }

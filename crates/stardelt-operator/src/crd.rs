@@ -428,6 +428,14 @@ pub struct ComponentStatus {
     pub ready: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Fingerprint (args + values) of the release that was applied last time a
+    /// hash was recorded; lets the next reconcile skip an unchanged component.
+    #[serde(
+        default,
+        rename = "appliedHash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub applied_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
