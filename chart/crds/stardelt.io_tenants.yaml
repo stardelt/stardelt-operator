@@ -5,7 +5,6 @@ metadata:
 spec:
   group: stardelt.io
   names:
-    categories: []
     kind: Tenant
     plural: tenants
     shortNames:
@@ -13,8 +12,7 @@ spec:
     singular: tenant
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: 'A tenant: an isolation boundary for data and identities.'

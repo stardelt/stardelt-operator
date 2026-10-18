@@ -112,30 +112,22 @@ pub struct ComponentValues {
     pub values_from: BTreeMap<String, ValuesSource>,
 }
 
-/// CRD schema for `values.<component>`: an object of free-form values, kept
-/// verbatim by the API server (`x-kubernetes-preserve-unknown-fields`).
-fn component_values_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
-    use schemars::schema::{InstanceType, ObjectValidation, SchemaObject};
-
-    let free_form_object = SchemaObject {
-        instance_type: Some(InstanceType::Object.into()),
-        extensions: [(
-            "x-kubernetes-preserve-unknown-fields".to_string(),
-            serde_json::Value::Bool(true),
-        )]
-        .into_iter()
-        .collect(),
-        ..Default::default()
-    };
-    SchemaObject {
-        instance_type: Some(InstanceType::Object.into()),
-        object: Some(Box::new(ObjectValidation {
-            additional_properties: Some(Box::new(free_form_object.into())),
-            ..Default::default()
-        })),
-        ..Default::default()
-    }
-    .into()
+/// CRD schema for `values.<component>`: free-form YAML kept verbatim by the API
+/// server (`x-kubernetes-preserve-unknown-fields`).
+///
+/// schemars 1.x represents a schema as raw JSON instead of the old typed tree
+/// (`SchemaObject`/`InstanceType`/`ObjectValidation` are gone), so this is written
+/// as the object it is: an object whose values are free-form objects.
+fn component_values_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": {
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true
+        }
+    })
+    .try_into()
+    .expect("the schema literal above is valid JSON Schema")
 }
 
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
