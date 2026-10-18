@@ -135,6 +135,12 @@ spec:
                 default: []
                 items:
                   properties:
+                    appliedHash:
+                      description: |-
+                        Fingerprint (args + values) of the release that was applied last time a
+                        hash was recorded; lets the next reconcile skip an unchanged component.
+                      nullable: true
+                      type: string
                     message:
                       nullable: true
                       type: string

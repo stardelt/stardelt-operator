@@ -18,3 +18,9 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Already in the dependency tree (kube pulls both in); used to build a mock kube
+# client for the controller tests, so no test needs a cluster.
+http = "1"
+tower = { version = "0.5", features = ["util"] }

@@ -13,8 +13,15 @@ async fn main() -> anyhow::Result<()> {
     match stardelt_operator::controller::run().await {
         Ok(()) => {}
         Err(e) => {
-            // No cluster available (e.g. running `cargo run` locally): stay alive
-            // instead of crash-looping so the process can idle in a pod.
+            // In a pod an unreachable API server is a startup failure: exit non-zero
+            // so the container restarts (and the failure is visible in the pod
+            // status) instead of idling for a cluster that may never answer.
+            if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+                tracing::error!(error = %e, "Kubernetes API unreachable; exiting so the container restarts");
+                return Err(e);
+            }
+            // Locally (`cargo run`) no cluster is expected: stay alive instead of
+            // crash-looping so the process can idle.
             tracing::warn!(error = %e, "no Kubernetes cluster available; operator idle");
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;

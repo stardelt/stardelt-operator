@@ -6,6 +6,7 @@ image:
 # GHCR packages are private; reference the pull secret when one is needed.
 imagePullSecrets: []
 
+# Must stay 1 until leader election lands (the chart refuses more).
 replicaCount: 1
 
 # RUST_LOG filter for the operator.

@@ -49,9 +49,9 @@ spec:
 Notebooks are platform-level on purpose: one hub serves every lakehouse, and it is a whole
 stack (hub, proxy, single-user pods) rather than a per-catalog concern. The golden values
 mirror `stardelt-platform/helm-values/jupyterhub.yaml` — small resources, `ClusterIP`,
-ephemeral per-user storage, the chart's dummy authenticator with the platform's documented
-throwaway password. Point it at your OIDC provider (the realm already defines the
-`jupyterhub` client) through `spec.values` before it carries anything real.
+ephemeral per-user storage, sign-in through the platform IdP: the hub reads the identity
+contract (ConfigMap `stardelt-identity`, Secret `stardelt-oidc-clients`) from its namespace;
+install it with stardelt-platform's `make install-identity` first, or nobody can sign in.
 
 ### Plug selection
 

@@ -32,22 +32,33 @@ pub fn golden_values(component: &str) -> Value {
             "additionalConfigProperties",
             serde_json::json!(["http-server.process-forwarded=true"]),
         )]),
-        // Mirrors the cluster-independent subset of
-        // stardelt-platform/helm-values/jupyterhub.yaml: the dev shape that fits a
-        // notebook stack on one small node. `singleuser.storage: none` keeps the
-        // per-user volume out of the way on a throwaway cluster, and the dummy
-        // authenticator is the chart's, with the same documented throwaway
-        // password the platform uses — an operator replacing it with the
-        // platform's OIDC provider (the realm already defines the `jupyterhub`
-        // client) does that through `spec.values`.
+        // Sign-in goes through the platform IdP, exactly like
+        // stardelt-platform/helm-values/jupyterhub.yaml: the hub reads the identity
+        // contract (ConfigMap stardelt-identity, Secret stardelt-oidc-clients) of
+        // its own namespace. There is no shared-password login.
         "jupyterhub" => json_obj(&[
             (
                 "hub",
                 serde_json::json!({
                     "config": {
-                        "JupyterHub": { "authenticator_class": "dummy" },
-                        "DummyAuthenticator": { "password": "stardelt" }
+                        "JupyterHub": { "authenticator_class": "generic-oauth" },
+                        "GenericOAuthenticator": {
+                            "client_id": "jupyterhub",
+                            "login_service": "Keycloak",
+                            "auto_login": true,
+                            "username_claim": "preferred_username",
+                            "scope": ["openid", "profile", "email"],
+                            "manage_groups": true,
+                            "auth_state_groups_key": "oauth_user.groups",
+                            "allowed_groups": ["stardelt-admins", "stardelt-users"],
+                            "admin_groups": ["stardelt-admins"]
+                        }
                     },
+                    "extraEnv": {
+                        "STARDELT_OIDC_ISSUER_URL": { "valueFrom": { "configMapKeyRef": { "name": "stardelt-identity", "key": "issuerUrl", "optional": true } } },
+                        "STARDELT_OIDC_CLIENT_SECRET": { "valueFrom": { "secretKeyRef": { "name": "stardelt-oidc-clients", "key": "jupyterhub", "optional": true } } }
+                    },
+                    "extraConfig": { "10-oidc": include_str!("jupyterhub_oidc.py") },
                     "resources": {
                         "requests": { "cpu": "50m", "memory": "256Mi" },
                         "limits": { "cpu": "500m", "memory": "512Mi" }
@@ -300,7 +311,7 @@ mod tests {
         let j = golden_values("jupyterhub");
         assert_eq!(
             j["hub"]["config"]["JupyterHub"]["authenticator_class"],
-            serde_json::json!("dummy")
+            serde_json::json!("generic-oauth")
         );
         assert_eq!(
             j["proxy"]["service"]["type"],
@@ -311,6 +322,37 @@ mod tests {
             serde_json::json!("none")
         );
         assert_eq!(j["singleuser"]["defaultUrl"], serde_json::json!("/lab"));
+    }
+
+    #[test]
+    fn jupyterhub_golden_values_hold_no_credential() {
+        let text = golden_values("jupyterhub").to_string();
+        assert!(!text.contains("DummyAuthenticator"));
+        assert!(!text.contains("\"password\""));
+        assert!(text.contains("stardelt-oidc-clients"));
+    }
+
+    #[test]
+    fn jupyterhub_identity_references_are_optional() {
+        // A cluster without `make install-identity` must still start the hub:
+        // the ConfigMap/Secret references are optional, never required objects.
+        let hub = golden_values("jupyterhub")["hub"].clone();
+        assert_eq!(
+            hub["extraEnv"]["STARDELT_OIDC_ISSUER_URL"]["valueFrom"]["configMapKeyRef"]["optional"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            hub["extraEnv"]["STARDELT_OIDC_CLIENT_SECRET"]["valueFrom"]["secretKeyRef"]["optional"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            hub["extraEnv"]["STARDELT_OIDC_ISSUER_URL"]["valueFrom"]["configMapKeyRef"]["name"],
+            serde_json::json!("stardelt-identity")
+        );
+        assert_eq!(
+            hub["extraEnv"]["STARDELT_OIDC_CLIENT_SECRET"]["valueFrom"]["secretKeyRef"]["name"],
+            serde_json::json!("stardelt-oidc-clients")
+        );
     }
 
     #[test]
