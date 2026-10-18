@@ -14,6 +14,8 @@
 
 use serde_json::{Map, Value};
 
+use crate::crd::Profile;
+
 /// Golden Helm values for one component: the curated settings that cannot be
 /// left to chart defaults without breaking the stack.
 ///
@@ -123,6 +125,61 @@ pub fn golden_values(component: &str) -> Value {
     }
 }
 
+/// Sizing for one profile, applied between the golden values and anything the CR asks for.
+///
+/// The platform already thinks this way: `make install-core SLIM=1` layers
+/// `helm-values/slim/` over the base values, and `install` does not. Mirroring that keeps one
+/// story — `demo` is the shape that fits a small node or a CI runner (Trino heaps that fit
+/// next to everything else, PVCs measured in gigabytes), while `full` and `airgap` are the
+/// base values. `airgap` matches `full` for now: the air-gap kit is P4 work layered on top,
+/// not a different size.
+///
+/// Anything here can be overridden by the CR: this is a default, not a policy.
+pub fn profile_values(component: &str, profile: Profile) -> Value {
+    if !matches!(profile, Profile::Demo) {
+        return Value::Object(Map::new());
+    }
+    match component {
+        // Constraint from the platform values: query.maxMemory + 30% heap headroom must fit
+        // the heap. 900MB + 450MB = 1350MB ≤ 1500m. Lowering the heap without
+        // query.maxMemoryPerNode makes Trino refuse to start.
+        "trino" => json_obj(&[
+            (
+                "server",
+                serde_json::json!({
+                    "workers": 1,
+                    "config": { "query": { "maxMemory": "900MB" } }
+                }),
+            ),
+            (
+                "coordinator",
+                serde_json::json!({
+                    "jvm": { "maxHeapSize": "1500m" },
+                    "additionalJVMConfig": ["-Xms512m"],
+                    "config": { "query": { "maxMemoryPerNode": "1GB" } }
+                }),
+            ),
+            (
+                "worker",
+                serde_json::json!({
+                    "jvm": { "maxHeapSize": "1500m" },
+                    "additionalJVMConfig": ["-Xms512m"],
+                    "config": { "query": { "maxMemoryPerNode": "1GB" } }
+                }),
+            ),
+        ]),
+        "seaweedfs" => json_obj(&[
+            ("master", serde_json::json!({ "data": { "size": "1Gi" } })),
+            (
+                "volume",
+                serde_json::json!({ "dataDirs": [{ "size": "5Gi" }] }),
+            ),
+            ("filer", serde_json::json!({ "data": { "size": "1Gi" } })),
+        ]),
+        _ => Value::Object(Map::new()),
+    }
+}
+
 /// Build a values object from `(key, value)` pairs.
 fn json_obj(pairs: &[(&str, Value)]) -> Value {
     Value::Object(
@@ -175,10 +232,11 @@ pub fn parse_values_document(document: &str) -> Result<Value, ValuesError> {
 /// order; `set` is handed to Helm as `--set` and is not part of this document).
 pub fn effective_values(
     component: &str,
+    profile: Profile,
     external: Option<&Value>,
     inline: Option<&Value>,
 ) -> Value {
-    let mut values = golden_values(component);
+    let mut values = deep_merge(golden_values(component), profile_values(component, profile));
     for over in [external, inline].into_iter().flatten() {
         values = deep_merge(values, over.clone());
     }
@@ -256,14 +314,62 @@ mod tests {
     }
 
     #[test]
+    fn demo_profile_sizes_the_stack_for_a_small_node() {
+        // Trino: the heap and the per-node memory limit are a pair — Trino refuses to start
+        // if the limit does not fit the heap, which is why both are in the profile.
+        let trino = effective_values("trino", Profile::Demo, None, None);
+        assert_eq!(
+            trino["coordinator"]["jvm"]["maxHeapSize"],
+            serde_json::json!("1500m")
+        );
+        assert_eq!(
+            trino["coordinator"]["config"]["query"]["maxMemoryPerNode"],
+            serde_json::json!("1GB")
+        );
+        assert_eq!(trino["server"]["workers"], serde_json::json!(1));
+        // SeaweedFS: gigabyte-scale volumes instead of the chart's defaults.
+        let seaweedfs = effective_values("seaweedfs", Profile::Demo, None, None);
+        assert_eq!(
+            seaweedfs["volume"]["dataDirs"][0]["size"],
+            serde_json::json!("5Gi")
+        );
+        // The golden values must survive the overlay: the profile sizes, it does not replace.
+        assert_eq!(seaweedfs["s3"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn full_profile_leaves_sizing_to_the_charts() {
+        for component in ["trino", "seaweedfs"] {
+            assert_eq!(
+                effective_values(component, Profile::Full, None, None),
+                golden_values(component),
+                "{component}: full adds no sizing of its own"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cr_value_beats_the_profile() {
+        let inline = serde_json::json!({ "coordinator": { "jvm": { "maxHeapSize": "8G" } } });
+        let merged = effective_values("trino", Profile::Demo, None, Some(&inline));
+        assert_eq!(
+            merged["coordinator"]["jvm"]["maxHeapSize"],
+            serde_json::json!("8G")
+        );
+        // …and the rest of the profile still applies.
+        assert_eq!(merged["server"]["workers"], serde_json::json!(1));
+    }
+
+    #[test]
     fn empty_overrides_leave_the_golden_document_untouched() {
         assert_eq!(
-            effective_values("trino", None, None),
+            effective_values("trino", Profile::Full, None, None),
             golden_values("trino")
         );
         assert_eq!(
             effective_values(
                 "trino",
+                Profile::Full,
                 Some(&serde_json::json!({})),
                 Some(&serde_json::json!({}))
             ),
@@ -280,7 +386,7 @@ mod tests {
         let inline = serde_json::json!({
             "coordinator": { "jvm": { "maxHeapSize": "4G" } }
         });
-        let merged = effective_values("trino", Some(&external), Some(&inline));
+        let merged = effective_values("trino", Profile::Full, Some(&external), Some(&inline));
 
         // Inline beats the external document, which beats the golden default.
         assert_eq!(
@@ -303,7 +409,7 @@ mod tests {
         let inline = serde_json::json!({
             "coordinator": { "resources": { "limits": { "cpu": "2" } } }
         });
-        let merged = effective_values("trino", None, Some(&inline));
+        let merged = effective_values("trino", Profile::Full, None, Some(&inline));
         assert_eq!(
             merged["additionalConfigProperties"],
             serde_json::json!(["http-server.process-forwarded=true"]),
