@@ -55,6 +55,19 @@ spec:
                 - full
                 - airgap
                 type: string
+              set:
+                additionalProperties:
+                  additionalProperties:
+                    type: string
+                  type: object
+                description: '`--set` overrides per component: `set.<component>.<helm.key>: "value"`. Highest precedence — Helm applies `--set` after any values document.'
+                type: object
+              values:
+                additionalProperties:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                description: Free-form Helm values per component, e.g. `values.trino.worker.resources`. Deep-merged over the golden defaults, so one key can be pinned without restating the rest.
+                type: object
             type: object
           status:
             nullable: true

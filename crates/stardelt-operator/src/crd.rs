@@ -51,6 +51,56 @@ impl Default for Pillars {
     }
 }
 
+/// Per-component Helm value overrides, shared by the root CRDs.
+///
+/// Administrators configure each plug (chart values, sizing, storage class,
+/// ingress, image registry) here. The operator ships golden defaults per
+/// component — the curated settings that make the stack work — and these
+/// fields layer on top. Merge order per component, later wins:
+///
+/// 1. the operator's golden defaults,
+/// 2. `values` (free-form YAML inline in the CR),
+/// 3. `set` (passed to Helm as `--set`, which Helm always applies last).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct ComponentValues {
+    /// Free-form Helm values per component, e.g. `values.trino.worker.resources`.
+    /// Deep-merged over the golden defaults, so one key can be pinned without
+    /// restating the rest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "component_values_schema")]
+    pub values: BTreeMap<String, serde_json::Value>,
+    /// `--set` overrides per component: `set.<component>.<helm.key>: "value"`.
+    /// Highest precedence — Helm applies `--set` after any values document.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub set: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// CRD schema for `values.<component>`: an object of free-form values, kept
+/// verbatim by the API server (`x-kubernetes-preserve-unknown-fields`).
+fn component_values_schema(_: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
+    use schemars::schema::{InstanceType, ObjectValidation, SchemaObject};
+
+    let free_form_object = SchemaObject {
+        instance_type: Some(InstanceType::Object.into()),
+        extensions: [(
+            "x-kubernetes-preserve-unknown-fields".to_string(),
+            serde_json::Value::Bool(true),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    SchemaObject {
+        instance_type: Some(InstanceType::Object.into()),
+        object: Some(Box::new(ObjectValidation {
+            additional_properties: Some(Box::new(free_form_object.into())),
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+    .into()
+}
+
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -69,6 +119,10 @@ pub struct PlatformInstanceSpec {
     /// Plan only (no cluster changes) until explicitly disabled. Safe default.
     #[serde(default = "default_true", rename = "dryRun")]
     pub dry_run: bool,
+    /// Per-component Helm value overrides for the platform's own components
+    /// (today: `cnpg`).
+    #[serde(flatten)]
+    pub component_values: ComponentValues,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -178,13 +232,14 @@ pub struct LakehouseSpec {
     /// Plan only (no cluster changes) until explicitly disabled.  Safe default.
     #[serde(default = "default_true", rename = "dryRun")]
     pub dry_run: bool,
-    /// Extra Helm values applied to every component (`--set key=value`).
-    #[serde(default)]
-    pub set: std::collections::BTreeMap<String, String>,
     /// Take over Helm releases this operator did not create. Off by default so a
     /// Lakehouse can never silently clobber an existing install.
     #[serde(default)]
     pub adopt: bool,
+    /// Per-component Helm value overrides for the planned components
+    /// (`seaweedfs`, `lakekeeper` / `polaris`, `trino`).
+    #[serde(flatten)]
+    pub component_values: ComponentValues,
 }
 
 fn default_true() -> bool {
@@ -529,5 +584,118 @@ mod tests {
         let pipeline = Pipeline::crd();
         assert_eq!(pipeline.spec.names.kind, "Pipeline");
         assert_eq!(pipeline.spec.scope, "Namespaced");
+    }
+
+    #[test]
+    fn component_value_overrides_default_to_empty() {
+        let lh: Lakehouse = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt" },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+        assert!(lh.spec.component_values.values.is_empty());
+        assert!(lh.spec.component_values.set.is_empty());
+
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {}
+        }))
+        .expect("deserialize PlatformInstance");
+        assert!(pi.spec.component_values.values.is_empty());
+        assert!(pi.spec.component_values.set.is_empty());
+    }
+
+    #[test]
+    fn lakehouse_parses_per_component_values_and_set() {
+        let lh: Lakehouse = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt" },
+            "spec": {
+                "values": {
+                    "trino": {
+                        "coordinator": { "jvm": { "maxHeapSize": "4G" } }
+                    }
+                },
+                "set": { "trino": { "server.workers": "3" } }
+            }
+        }))
+        .expect("deserialize Lakehouse");
+
+        let overrides = &lh.spec.component_values;
+        assert_eq!(
+            overrides.values["trino"]["coordinator"]["jvm"]["maxHeapSize"],
+            serde_json::json!("4G")
+        );
+        assert_eq!(overrides.set["trino"]["server.workers"], "3");
+    }
+
+    #[test]
+    fn platform_instance_parses_component_values() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "values": { "cnpg": { "replicaCount": 2 } },
+                "set": { "cnpg": { "image.tag": "1.25.0" } }
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        assert_eq!(
+            pi.spec.component_values.values["cnpg"]["replicaCount"],
+            serde_json::json!(2)
+        );
+        assert_eq!(pi.spec.component_values.set["cnpg"]["image.tag"], "1.25.0");
+    }
+
+    #[test]
+    fn lakehouse_crd_documents_free_form_component_values() {
+        use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaPropsOrBool;
+
+        let crd = Lakehouse::crd();
+        let schema = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .expect("openAPIV3Schema");
+        let spec = schema
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("spec"))
+            .expect("spec schema");
+        let spec_properties = spec.properties.as_ref().expect("spec properties");
+
+        for field in ["values", "set"] {
+            assert!(
+                spec_properties.contains_key(field),
+                "spec.{field} must be part of the CRD schema"
+            );
+        }
+
+        // `values.<component>` must survive API-server pruning.
+        let values = spec_properties.get("values").expect("values schema");
+        let per_component = match values
+            .additional_properties
+            .as_ref()
+            .expect("additionalProperties")
+        {
+            JSONSchemaPropsOrBool::Schema(props) => props,
+            JSONSchemaPropsOrBool::Bool(_) => panic!("values.<component> must carry a schema"),
+        };
+        assert_eq!(
+            per_component.x_kubernetes_preserve_unknown_fields,
+            Some(true),
+            "free-form values must set x-kubernetes-preserve-unknown-fields"
+        );
+        assert_eq!(
+            per_component.type_.as_deref(),
+            Some("object"),
+            "values.<component> is a values document, i.e. an object"
+        );
     }
 }

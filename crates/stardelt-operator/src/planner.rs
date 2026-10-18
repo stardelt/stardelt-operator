@@ -26,9 +26,10 @@ pub fn plan_platform(_spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
 
 /// Which components a `Lakehouse` needs, in apply order.
 ///
-/// Storage first (S3 must exist), then the catalog. The CNPG *operator* is a
-/// platform-level prerequisite (`plan_platform`); a Lakehouse only owns
-/// namespace-scoped resources.
+/// Storage first (S3 must exist), then the catalog, then query serving — each
+/// stage depends on the one before it. The CNPG *operator* is a platform-level
+/// prerequisite (`plan_platform`); a Lakehouse only owns namespace-scoped
+/// resources.
 pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
     let mut plan = Vec::new();
 
@@ -49,6 +50,13 @@ pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
             chart: Some("polaris/polaris"),
         }),
     }
+
+    // Query serving (master spec §5, plug 4): Trino is the default Iceberg REST
+    // client and part of the managed Lakehouse.
+    plan.push(ComponentPlan {
+        name: "trino",
+        chart: Some("trino/trino"),
+    });
 
     plan
 }
@@ -158,7 +166,7 @@ mod tests {
             },
             profile: Default::default(),
             dry_run: true,
-            set: Default::default(),
+            component_values: Default::default(),
             adopt: false,
         }
     }
@@ -186,9 +194,9 @@ mod tests {
     }
 
     #[test]
-    fn default_plan_is_seaweedfs_lakekeeper() {
+    fn default_plan_is_storage_then_catalog_then_query() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
-        assert_eq!(names(&plan), vec!["seaweedfs", "lakekeeper"]);
+        assert_eq!(names(&plan), vec!["seaweedfs", "lakekeeper", "trino"]);
     }
 
     #[test]
@@ -197,6 +205,7 @@ mod tests {
             profile: Default::default(),
             pillars: Default::default(),
             dry_run: true,
+            component_values: Default::default(),
         };
         assert_eq!(names(&plan_platform(&pi)), vec!["cnpg"]);
         // It must not leak into a per-Lakehouse plan.
@@ -207,7 +216,7 @@ mod tests {
     #[test]
     fn byos3_skips_seaweedfs_and_polaris_replaces_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Polaris, StorageImpl::ByoS3));
-        assert_eq!(names(&plan), vec!["polaris"]);
+        assert_eq!(names(&plan), vec!["polaris", "trino"]);
     }
 
     #[test]
@@ -215,6 +224,15 @@ mod tests {
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs)) {
             if let Some(chart) = c.chart {
                 assert!(chart_version(chart).is_some(), "no pin for {chart}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_planned_chart_has_a_repo() {
+        for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs)) {
+            if let Some(chart) = c.chart {
+                assert!(chart_repo(chart).is_some(), "no repo for {chart}");
             }
         }
     }

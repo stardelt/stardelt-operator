@@ -21,11 +21,12 @@ use kube::{
 use serde_json::json;
 
 use crate::crd::{
-    ComponentStatus, Lakehouse, LakehouseStatus, PlatformInstance, PlatformInstanceStatus, Tenant,
-    TenantStatus,
+    ComponentStatus, ComponentValues, Lakehouse, LakehouseStatus, PlatformInstance,
+    PlatformInstanceStatus, Tenant, TenantStatus,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
+use crate::values::effective_values;
 
 pub struct Context {
     pub client: Client,
@@ -108,15 +109,37 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
+/// Overrides keyed by a component the plan does not contain are almost always a
+/// typo (`polaris` while the catalog is Lakekeeper, say); log them loudly.
+fn warn_unknown_overrides(plan: &[ComponentPlan], overrides: &ComponentValues) {
+    let planned: std::collections::BTreeSet<&str> = plan.iter().map(|c| c.name).collect();
+    let named = overrides
+        .values
+        .keys()
+        .map(|k| (k.as_str(), "values"))
+        .chain(overrides.set.keys().map(|k| (k.as_str(), "set")));
+    for (component, field) in named {
+        if !planned.contains(component) {
+            tracing::warn!(
+                component,
+                field,
+                "value override names no planned component; ignored"
+            );
+        }
+    }
+}
+
 /// Apply (or plan) a component plan, returning a truthful per-component status.
 async fn apply_plan(
     ctx: &Context,
     namespace: &str,
     plan: &[ComponentPlan],
+    overrides: &ComponentValues,
     dry_run: bool,
-    set: &std::collections::BTreeMap<String, String>,
     adopt: bool,
 ) -> Vec<ComponentStatus> {
+    warn_unknown_overrides(plan, overrides);
+
     let mut components = Vec::with_capacity(plan.len());
     for component in plan {
         let Some(chart) = component.chart else {
@@ -134,12 +157,20 @@ async fn apply_plan(
             version: chart_version(chart).map(str::to_string),
             namespace: namespace.to_string(),
             dry_run,
-            set: set.clone(),
+            set: overrides
+                .set
+                .get(component.name)
+                .cloned()
+                .unwrap_or_default(),
+            values: Some(effective_values(
+                component.name,
+                overrides.values.get(component.name),
+            )),
         };
 
         // Adopt guard: never silently take over a release this operator did not
         // create. `spec.adopt: true` is the explicit opt-in.
-        if !dry_run && !adopt && ctx.helm.run(release.status_args()).await.is_ok() {
+        if !dry_run && !adopt && ctx.helm.run(release.status_args(), None).await.is_ok() {
             components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: false,
@@ -151,7 +182,7 @@ async fn apply_plan(
             continue;
         }
 
-        match ctx.helm.run(release.args()).await {
+        match ctx.helm.run(release.args(), release.values_yaml()).await {
             Ok(_) => components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: !dry_run,
@@ -188,8 +219,8 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         &ctx,
         &namespace,
         &plan,
+        &lh.spec.component_values,
         lh.spec.dry_run,
-        &lh.spec.set,
         lh.spec.adopt,
     )
     .await;
@@ -224,8 +255,8 @@ async fn reconcile_platform(
         &ctx,
         "stardelt",
         &plan,
+        &instance.spec.component_values,
         instance.spec.dry_run,
-        &Default::default(),
         false,
     )
     .await;
