@@ -32,6 +32,10 @@ pub struct HelmRelease {
     pub values: Option<serde_json::Value>,
 }
 
+/// Recorded as the Helm revision description on every upgrade this operator
+/// performs; it is how a later reconcile tells its own releases from foreign ones.
+pub const OWNER_MARKER: &str = "managed by stardelt-operator";
+
 impl HelmRelease {
     pub fn args(&self) -> Vec<String> {
         // `helm upgrade --install <name> <chart>`; with `--repo`, <chart> must be
@@ -72,6 +76,8 @@ impl HelmRelease {
             args.push("--values".into());
             args.push("-".into());
         }
+        args.push("--description".into());
+        args.push(OWNER_MARKER.into());
         if self.dry_run {
             args.push("--dry-run".into());
         } else {
@@ -89,15 +95,22 @@ impl HelmRelease {
         })
     }
 
-    /// `helm status` — used to detect a release this operator does not own.
-    pub fn status_args(&self) -> Vec<String> {
+    /// `helm history -o json` — used to detect a release this operator does not own.
+    pub fn history_args(&self) -> Vec<String> {
         vec![
-            "status".into(),
+            "history".into(),
             self.name.clone(),
             "--namespace".into(),
             self.namespace.clone(),
+            "-o".into(),
+            "json".into(),
         ]
     }
+}
+
+/// True when any revision in `helm history -o json` output carries [`OWNER_MARKER`].
+pub fn is_owned(history_json: &str) -> bool {
+    history_json.contains(OWNER_MARKER)
 }
 
 /// Runs helm. `Vec<String>` args (no shell), so nothing is interpolated.
@@ -264,8 +277,36 @@ mod tests {
     }
 
     #[test]
-    fn status_args_target_the_release_namespace() {
-        let args = release(false).status_args();
-        assert_eq!(args, vec!["status", "seaweedfs", "--namespace", "stardelt"]);
+    fn history_args_target_the_release_namespace() {
+        let args = release(false).history_args();
+        assert_eq!(
+            args,
+            vec![
+                "history",
+                "seaweedfs",
+                "--namespace",
+                "stardelt",
+                "-o",
+                "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn upgrades_record_the_owner_marker() {
+        let args = release(false).args();
+        let i = args
+            .iter()
+            .position(|a| a == "--description")
+            .expect("--description");
+        assert_eq!(args[i + 1], OWNER_MARKER);
+    }
+
+    #[test]
+    fn ownership_is_read_from_revision_descriptions() {
+        let mine = format!(r#"[{{"revision":1,"description":"{OWNER_MARKER}"}}]"#);
+        let foreign = r#"[{"revision":1,"description":"Install complete"}]"#;
+        assert!(is_owned(&mine));
+        assert!(!is_owned(foreign));
     }
 }

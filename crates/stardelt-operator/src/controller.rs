@@ -27,7 +27,7 @@ use crate::crd::{
     ComponentStatus, ComponentValues, Lakehouse, LakehouseStatus, PlatformInstance,
     PlatformInstanceStatus, Tenant, TenantStatus, ValuesSource,
 };
-use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner};
+use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::values::{effective_values, parse_values_document};
 
@@ -321,8 +321,12 @@ async fn apply_plan(
         };
 
         // Adopt guard: never silently take over a release this operator did not
-        // create. `spec.adopt: true` is the explicit opt-in.
-        if !dry_run && !adopt && ctx.helm.run(release.status_args(), None).await.is_ok() {
+        // create. Releases it installed carry `OWNER_MARKER` in their history, so
+        // they keep reconciling; `spec.adopt: true` is the opt-in for foreign ones.
+        let foreign = !dry_run
+            && !adopt
+            && matches!(ctx.helm.run(release.history_args(), None).await, Ok(h) if !is_owned(&h));
+        if foreign {
             outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
                 ready: false,
