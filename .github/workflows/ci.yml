@@ -26,3 +26,9 @@ jobs:
 
       - name: cargo check
         run: cargo check --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: Chart pins agree with stardelt-platform
+        run: bash scripts/check-platform-pins.sh
