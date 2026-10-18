@@ -70,6 +70,20 @@ spec:
   profile: demo                              # demo | full | airgap
 ```
 
+A `Lakehouse` also installs Trino with the `warehouse` Iceberg catalog pre-wired: it points at
+the Lakehouse's own Lakekeeper (`http://lakekeeper:8181/catalog`) and its SeaweedFS S3 service
+(`http://seaweedfs-s3:8333`) — namespace-local names, so the same resource works in any
+namespace. Two prerequisites come from the platform install, not from the operator:
+
+- a `warehouse` warehouse in the catalog — `make install` creates it with
+  `manifests/lakekeeper-bootstrap.yaml`;
+- a `stardelt-s3-creds` Secret (keys `access-key`, `secret-key`) in the Lakehouse's namespace,
+  which the catalog's `${ENV:S3_ACCESS_KEY}` / `${ENV:S3_SECRET_KEY}` substitution reads.
+  `make install-core` creates the dev default in namespace `stardelt`; for a Lakehouse in any
+  other namespace, create the Secret there yourself.
+
+Without the Secret, Trino stays in `CreateContainerConfigError`.
+
 Ingestion is one contract with three domain defaults (master spec §5, plugs 8–10). `domain`
 selects the plug and therefore the components the operator plans:
 
@@ -165,7 +179,7 @@ spec:
             type: persistentVolumeClaim
             size: 100Gi
             storageClass: fast-ssd
-            maxVolumes: 0
+            maxVolumes: 100
   valuesFrom:
     trino:
       configMapRef: { name: trino-values, key: values.yaml }
@@ -198,6 +212,11 @@ component plan, runs `helm --dry-run` for each and writes the plan into `.status
 Set `dryRun: false` to actually apply. `.status.phase` is `Planned` while dry-running, `Ready`
 once every component applied, `Progressing` while one still needs to converge, and `Degraded`
 when a values source cannot be resolved — an admin error that will not heal by itself.
+
+`Tenant`, `Lakehouse` and `PlatformInstance` also write a `Ready` condition and
+`.status.observedGeneration` (the generation the status was computed from), so
+`kubectl wait --for=condition=Ready` and GitOps health checks work. `lastTransitionTime`
+changes only when `Ready` flips.
 
 ```yaml
 apiVersion: stardelt.io/v1alpha1
