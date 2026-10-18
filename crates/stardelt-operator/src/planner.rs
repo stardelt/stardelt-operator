@@ -17,11 +17,20 @@ pub struct ComponentPlan {
 
 /// Platform-level prerequisites, installed once per `PlatformInstance` (not per
 /// Lakehouse). The CNPG operator is cluster-scoped, so it lives here.
-pub fn plan_platform(_spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
-    vec![ComponentPlan {
+pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
+    // Cluster-scoped prerequisites first, then the pillar components that belong
+    // to the platform rather than to one lakehouse.
+    let mut plan = vec![ComponentPlan {
         name: "cnpg",
         chart: Some("cnpg/cloudnative-pg"),
-    }]
+    }];
+    if spec.pillars.notebooks {
+        plan.push(ComponentPlan {
+            name: "jupyterhub",
+            chart: Some("jupyterhub/jupyterhub"),
+        });
+    }
+    plan
 }
 
 /// Which components a `Lakehouse` needs, in apply order.
@@ -132,6 +141,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "seaweedfs/seaweedfs" => Some("4.25.1"),
         "lakekeeper/lakekeeper" => Some("0.11.0"),
         "trino/trino" => Some("1.42.2"),
+        "jupyterhub/jupyterhub" => Some("4.4.3"),
         _ => None,
     }
 }
@@ -144,6 +154,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "seaweedfs/seaweedfs" => Some("https://seaweedfs.github.io/seaweedfs/helm"),
         "lakekeeper/lakekeeper" => Some("https://lakekeeper.github.io/lakekeeper-charts/"),
         "trino/trino" => Some("https://trinodb.github.io/charts"),
+        "jupyterhub/jupyterhub" => Some("https://jupyterhub.github.io/helm-chart/"),
         _ => None,
     }
 }
@@ -153,7 +164,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::crd::{CatalogSpec, PipelineStep, PlatformInstanceSpec, StorageSpec};
+    use crate::crd::{CatalogSpec, Pillars, PipelineStep, PlatformInstanceSpec, StorageSpec};
 
     fn spec(catalog: CatalogImpl, storage: StorageImpl) -> LakehouseSpec {
         LakehouseSpec {
@@ -200,6 +211,27 @@ mod tests {
     }
 
     #[test]
+    fn notebooks_pillar_adds_jupyterhub_to_the_platform_plan() {
+        let without = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+        };
+        assert!(!without.pillars.notebooks, "notebooks stay opt-in");
+        assert_eq!(names(&plan_platform(&without)), vec!["cnpg"]);
+
+        let with = PlatformInstanceSpec {
+            pillars: Pillars {
+                notebooks: true,
+                ..Default::default()
+            },
+            ..without
+        };
+        assert_eq!(names(&plan_platform(&with)), vec!["cnpg", "jupyterhub"]);
+    }
+
+    #[test]
     fn platform_plan_owns_the_cluster_scoped_cnpg_operator() {
         let pi = PlatformInstanceSpec {
             profile: Default::default(),
@@ -221,7 +253,19 @@ mod tests {
 
     #[test]
     fn every_default_chart_has_a_pinned_version() {
-        for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs)) {
+        let platform = plan_platform(&PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars {
+                notebooks: true,
+                ..Default::default()
+            },
+            dry_run: true,
+            component_values: Default::default(),
+        });
+        for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
+            .into_iter()
+            .chain(platform)
+        {
             if let Some(chart) = c.chart {
                 assert!(chart_version(chart).is_some(), "no pin for {chart}");
             }
@@ -230,7 +274,19 @@ mod tests {
 
     #[test]
     fn every_planned_chart_has_a_repo() {
-        for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs)) {
+        let platform = plan_platform(&PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars {
+                notebooks: true,
+                ..Default::default()
+            },
+            dry_run: true,
+            component_values: Default::default(),
+        });
+        for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
+            .into_iter()
+            .chain(platform)
+        {
             if let Some(chart) = c.chart {
                 assert!(chart_repo(chart).is_some(), "no repo for {chart}");
             }

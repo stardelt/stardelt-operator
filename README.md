@@ -24,6 +24,35 @@ watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
 `StreamApp` and the ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see
 the master spec §5).
 
+### Pillars
+
+`PlatformInstance` carries what belongs to the platform rather than to one lakehouse:
+
+| Pillar | Default | What it plans |
+|---|---|---|
+| `lakehouse` | `true` | nothing by itself — the storage + catalog + query components hang off each `Lakehouse` |
+| `batch` | `false` | reserved for the `Pipeline`/Airflow work |
+| `notebooks` | `false` | JupyterHub (chart `jupyterhub/jupyterhub`, pinned like every other component) |
+| `streaming` | `false` | reserved for Kafka + Flink |
+| `ml` | `false` | reserved for the ML plugs |
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: PlatformInstance
+metadata: { name: cluster }
+spec:
+  profile: demo
+  pillars: { notebooks: true }      # adds JupyterHub to the cluster-scoped plan
+  dryRun: true                      # plan first; flip to apply
+```
+
+Notebooks are platform-level on purpose: one hub serves every lakehouse, and it is a whole
+stack (hub, proxy, single-user pods) rather than a per-catalog concern. The golden values
+mirror `stardelt-platform/helm-values/jupyterhub.yaml` — small resources, `ClusterIP`,
+ephemeral per-user storage, the chart's dummy authenticator with the platform's documented
+throwaway password. Point it at your OIDC provider (the realm already defines the
+`jupyterhub` client) through `spec.values` before it carries anything real.
+
 ### Plug selection
 
 The plug matrix is expressed directly in the resource. Defaults are Lakekeeper + SeaweedFS +
@@ -89,7 +118,8 @@ it watches CRDs and applies upstream Helm releases via the `helm` binary in its 
 - `src/values.rs` — pure functions: the golden per-component values, parsing of external
   documents, and the merge order.
 - `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
-- `src/controller.rs` — reconciles `Tenant` → Namespace and `Lakehouse` → its component plan.
+- `src/controller.rs` — reconciles `Tenant` → Namespace, `PlatformInstance` → its cluster-scoped
+  plan and `Lakehouse` → its component plan.
 - `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
 
 ### Component values
