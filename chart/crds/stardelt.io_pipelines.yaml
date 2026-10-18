@@ -5,7 +5,6 @@ metadata:
 spec:
   group: stardelt.io
   names:
-    categories: []
     kind: Pipeline
     plural: pipelines
     shortNames:
@@ -13,8 +12,7 @@ spec:
     singular: pipeline
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: 'A transform pipeline: ordered sql/python/dbt/quality steps on one engine.'
@@ -44,7 +42,9 @@ spec:
                       description: Step-specific parameters (model path, SQL file, gate threshold, …).
                       type: object
                     kind:
-                      description: What a pipeline step does — the step contract behind `Pipeline` (master spec §5, plugs 6, 7 and 12).
+                      description: |-
+                        What a pipeline step does — the step contract behind `Pipeline`
+                        (master spec §5, plugs 6, 7 and 12).
                       enum:
                       - sql
                       - python
@@ -93,7 +93,9 @@ spec:
               runs:
                 default: []
                 items:
-                  description: 'Last-known run of a pipeline. Intentionally minimal: the authoritative history belongs to the engine adapter (Airflow / Spark); this is the operator''s view.'
+                  description: |-
+                    Last-known run of a pipeline. Intentionally minimal: the authoritative history
+                    belongs to the engine adapter (Airflow / Spark); this is the operator's view.
                   properties:
                     id:
                       type: string

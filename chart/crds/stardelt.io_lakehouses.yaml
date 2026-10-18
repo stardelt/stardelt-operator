@@ -5,7 +5,6 @@ metadata:
 spec:
   group: stardelt.io
   names:
-    categories: []
     kind: Lakehouse
     plural: lakehouses
     shortNames:
@@ -13,8 +12,7 @@ spec:
     singular: lakehouse
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: A managed Trino + catalog + Iceberg unit on object storage.
@@ -24,7 +22,9 @@ spec:
             properties:
               adopt:
                 default: false
-                description: Take over Helm releases this operator did not create. Off by default so a Lakehouse can never silently clobber an existing install.
+                description: |-
+                  Take over Helm releases this operator did not create. Off by default so a
+                  Lakehouse can never silently clobber an existing install.
                 type: boolean
               catalog:
                 default:
@@ -55,7 +55,9 @@ spec:
                   additionalProperties:
                     type: string
                   type: object
-                description: '`--set` overrides per component: `set.<component>.<helm.key>: "value"`. Highest precedence — Helm applies `--set` after any values document.'
+                description: |-
+                  `--set` overrides per component: `set.<component>.<helm.key>: "value"`.
+                  Highest precedence — Helm applies `--set` after any values document.
                 type: object
               storage:
                 default:
@@ -77,11 +79,16 @@ spec:
                 additionalProperties:
                   type: object
                   x-kubernetes-preserve-unknown-fields: true
-                description: Free-form Helm values per component, e.g. `values.trino.worker.resources`. Deep-merged over the golden defaults, so one key can be pinned without restating the rest.
+                description: |-
+                  Free-form Helm values per component, e.g. `values.trino.worker.resources`.
+                  Deep-merged over the golden defaults, so one key can be pinned without
+                  restating the rest.
                 type: object
               valuesFrom:
                 additionalProperties:
-                  description: 'External source of one component''s Helm values: set exactly one of `configMapRef` or `secretRef`.'
+                  description: |-
+                    External source of one component's Helm values: set exactly one of
+                    `configMapRef` or `secretRef`.
                   properties:
                     configMapRef:
                       description: Read the values document from this ConfigMap key.
@@ -94,7 +101,9 @@ spec:
                           description: Name of the ConfigMap or Secret.
                           type: string
                         namespace:
-                          description: Namespace of the referenced object. Defaults to the resource's own namespace; required for cluster-scoped resources (`PlatformInstance`).
+                          description: |-
+                            Namespace of the referenced object. Defaults to the resource's own
+                            namespace; required for cluster-scoped resources (`PlatformInstance`).
                           nullable: true
                           type: string
                       required:
@@ -112,7 +121,9 @@ spec:
                           description: Name of the ConfigMap or Secret.
                           type: string
                         namespace:
-                          description: Namespace of the referenced object. Defaults to the resource's own namespace; required for cluster-scoped resources (`PlatformInstance`).
+                          description: |-
+                            Namespace of the referenced object. Defaults to the resource's own
+                            namespace; required for cluster-scoped resources (`PlatformInstance`).
                           nullable: true
                           type: string
                       required:
