@@ -165,6 +165,12 @@ pub struct PlatformInstanceStatus {
     pub phase: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
     #[serde(default)]
     pub components: Vec<ComponentStatus>,
 }
@@ -193,6 +199,12 @@ pub struct TenantStatus {
     pub phase: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
 }
 
 /// Catalog implementation (the plug behind the Iceberg REST contract).
@@ -286,6 +298,12 @@ pub struct LakehouseStatus {
     pub phase: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
     #[serde(default)]
     pub components: Vec<ComponentStatus>,
 }
@@ -341,6 +359,12 @@ pub struct IngestionSourceStatus {
     pub phase: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
 }
 
 /// What a pipeline step does — the step contract behind `Pipeline`
@@ -408,7 +432,7 @@ pub struct PipelineRun {
     pub id: String,
     /// Free-form until the adapters land (`queued` | `running` | `succeeded` | `failed`).
     pub state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "startedAt", skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
 }
 
@@ -418,6 +442,12 @@ pub struct PipelineStatus {
     pub phase: String,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
     #[serde(default)]
     pub runs: Vec<PipelineRun>,
 }
@@ -447,8 +477,18 @@ pub struct Condition {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "lastTransitionTime",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_transition_time: Option<String>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
 }
 
 #[cfg(test)]
@@ -611,6 +651,7 @@ mod tests {
         let status = PipelineStatus {
             phase: "Ready".into(),
             conditions: vec![],
+            observed_generation: None,
             runs: vec![run],
         };
         let json = serde_json::to_value(&status).expect("serialize PipelineStatus");

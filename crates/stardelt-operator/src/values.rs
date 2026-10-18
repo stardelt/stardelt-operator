@@ -16,6 +16,32 @@ use serde_json::{Map, Value};
 
 use crate::crd::Profile;
 
+/// The `warehouse` Trino catalog, verbatim from
+/// `stardelt-platform/chart/values.yaml` (`trino.catalogs.warehouse`).
+///
+/// Trino substitutes `${ENV:S3_ACCESS_KEY}` / `${ENV:S3_SECRET_KEY}` from the
+/// process environment, which the `env` block of [`golden_values`] feeds from
+/// the `stardelt-s3-creds` Secret. That Secret and the `warehouse` Iceberg
+/// warehouse are install-time prerequisites; the operator creates neither.
+const WAREHOUSE_CATALOG: &str = r#"connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://lakekeeper:8181/catalog
+iceberg.rest-catalog.warehouse=warehouse
+iceberg.rest-catalog.vended-credentials-enabled=false
+fs.native-s3.enabled=true
+s3.endpoint=http://seaweedfs-s3:8333
+s3.region=us-east-1
+s3.path-style-access=true
+s3.aws-access-key=${ENV:S3_ACCESS_KEY}
+s3.aws-secret-key=${ENV:S3_SECRET_KEY}
+# Single-replica SeaweedFS volume server can't sustain Trino's default
+# parallel HTTP range requests (broken pipe / connection reset). Throttle
+# both connection pool and the Iceberg metadata enumeration threads.
+s3.max-connections=16
+iceberg.split-manager-threads=4
+iceberg.metadata.parallelism=2
+"#;
+
 /// Golden Helm values for one component: the curated settings that cannot be
 /// left to chart defaults without breaking the stack.
 ///
@@ -28,10 +54,32 @@ pub fn golden_values(component: &str) -> Value {
         // Trino sits behind ingress-nginx, which sets X-Forwarded-For; without
         // this it answers 406 "Server configuration does not allow processing
         // of the X-Forwarded-For header".
-        "trino" => json_obj(&[(
-            "additionalConfigProperties",
-            serde_json::json!(["http-server.process-forwarded=true"]),
-        )]),
+        //
+        // The service names in the catalog are the namespace-local short names
+        // of the releases `planner.rs::plan_lakehouse` installs for the
+        // Lakehouse: `lakekeeper` is its catalog release, and `seaweedfs-s3` is
+        // the S3 service of its `seaweedfs` release. They must not be FQDNs —
+        // a Lakehouse may live in any namespace.
+        "trino" => json_obj(&[
+            (
+                "additionalConfigProperties",
+                serde_json::json!(["http-server.process-forwarded=true"]),
+            ),
+            (
+                "env",
+                serde_json::json!([
+                    { "name": "S3_ACCESS_KEY", "valueFrom": { "secretKeyRef": { "name": "stardelt-s3-creds", "key": "access-key" } } },
+                    { "name": "S3_SECRET_KEY", "valueFrom": { "secretKeyRef": { "name": "stardelt-s3-creds", "key": "secret-key" } } }
+                ]),
+            ),
+            // TODO(polaris): under `spec.catalog.implementation: polaris` this
+            // URI is wrong; Polaris has no adapter yet, so the Lakekeeper URI
+            // stays until one lands.
+            (
+                "catalogs",
+                serde_json::json!({ "warehouse": WAREHOUSE_CATALOG }),
+            ),
+        ]),
         // Sign-in goes through the platform IdP, exactly like
         // stardelt-platform/helm-values/jupyterhub.yaml: the hub reads the identity
         // contract (ConfigMap stardelt-identity, Secret stardelt-oidc-clients) of
@@ -120,7 +168,12 @@ pub fn golden_values(component: &str) -> Value {
                     "dataDirs": [{
                         "name": "data",
                         "type": "persistentVolumeClaim",
-                        "maxVolumes": 0
+                        // Volume slots. The chart's default (0 → auto-configure, 7 on Linux) is a trap
+                        // on a small install: once the slots are used up, the master cannot create a
+                        // volume for a *new* collection, and writes to a new bucket block forever —
+                        // the client sees a hang, the master log says "failed to find writable volumes
+                        // … Not enough data nodes found", and buckets created earlier keep working.
+                        "maxVolumes": 100
                     }]
                 }),
             ),
@@ -181,9 +234,18 @@ pub fn profile_values(component: &str, profile: Profile) -> Value {
         ]),
         "seaweedfs" => json_obj(&[
             ("master", serde_json::json!({ "data": { "size": "1Gi" } })),
+            // Arrays replace in `deep_merge` (Helm's semantics): a profile that
+            // sizes a volume must restate the whole list entry.
             (
                 "volume",
-                serde_json::json!({ "dataDirs": [{ "size": "5Gi" }] }),
+                serde_json::json!({
+                    "dataDirs": [{
+                        "name": "data",
+                        "type": "persistentVolumeClaim",
+                        "size": "5Gi",
+                        "maxVolumes": 100
+                    }]
+                }),
             ),
             ("filer", serde_json::json!({ "data": { "size": "1Gi" } })),
         ]),
@@ -356,6 +418,34 @@ mod tests {
     }
 
     #[test]
+    fn trino_golden_values_carry_the_warehouse_catalog() {
+        for profile in [Profile::Demo, Profile::Full, Profile::Airgap] {
+            let trino = effective_values("trino", profile, None, None);
+            let warehouse = trino["catalogs"]["warehouse"]
+                .as_str()
+                .expect("catalogs.warehouse is a properties document");
+            assert!(
+                warehouse.contains("iceberg.rest-catalog.uri=http://lakekeeper:8181/catalog"),
+                "profile {profile:?}: {warehouse}"
+            );
+            assert!(
+                warehouse.contains("s3.endpoint=http://seaweedfs-s3:8333"),
+                "profile {profile:?}: {warehouse}"
+            );
+            assert_eq!(
+                trino["env"][0]["valueFrom"]["secretKeyRef"]["name"],
+                serde_json::json!("stardelt-s3-creds"),
+                "profile {profile:?}: the S3 access key must come from the install Secret"
+            );
+            assert_eq!(
+                trino["env"][1]["valueFrom"]["secretKeyRef"]["key"],
+                serde_json::json!("secret-key"),
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn demo_profile_sizes_the_stack_for_a_small_node() {
         // Trino: the heap and the per-node memory limit are a pair — Trino refuses to start
         // if the limit does not fit the heap, which is why both are in the profile.
@@ -375,8 +465,25 @@ mod tests {
             seaweedfs["volume"]["dataDirs"][0]["size"],
             serde_json::json!("5Gi")
         );
+        // The profile must restate the whole entry: arrays replace, not merge.
+        let dir = &seaweedfs["volume"]["dataDirs"][0];
+        assert_eq!(dir["type"], serde_json::json!("persistentVolumeClaim"));
+        assert_eq!(dir["name"], serde_json::json!("data"));
+        assert_eq!(dir["maxVolumes"], serde_json::json!(100));
         // The golden values must survive the overlay: the profile sizes, it does not replace.
         assert_eq!(seaweedfs["s3"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn every_profile_keeps_seaweedfs_on_a_pvc() {
+        for profile in [Profile::Demo, Profile::Full, Profile::Airgap] {
+            let values = effective_values("seaweedfs", profile, None, None);
+            assert_eq!(
+                values["volume"]["dataDirs"][0]["type"],
+                serde_json::json!("persistentVolumeClaim"),
+                "profile {profile:?} dropped the PVC"
+            );
+        }
     }
 
     #[test]
@@ -456,6 +563,13 @@ mod tests {
             merged["additionalConfigProperties"],
             serde_json::json!(["http-server.process-forwarded=true"]),
             "pinning resources must not drop the curated trino settings"
+        );
+        assert!(
+            merged["catalogs"]["warehouse"]
+                .as_str()
+                .is_some_and(|catalog| catalog
+                    .contains("iceberg.rest-catalog.uri=http://lakekeeper:8181/catalog")),
+            "pinning resources must not drop the warehouse catalog"
         );
     }
 

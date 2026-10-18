@@ -28,7 +28,7 @@ use serde_json::json;
 
 use crate::crd::Profile;
 use crate::crd::{
-    ComponentStatus, ComponentValues, Lakehouse, LakehouseStatus, PlatformInstance,
+    ComponentStatus, ComponentValues, Condition, Lakehouse, LakehouseStatus, PlatformInstance,
     PlatformInstanceStatus, Tenant, TenantStatus, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
@@ -74,6 +74,32 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
+/// The Ready condition for a phase. Keeps the previous transition time while the status is unchanged.
+fn ready_condition(
+    phase: &str,
+    generation: Option<i64>,
+    previous: Option<&Condition>,
+    now: &str,
+) -> Condition {
+    let status = if phase == "Ready" { "True" } else { "False" };
+    let last_transition_time = match previous {
+        Some(p) if p.status == status => p.last_transition_time.clone(),
+        _ => Some(now.to_string()),
+    };
+    Condition {
+        type_: "Ready".into(),
+        status: status.into(),
+        reason: Some(phase.into()),
+        message: None,
+        last_transition_time,
+        observed_generation: generation,
+    }
+}
+
+fn now_rfc3339() -> String {
+    k8s_openapi::jiff::Timestamp::now().to_string()
+}
+
 /// A Tenant owns its Namespace.
 async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
     let name = tenant.name_any();
@@ -103,9 +129,19 @@ async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Acti
         ctx.client.clone(),
         tenant.namespace().as_deref().unwrap_or("default"),
     );
+    let prev = tenant
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
     let status = TenantStatus {
         phase: "Ready".into(),
-        conditions: vec![],
+        conditions: vec![ready_condition(
+            "Ready",
+            tenant.metadata.generation,
+            prev,
+            &now_rfc3339(),
+        )],
+        observed_generation: tenant.metadata.generation,
     };
     api.patch_status(
         &name,
@@ -531,9 +567,19 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     .await;
     let phase = phase(lh.spec.dry_run, &outcome);
 
+    let prev = lh
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
     let status = LakehouseStatus {
         phase: phase.into(),
-        conditions: vec![],
+        conditions: vec![ready_condition(
+            phase,
+            lh.metadata.generation,
+            prev,
+            &now_rfc3339(),
+        )],
+        observed_generation: lh.metadata.generation,
         components: outcome.components,
     };
     let api: Api<Lakehouse> = match lh.namespace() {
@@ -580,9 +626,19 @@ async fn reconcile_platform(
     .await;
     let phase = phase(instance.spec.dry_run, &outcome);
 
+    let prev = instance
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
     let status = PlatformInstanceStatus {
         phase: phase.into(),
-        conditions: vec![],
+        conditions: vec![ready_condition(
+            phase,
+            instance.metadata.generation,
+            prev,
+            &now_rfc3339(),
+        )],
+        observed_generation: instance.metadata.generation,
         components: outcome.components,
     };
     let api: Api<PlatformInstance> = Api::all(ctx.client.clone());
@@ -942,6 +998,268 @@ mod tests {
                 .iter()
                 .any(|call| call.args.first().map(String::as_str) == Some("status")),
             "a dry run does not consult the release"
+        );
+    }
+
+    fn prev(status: &str, time: &str) -> Condition {
+        Condition {
+            type_: "Ready".into(),
+            status: status.into(),
+            reason: None,
+            message: None,
+            last_transition_time: Some(time.into()),
+            observed_generation: None,
+        }
+    }
+
+    #[test]
+    fn ready_condition_true_only_for_ready() {
+        assert_eq!(ready_condition("Ready", None, None, "t").status, "True");
+        for phase in ["Planned", "Degraded", "Failed"] {
+            assert_eq!(ready_condition(phase, None, None, "t").status, "False");
+        }
+    }
+
+    #[test]
+    fn ready_condition_keeps_time_when_unchanged() {
+        let p = prev("True", "old");
+        let c = ready_condition("Ready", Some(3), Some(&p), "new");
+        assert_eq!(c.last_transition_time.as_deref(), Some("old"));
+        assert_eq!(c.observed_generation, Some(3));
+    }
+
+    #[test]
+    fn ready_condition_moves_time_on_flip() {
+        let p = prev("True", "old");
+        let c = ready_condition("Degraded", None, Some(&p), "new");
+        assert_eq!(c.status, "False");
+        assert_eq!(c.last_transition_time.as_deref(), Some("new"));
+    }
+
+    /// One request recorded by [`status_mock_client`].
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    /// A kube client that answers the requests a reconciler makes before it
+    /// patches a status: namespace reads return a Namespace, status patches echo
+    /// a minimal document of the right kind. Every request is recorded, so a
+    /// test can inspect the status the reconciler wrote.
+    fn status_mock_client() -> (Client, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                recorder
+                    .lock()
+                    .expect("requests poisoned")
+                    .push(RecordedRequest {
+                        method: method.clone(),
+                        path: path.clone(),
+                        body: String::from_utf8_lossy(&body).to_string(),
+                    });
+                let document = if method == "PATCH" && path.contains("tenants") {
+                    json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "Tenant",
+                        "metadata": { "name": "acme", "namespace": "stardelt" },
+                        "spec": {}
+                    })
+                } else if method == "PATCH" && path.contains("lakehouses") {
+                    json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "Lakehouse",
+                        "metadata": { "name": "main", "namespace": "stardelt" },
+                        "spec": {}
+                    })
+                } else if method == "PATCH" {
+                    json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "PlatformInstance",
+                        "metadata": { "name": "cluster" },
+                        "spec": {}
+                    })
+                } else {
+                    json!({
+                        "apiVersion": "v1",
+                        "kind": "Namespace",
+                        "metadata": { "name": "stardelt" }
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&document).expect("mock document"),
+                        ))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (Client::new(service, "stardelt"), requests)
+    }
+
+    /// The `status` object of the last PATCH whose path contains `marker`.
+    fn patched_status(
+        requests: &Arc<Mutex<Vec<RecordedRequest>>>,
+        marker: &str,
+    ) -> serde_json::Value {
+        let requests = requests.lock().expect("requests poisoned");
+        let patch = requests
+            .iter()
+            .rev()
+            .find(|r| r.method == "PATCH" && r.path.contains(marker))
+            .unwrap_or_else(|| {
+                let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+                panic!("no status patch for {marker}: {paths:?}")
+            });
+        let body: serde_json::Value =
+            serde_json::from_str(&patch.body).expect("patch body is JSON");
+        body["status"].clone()
+    }
+
+    #[tokio::test]
+    async fn tenant_status_carries_ready_and_observed_generation() {
+        let (client, requests) = status_mock_client();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let tenant: Tenant = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Tenant",
+            "metadata": { "name": "acme", "namespace": "stardelt", "generation": 7 },
+            "spec": {},
+            "status": {
+                "phase": "Ready",
+                "observedGeneration": 6,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "Ready",
+                    "lastTransitionTime": "old"
+                }]
+            }
+        }))
+        .expect("deserialize Tenant");
+
+        reconcile_tenant(Arc::new(tenant), ctx)
+            .await
+            .expect("reconcile Tenant");
+
+        let status = patched_status(&requests, "tenants");
+        assert_eq!(status["observedGeneration"], json!(7));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("True"));
+        assert_eq!(
+            ready["observedGeneration"],
+            json!(7),
+            "the condition must not report the generation it did not observe"
+        );
+        assert_eq!(
+            ready["lastTransitionTime"],
+            json!("old"),
+            "an unchanged Ready keeps its transition time"
+        );
+    }
+
+    #[tokio::test]
+    async fn lakehouse_status_carries_ready_and_observed_generation() {
+        let (client, requests) = status_mock_client();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt", "generation": 7 },
+            "spec": {},
+            "status": {
+                "phase": "Planned",
+                "observedGeneration": 6,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "Planned",
+                    "lastTransitionTime": "old"
+                }]
+            }
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        let status = patched_status(&requests, "lakehouses");
+        assert_eq!(status["phase"], json!("Planned"));
+        assert_eq!(status["observedGeneration"], json!(7));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Planned"));
+        assert_eq!(ready["observedGeneration"], json!(7));
+        assert_eq!(
+            ready["lastTransitionTime"],
+            json!("old"),
+            "an unchanged Ready keeps its transition time"
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_status_carries_ready_and_observed_generation() {
+        let (client, requests) = status_mock_client();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let instance: PlatformInstance = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster", "generation": 7 },
+            "spec": {},
+            "status": {
+                "phase": "Planned",
+                "observedGeneration": 6,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "False",
+                    "reason": "Planned",
+                    "lastTransitionTime": "old"
+                }]
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("reconcile PlatformInstance");
+
+        let status = patched_status(&requests, "platforminstances");
+        assert_eq!(status["phase"], json!("Planned"));
+        assert_eq!(status["observedGeneration"], json!(7));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Planned"));
+        assert_eq!(ready["observedGeneration"], json!(7));
+        assert_eq!(
+            ready["lastTransitionTime"],
+            json!("old"),
+            "an unchanged Ready keeps its transition time"
         );
     }
 }

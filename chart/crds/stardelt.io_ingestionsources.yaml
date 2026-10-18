@@ -62,12 +62,16 @@ spec:
                 default: []
                 items:
                   properties:
-                    last_transition_time:
+                    lastTransitionTime:
                       nullable: true
                       type: string
                     message:
                       nullable: true
                       type: string
+                    observedGeneration:
+                      format: int64
+                      nullable: true
+                      type: integer
                     reason:
                       nullable: true
                       type: string
@@ -80,6 +84,10 @@ spec:
                   - type
                   type: object
                 type: array
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
               phase:
                 default: ''
                 type: string
