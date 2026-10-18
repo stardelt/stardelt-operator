@@ -7,8 +7,13 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
-      all:
+      # Minor and patch together (they are routine and safe as a unit).
+      # Majors are deliberately NOT grouped: a framework major riding along with
+      # six small bumps is how a build breaks in a PR nobody can review — see
+      # the operator's kube 0.96→4.2 and the frontend's React 18→19.
+      minor-and-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -16,8 +21,13 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
-      all:
+      # Minor and patch together (they are routine and safe as a unit).
+      # Majors are deliberately NOT grouped: a framework major riding along with
+      # six small bumps is how a build breaks in a PR nobody can review — see
+      # the operator's kube 0.96→4.2 and the frontend's React 18→19.
+      minor-and-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
   - package-ecosystem: docker
     directory: /image
     schedule:
@@ -25,5 +35,10 @@ updates:
       day: monday
     open-pull-requests-limit: 5
     groups:
-      all:
+      # Minor and patch together (they are routine and safe as a unit).
+      # Majors are deliberately NOT grouped: a framework major riding along with
+      # six small bumps is how a build breaks in a PR nobody can review — see
+      # the operator's kube 0.96→4.2 and the frontend's React 18→19.
+      minor-and-patch:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
