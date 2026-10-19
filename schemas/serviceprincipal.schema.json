@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A non-human identity (client credentials) for pipelines, maintenance and collectors.",
+  "properties": {
+    "spec": {
+      "description": "A non-human identity for jobs, maintenance and collectors (decisions D20 and D21, internal note\n`design/scheduled-jobs.md`). With the platform identity provider the operator creates a client\nwith a service account and the audiences below and writes its credentials to the Secret\n`sp-<name>`; with an external provider it only checks the Secret named in `existingSecretRef`.\nThe owner group's members may name the principal as a pipeline's `runAs`; nobody may read the Secret.",
+      "properties": {
+        "audiences": {
+          "default": [
+            "trino"
+          ],
+          "description": "What the principal's tokens are valid for; at least one, `trino` by default.",
+          "items": {
+            "description": "What a principal's tokens are valid for (the `aud` claim of its access token).",
+            "enum": [
+              "trino",
+              "lakekeeper"
+            ],
+            "type": "string"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array"
+        },
+        "existingSecretRef": {
+          "description": "Only with an external identity provider: the Secret that holds the app registration's credentials.",
+          "nullable": true,
+          "properties": {
+            "name": {
+              "maxLength": 253,
+              "minLength": 1,
+              "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "ownerGroup": {
+          "description": "The group whose members may use the principal. Members never read its credentials.",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "purpose": {
+          "default": "pipeline",
+          "description": "What a service principal is for. It decides nothing by itself (grants do); it makes the intent\nvisible in `kubectl get` and in Nova.",
+          "enum": [
+            "pipeline",
+            "maintenance",
+            "collector"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "ownerGroup"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "each audience may appear once",
+          "rule": "self.audiences.all(a, self.audiences.exists_one(b, b == a))"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "clientId": {
+          "nullable": true,
+          "type": "string"
+        },
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "ready": {
+          "default": false,
+          "description": "True when the client exists (or the referenced Secret is valid) and the Secret is written.",
+          "type": "boolean"
+        },
+        "secretName": {
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "ServicePrincipal",
+  "type": "object"
+}

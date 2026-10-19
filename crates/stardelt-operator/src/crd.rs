@@ -1184,6 +1184,154 @@ pub struct VolumeStatus {
     pub observed_generation: Option<i64>,
 }
 
+/// What a service principal is for. It decides nothing by itself (grants do); it makes the intent
+/// visible in `kubectl get` and in Nova.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalPurpose {
+    /// Runs the tasks of scheduled pipelines (`Pipeline.spec.runAs`).
+    #[default]
+    Pipeline,
+    /// Runs table maintenance (compaction, snapshot expiry).
+    Maintenance,
+    /// Delivers events or metrics into the platform (for example the query-log collector).
+    Collector,
+}
+
+/// What a principal's tokens are valid for (the `aud` claim of its access token).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PrincipalAudience {
+    /// The query engine.
+    Trino,
+    /// The catalog.
+    Lakekeeper,
+}
+
+/// A secret that already holds the credentials of an app registration made by the identity
+/// provider's administrator (`identity.mode: external`). The Secret must be in the same namespace
+/// and have the keys `client-id` and `client-secret`.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ExistingSecretRef {
+    #[schemars(
+        length(min = 1, max = 253),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+    )]
+    pub name: String,
+}
+
+/// A non-human identity for jobs, maintenance and collectors (decisions D20 and D21, internal note
+/// `design/scheduled-jobs.md`). With the platform identity provider the operator creates a client
+/// with a service account and the audiences below and writes its credentials to the Secret
+/// `sp-<name>`; with an external provider it only checks the Secret named in `existingSecretRef`.
+/// The owner group's members may name the principal as a pipeline's `runAs`; nobody may read the Secret.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "ServicePrincipal",
+    namespaced,
+    status = "ServicePrincipalStatus",
+    shortname = "sp",
+    doc = "A non-human identity (client credentials) for pipelines, maintenance and collectors."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.audiences.all(a, self.audiences.exists_one(b, b == a))",
+        "message": "each audience may appear once"
+    }
+]))]
+pub struct ServicePrincipalSpec {
+    /// The group whose members may use the principal. Members never read its credentials.
+    #[serde(rename = "ownerGroup")]
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub owner_group: String,
+    #[serde(default)]
+    pub purpose: PrincipalPurpose,
+    /// What the principal's tokens are valid for; at least one, `trino` by default.
+    #[serde(default = "default_principal_audiences")]
+    #[schemars(length(min = 1, max = 2))]
+    pub audiences: Vec<PrincipalAudience>,
+    /// Only with an external identity provider: the Secret that holds the app registration's credentials.
+    #[serde(
+        default,
+        rename = "existingSecretRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub existing_secret_ref: Option<ExistingSecretRef>,
+}
+
+fn default_principal_audiences() -> Vec<PrincipalAudience> {
+    vec![PrincipalAudience::Trino]
+}
+
+impl ServicePrincipalSpec {
+    /// The rules the schema enforces, repeated for the controller and the tests, plus the resource name.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !name_ok {
+            return Err(format!(
+                "service principal name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
+            ));
+        }
+        let group = self.owner_group.as_bytes();
+        if group.is_empty()
+            || group.len() > 64
+            || !group[0].is_ascii_alphanumeric()
+            || !group
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err("ownerGroup must be a valid group name".to_string());
+        }
+        let unique: std::collections::BTreeSet<_> =
+            self.audiences.iter().map(|a| format!("{a:?}")).collect();
+        if self.audiences.is_empty() || unique.len() != self.audiences.len() {
+            return Err("audiences must list each audience once, at least one".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// The client id of the principal `name` in the identity provider (platform mode) and the name of
+/// the Secret that holds its credentials: `client-id` and `client-secret`.
+pub fn principal_client_id(name: &str) -> String {
+    format!("sp-{name}")
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct ServicePrincipalStatus {
+    /// True when the client exists (or the referenced Secret is valid) and the Secret is written.
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default, rename = "clientId", skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(
+        default,
+        rename = "secretName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub secret_name: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct ComponentStatus {
     pub name: String,
@@ -2076,5 +2224,88 @@ mod tests {
         ] {
             assert!(yaml.contains(bound), "the CRD lacks `{bound}`");
         }
+    }
+
+    fn principal(spec: serde_json::Value) -> ServicePrincipal {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "ServicePrincipal",
+            "metadata": { "name": "pipeline-analytics", "namespace": "stardelt" },
+            "spec": spec
+        }))
+        .expect("deserialize ServicePrincipal")
+    }
+
+    #[test]
+    fn a_principal_defaults_to_a_pipeline_identity_for_the_engine() {
+        let sp = principal(serde_json::json!({ "ownerGroup": "analytics" }));
+        assert_eq!(sp.spec.purpose, PrincipalPurpose::Pipeline);
+        assert_eq!(sp.spec.audiences, vec![PrincipalAudience::Trino]);
+        assert!(sp.spec.existing_secret_ref.is_none());
+        assert!(sp.spec.validate("pipeline-analytics").is_ok());
+        assert_eq!(
+            principal_client_id("pipeline-analytics"),
+            "sp-pipeline-analytics"
+        );
+    }
+
+    #[test]
+    fn a_principal_may_reach_the_catalog_too_and_name_a_secret_for_an_external_provider() {
+        let sp = principal(serde_json::json!({
+            "ownerGroup": "analytics", "purpose": "maintenance",
+            "audiences": ["trino", "lakekeeper"],
+            "existingSecretRef": { "name": "sp-maintenance" }
+        }));
+        assert_eq!(sp.spec.purpose, PrincipalPurpose::Maintenance);
+        assert_eq!(sp.spec.audiences.len(), 2);
+        assert_eq!(
+            sp.spec.existing_secret_ref.as_ref().unwrap().name,
+            "sp-maintenance"
+        );
+        assert!(sp.spec.validate("maintenance").is_ok());
+    }
+
+    #[test]
+    fn bad_owner_groups_audiences_and_names_are_refused() {
+        let bad =
+            |spec: serde_json::Value, name: &str| principal(spec).spec.validate(name).unwrap_err();
+        assert!(bad(serde_json::json!({ "ownerGroup": "a/b" }), "x").contains("ownerGroup"));
+        assert!(bad(serde_json::json!({ "ownerGroup": "../x" }), "x").contains("ownerGroup"));
+        assert!(
+            bad(
+                serde_json::json!({ "ownerGroup": "g", "audiences": ["trino", "trino"] }),
+                "x"
+            )
+            .contains("audience")
+        );
+        assert!(
+            bad(
+                serde_json::json!({ "ownerGroup": "g", "audiences": [] }),
+                "x"
+            )
+            .contains("audience")
+        );
+        for name in ["", "Pipeline", "1p", "p_", "p-", &"a".repeat(41)] {
+            assert!(
+                bad(serde_json::json!({ "ownerGroup": "g" }), name).contains("name"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_principal_crd_has_the_rule_the_short_name_and_no_secret_field() {
+        let crd = ServicePrincipal::crd();
+        assert_eq!(crd.spec.names.plural, "serviceprincipals");
+        assert_eq!(
+            crd.spec.names.short_names.as_deref(),
+            Some(&["sp".to_string()][..])
+        );
+        let yaml = serde_yaml::to_string(&crd).unwrap();
+        assert!(yaml.contains("each audience may appear once"));
+        assert!(
+            !yaml.contains("clientSecret") && !yaml.contains("password"),
+            "no field holds a credential"
+        );
     }
 }

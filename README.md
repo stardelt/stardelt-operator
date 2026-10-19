@@ -395,6 +395,26 @@ crates/stardelt-operator/
 chart/                         Helm chart + generated CRDs
 ```
 
+## ServicePrincipal
+
+A `ServicePrincipal` is a non-human identity for pipelines, maintenance and collectors. Its owner group's members may name
+it as a pipeline's `runAs` and may not read its credentials. With the platform identity provider the operator will create a
+client with a service account and write its credentials to the Secret `sp-<name>` (`client-id`, `client-secret`); with an
+external provider it only checks the Secret named in `existingSecretRef`. Today the resource is validated and nothing
+reconciles it yet.
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: ServicePrincipal
+metadata:
+  name: pipeline-analytics
+  namespace: stardelt
+spec:
+  ownerGroup: analytics        # members may use it as runAs
+  purpose: pipeline            # pipeline (default) | maintenance | collector
+  audiences: [trino]           # trino (default) and/or lakekeeper
+```
+
 ## Links
 
 - [stardelt.io/roadmap](https://stardelt.io/roadmap)

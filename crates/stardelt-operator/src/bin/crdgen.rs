@@ -8,7 +8,7 @@ use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomRe
 use kube::CustomResourceExt;
 
 use stardelt_operator::crd::{
-    Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance, Volume,
+    Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance, ServicePrincipal, Volume,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -65,6 +65,15 @@ fn main() -> anyhow::Result<()> {
     let volume_crd = Volume::crd();
     write(dir, "stardelt.io_volumes.yaml", &volume_crd)?;
     write_schema(schema_dir, "volume.schema.json", "Volume", &volume_crd)?;
+
+    let principal_crd = ServicePrincipal::crd();
+    write(dir, "stardelt.io_serviceprincipals.yaml", &principal_crd)?;
+    write_schema(
+        schema_dir,
+        "serviceprincipal.schema.json",
+        "ServicePrincipal",
+        &principal_crd,
+    )?;
 
     println!(
         "wrote CRDs to {} and schemas to {}",
