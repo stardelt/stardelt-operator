@@ -483,9 +483,76 @@ fn phase(dry_run: bool, outcome: &PlanOutcome) -> &'static str {
     }
 }
 
+/// Write one Lakehouse status. A merge patch: conditions and components are
+/// replaced wholesale, the rest of the status is left alone.
+async fn patch_lakehouse_status(
+    ctx: &Context,
+    lh: &Lakehouse,
+    status: LakehouseStatus,
+) -> Result<(), kube::Error> {
+    let api: Api<Lakehouse> = match lh.namespace() {
+        Some(ns) => Api::namespaced(ctx.client.clone(), &ns),
+        None => Api::all(ctx.client.clone()),
+    };
+    api.patch_status(
+        &lh.name_any(),
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "status": status })),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
     let name = lh.name_any();
     let namespace = lh.namespace().unwrap_or_else(|| "default".into());
+
+    // v1alpha1 supports exactly one Lakehouse per namespace (decision D18):
+    // release names are stable, so a second resource would Helm-upgrade the same
+    // releases and apply the same Secret/Cluster names as the first. The oldest
+    // resource (creationTimestamp, tie-break by name) owns the namespace; any
+    // other one reports Blocked and plans nothing.
+    let siblings = Api::<Lakehouse>::namespaced(ctx.client.clone(), &namespace)
+        .list(&ListParams::default())
+        .await?;
+    let oldest = siblings
+        .items
+        .iter()
+        .map(|item| (item.metadata.creation_timestamp.clone(), item.name_any()))
+        .min();
+    let blocked_by = match oldest {
+        Some((_, oldest)) if oldest != name => Some(oldest),
+        _ => None,
+    };
+    if let Some(peer) = blocked_by {
+        let message =
+            format!("one Lakehouse per namespace in v1alpha1: '{peer}' is older (decision D18)");
+        let phase = "Blocked";
+        let prev = lh
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
+        let status = LakehouseStatus {
+            phase: phase.into(),
+            conditions: vec![ready_condition(
+                phase,
+                lh.metadata.generation,
+                prev,
+                &now_rfc3339(),
+            )],
+            observed_generation: lh.metadata.generation,
+            components: vec![ComponentStatus {
+                name: "lakehouse".into(),
+                ready: false,
+                message: Some(message),
+                applied_hash: None,
+            }],
+        };
+        patch_lakehouse_status(&ctx, &lh, status).await?;
+        tracing::info!(lakehouse = %name, %namespace, older = %peer, "blocked: one Lakehouse per namespace in v1alpha1");
+        return Ok(Action::requeue(Duration::from_secs(30)));
+    }
+
     let plan = plan_lakehouse(&lh.spec);
     let overrides = OverridesContext {
         scope_namespace: Some(&namespace),
@@ -569,16 +636,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         observed_generation: lh.metadata.generation,
         components: outcome.components,
     };
-    let api: Api<Lakehouse> = match lh.namespace() {
-        Some(ns) => Api::namespaced(ctx.client.clone(), &ns),
-        None => Api::all(ctx.client.clone()),
-    };
-    api.patch_status(
-        &name,
-        &PatchParams::default(),
-        &Patch::Merge(json!({ "status": status })),
-    )
-    .await?;
+    patch_lakehouse_status(&ctx, &lh, status).await?;
     tracing::info!(lakehouse = %name, phase, dry_run = lh.spec.dry_run, "reconciled");
     Ok(Action::requeue(Duration::from_secs(requeue)))
 }
@@ -1048,15 +1106,34 @@ mod tests {
         body: String,
     }
 
+    /// One `Lakehouse` for a `LakehouseList` answer, created at `created`.
+    fn lakehouse_item(name: &str, created: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": {
+                "name": name,
+                "namespace": "stardelt",
+                "creationTimestamp": created,
+                "generation": 1
+            },
+            "spec": {}
+        })
+    }
+
     /// A kube client that answers the requests a reconciler makes before it
-    /// patches a status: namespace reads return a Namespace, status patches echo
-    /// a minimal document of the right kind. Every request is recorded, so a
-    /// test can inspect the status the reconciler wrote.
-    fn status_mock_client() -> (Client, Arc<Mutex<Vec<RecordedRequest>>>) {
+    /// patches a status: namespace reads return a Namespace, `GET …/lakehouses`
+    /// returns a `LakehouseList` with `lakehouses` as its items, status patches
+    /// echo a minimal document of the right kind. Every request is recorded, so
+    /// a test can inspect the status the reconciler wrote.
+    fn status_mock_client(
+        lakehouses: serde_json::Value,
+    ) -> (Client, Arc<Mutex<Vec<RecordedRequest>>>) {
         let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
         let recorder = requests.clone();
         let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
             let recorder = recorder.clone();
+            let lakehouses = lakehouses.clone();
             let method = request.method().to_string();
             let path = request.uri().path().to_string();
             async move {
@@ -1073,7 +1150,14 @@ mod tests {
                         path: path.clone(),
                         body: String::from_utf8_lossy(&body).to_string(),
                     });
-                let document = if method == "PATCH" && path.contains("lakehouses") {
+                let document = if method == "GET" && path.contains("lakehouses") {
+                    json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "LakehouseList",
+                        "metadata": { "resourceVersion": "1" },
+                        "items": lakehouses
+                    })
+                } else if method == "PATCH" && path.contains("lakehouses") {
                     json!({
                         "apiVersion": "stardelt.io/v1alpha1",
                         "kind": "Lakehouse",
@@ -1129,7 +1213,9 @@ mod tests {
 
     #[tokio::test]
     async fn lakehouse_status_carries_ready_and_observed_generation() {
-        let (client, requests) = status_mock_client();
+        // The single-Lakehouse case: the only sibling is this one.
+        let (client, requests) =
+            status_mock_client(json!([lakehouse_item("main", "2026-01-01T00:00:00Z")]));
         let ctx = Arc::new(Context {
             client,
             helm: helm_stub(),
@@ -1173,7 +1259,8 @@ mod tests {
 
     #[tokio::test]
     async fn lakehouse_status_ends_with_the_discovery_component() {
-        let (client, requests) = status_mock_client();
+        let (client, requests) =
+            status_mock_client(json!([lakehouse_item("main", "2026-01-01T00:00:00Z")]));
         let ctx = Arc::new(Context {
             client,
             helm: helm_stub(),
@@ -1204,8 +1291,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_lakehouse_is_blocked_and_applies_nothing() {
+        // `main` is older than `scratch-two`, so reconciling the newer one must
+        // report Blocked instead of planning.
+        let (client, requests) = status_mock_client(json!([
+            lakehouse_item("main", "2026-01-01T00:00:00Z"),
+            lakehouse_item("scratch-two", "2026-01-02T00:00:00Z"),
+        ]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "scratch-two", "namespace": "stardelt", "generation": 3 },
+            "spec": { "profile": "demo", "dryRun": true }
+        }))
+        .expect("deserialize Lakehouse");
+
+        let action = reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        assert_eq!(
+            action,
+            Action::requeue(Duration::from_secs(30)),
+            "a blocked Lakehouse checks back in case the older peer disappears"
+        );
+        let status = patched_status(&requests, "lakehouses");
+        assert_eq!(status["phase"], json!("Blocked"));
+        assert_eq!(status["observedGeneration"], json!(3));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Blocked"));
+        let components = status["components"].as_array().expect("components");
+        assert_eq!(components.len(), 1, "only the blocking reason is reported");
+        assert_eq!(components[0]["name"], json!("lakehouse"));
+        assert_eq!(components[0]["ready"], json!(false));
+        assert_eq!(
+            components[0]["message"],
+            json!("one Lakehouse per namespace in v1alpha1: 'main' is older (decision D18)")
+        );
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a blocked Lakehouse must not invoke helm"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_oldest_lakehouse_still_plans() {
+        let (client, requests) = status_mock_client(json!([
+            lakehouse_item("main", "2026-01-01T00:00:00Z"),
+            lakehouse_item("scratch-two", "2026-01-02T00:00:00Z"),
+        ]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt", "generation": 2 },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        let status = patched_status(&requests, "lakehouses");
+        assert_eq!(status["phase"], json!("Planned"));
+        assert!(
+            !helm.calls.lock().expect("calls poisoned").is_empty(),
+            "the oldest Lakehouse still plans its releases"
+        );
+    }
+
+    #[tokio::test]
     async fn platform_status_carries_ready_and_observed_generation() {
-        let (client, requests) = status_mock_client();
+        let (client, requests) = status_mock_client(json!([]));
         let ctx = Arc::new(Context {
             client,
             helm: helm_stub(),
