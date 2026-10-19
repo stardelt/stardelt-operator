@@ -4,7 +4,7 @@
 
 use crate::crd::{
     CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine, PipelineSpec,
-    PlatformInstanceSpec, StepKind, StorageImpl,
+    PlatformInstanceSpec, StorageImpl, TaskKind,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,7 +123,7 @@ pub fn plan_pipeline(spec: &PipelineSpec) -> Vec<ComponentPlan> {
         }
     };
 
-    if spec.steps.iter().any(|step| step.kind == StepKind::Dbt) {
+    if spec.tasks.iter().any(|task| task.kind == TaskKind::Dbt) {
         plan.push(ComponentPlan {
             name: "dbt",
             chart: None,
@@ -164,7 +164,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::crd::{CatalogSpec, Pillars, PipelineStep, PlatformInstanceSpec, StorageSpec};
+    use crate::crd::{
+        CatalogSpec, Pillars, PipelineConcurrency, PipelineTask, PlatformInstanceSpec, StorageSpec,
+    };
 
     fn spec(catalog: CatalogImpl, storage: StorageImpl) -> LakehouseSpec {
         LakehouseSpec {
@@ -196,11 +198,27 @@ mod tests {
         }
     }
 
-    fn step(name: &str, kind: StepKind) -> PipelineStep {
-        PipelineStep {
+    fn step(name: &str, kind: TaskKind) -> PipelineTask {
+        PipelineTask {
             name: name.into(),
             kind,
+            depends_on: vec![],
+            sql: (kind == TaskKind::Sql).then(|| "SELECT 1".to_string()),
+            warehouse: None,
             config: BTreeMap::new(),
+        }
+    }
+
+    fn pipeline(tasks: Vec<PipelineTask>, engine: PipelineEngine) -> PipelineSpec {
+        PipelineSpec {
+            tasks,
+            schedule: None,
+            run_as: None,
+            params: BTreeMap::new(),
+            retries: None,
+            timeout: None,
+            concurrency: PipelineConcurrency::default(),
+            engine,
         }
     }
 
@@ -319,27 +337,25 @@ mod tests {
 
     #[test]
     fn airflow_pipeline_plans_only_airflow() {
-        let spec = PipelineSpec {
-            steps: vec![
-                step("load", StepKind::Sql),
-                step("assert", StepKind::Quality),
+        let spec = pipeline(
+            vec![
+                step("load", TaskKind::Sql),
+                step("assert", TaskKind::Quality),
             ],
-            schedule: Some("0 3 * * *".into()),
-            engine: PipelineEngine::Airflow,
-        };
+            PipelineEngine::Airflow,
+        );
         assert_eq!(names(&plan_pipeline(&spec)), vec!["airflow"]);
     }
 
     #[test]
     fn spark_pipeline_with_dbt_step_plans_spark_operator_and_dbt() {
-        let spec = PipelineSpec {
-            steps: vec![
-                step("build", StepKind::Dbt),
-                step("enrich", StepKind::Python),
+        let spec = pipeline(
+            vec![
+                step("build", TaskKind::Dbt),
+                step("enrich", TaskKind::Python),
             ],
-            schedule: None,
-            engine: PipelineEngine::Spark,
-        };
+            PipelineEngine::Spark,
+        );
         let plan = plan_pipeline(&spec);
         assert_eq!(names(&plan), vec!["spark-operator", "dbt"]);
         assert_eq!(plan[0].chart, Some("spark-operator/spark-operator"));
@@ -349,11 +365,7 @@ mod tests {
 
     #[test]
     fn sql_only_pipeline_does_not_pull_in_dbt() {
-        let spec = PipelineSpec {
-            steps: vec![step("load", StepKind::Sql)],
-            schedule: None,
-            engine: PipelineEngine::Spark,
-        };
+        let spec = pipeline(vec![step("load", TaskKind::Sql)], PipelineEngine::Spark);
         assert_eq!(names(&plan_pipeline(&spec)), vec!["spark-operator"]);
     }
 }
