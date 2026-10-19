@@ -1,0 +1,212 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A typed connection to an outside system: settings here, the credentials in the secret store.",
+  "properties": {
+    "spec": {
+      "description": "A typed connection to a system outside the platform: non-secret settings here, the secret\nfields in the secret store (decision D23). No value of a secret is ever part of this resource.",
+      "properties": {
+        "config": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Non-secret settings, for example `host`, `port`, `database`, `bucket`, `baseUrl`.",
+          "maxProperties": 32,
+          "type": "object"
+        },
+        "ownerGroup": {
+          "description": "Scope `group`: the Keycloak group whose members manage and use the connection.",
+          "maxLength": 64,
+          "minLength": 1,
+          "nullable": true,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "refreshInterval": {
+          "default": "15m",
+          "description": "How often the synced Secret is refreshed from the store, for example `15m`. Between one minute and 24 hours.",
+          "pattern": "^[0-9]{1,4}(m|h)$",
+          "type": "string"
+        },
+        "scope": {
+          "default": "group",
+          "description": "Whose credential a connection holds and who may use it (decision D27,\ninternal note `design/secrets-and-connections.md` §8). Personal connections have no\nresource: they live only in the secret store and never reach a pipeline.",
+          "enum": [
+            "group",
+            "managed"
+          ],
+          "type": "string"
+        },
+        "secret": {
+          "description": "Where the secret part of a connection lives.",
+          "properties": {
+            "keys": {
+              "description": "Names of the secret fields, for example `user` and `password`. They become the keys of the\nsynced Kubernetes Secret and the environment variables `CONN_<NAME>_<KEY>`.",
+              "items": {
+                "maxLength": 63,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 16,
+              "minItems": 1,
+              "type": "array"
+            },
+            "remoteRef": {
+              "description": "Path in the secret store. Absent: derived from the scope, `connections/group/<ownerGroup>/<name>`\nor `connections/managed/<name>`. Set it only when the platform reads the customer's own store\n(`spec.secrets` mode `external`); in platform mode the controller refuses a value, because\na path chosen by the author could point at another group's secret.",
+              "maxLength": 512,
+              "minLength": 1,
+              "nullable": true,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "keys"
+          ],
+          "type": "object"
+        },
+        "type": {
+          "description": "What a connection reaches. The type decides which settings and secret keys are required.",
+          "enum": [
+            "postgresql",
+            "mysql",
+            "sqlserver",
+            "oracle",
+            "rest-api",
+            "s3",
+            "kafka",
+            "sftp",
+            "generic"
+          ],
+          "type": "string"
+        },
+        "usableBy": {
+          "description": "Scope `managed`: the groups whose platform-run work may use the connection.",
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        }
+      },
+      "required": [
+        "secret",
+        "type"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "a group connection needs ownerGroup and no usableBy",
+          "rule": "self.scope != 'group' || (has(self.ownerGroup) && !has(self.usableBy))"
+        },
+        {
+          "message": "a managed connection needs usableBy and no ownerGroup",
+          "rule": "self.scope != 'managed' || (has(self.usableBy) && !has(self.ownerGroup))"
+        },
+        {
+          "message": "usableBy must list group names (letters, digits, dot, underscore, dash)",
+          "rule": "!has(self.usableBy) || self.usableBy.all(g, g.matches('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'))"
+        },
+        {
+          "message": "secret.remoteRef must not contain .. or //",
+          "rule": "!has(self.secret.remoteRef) || (!self.secret.remoteRef.contains('..') && !self.secret.remoteRef.contains('//'))"
+        },
+        {
+          "message": "secret.keys must be unique names of letters, digits and underscore",
+          "rule": "self.secret.keys.all(k, k.matches('^[A-Za-z][A-Za-z0-9_]{0,62}$') && self.secret.keys.exists_one(j, j == k))"
+        },
+        {
+          "message": "config holds settings, not secrets: a name like password, secret or token belongs in secret.keys",
+          "rule": "!has(self.config) || self.config.all(k, k.matches('^[A-Za-z][A-Za-z0-9_.-]{0,62}$') && !k.lowerAscii().matches('(password|passwd|passphrase|secret|token|credential)'))"
+        },
+        {
+          "message": "a database connection needs config.host and the secret keys user and password",
+          "rule": "!(self.type in ['postgresql', 'mysql', 'sqlserver', 'oracle']) || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && 'password' in self.secret.keys)"
+        },
+        {
+          "message": "a rest-api connection needs config.baseUrl and the secret key token, or clientId and clientSecret",
+          "rule": "self.type != 'rest-api' || (has(self.config) && 'baseUrl' in self.config && ('token' in self.secret.keys || ('clientId' in self.secret.keys && 'clientSecret' in self.secret.keys)))"
+        },
+        {
+          "message": "an s3 connection needs config.bucket and the secret keys accessKeyId and secretAccessKey",
+          "rule": "self.type != 's3' || (has(self.config) && 'bucket' in self.config && 'accessKeyId' in self.secret.keys && 'secretAccessKey' in self.secret.keys)"
+        },
+        {
+          "message": "an sftp connection needs config.host and the secret keys user and password or privateKey",
+          "rule": "self.type != 'sftp' || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && ('password' in self.secret.keys || 'privateKey' in self.secret.keys))"
+        },
+        {
+          "message": "a kafka connection needs config.bootstrapServers",
+          "rule": "self.type != 'kafka' || (has(self.config) && 'bootstrapServers' in self.config)"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "lastSync": {
+          "description": "RFC 3339 time of the last successful sync from the store.",
+          "nullable": true,
+          "type": "string"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "ready": {
+          "default": false,
+          "description": "True when the Secret exists and holds every key in `spec.secret.keys`.",
+          "type": "boolean"
+        },
+        "secretName": {
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "Connection",
+  "type": "object"
+}

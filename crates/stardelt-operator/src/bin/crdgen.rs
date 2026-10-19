@@ -7,7 +7,7 @@ use std::path::Path;
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::CustomResourceExt;
 
-use stardelt_operator::crd::{IngestionSource, Lakehouse, Pipeline, PlatformInstance};
+use stardelt_operator::crd::{Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance};
 
 fn main() -> anyhow::Result<()> {
     let dir = Path::new("chart/crds");
@@ -49,6 +49,15 @@ fn main() -> anyhow::Result<()> {
         "pipeline.schema.json",
         "Pipeline",
         &pipeline_crd,
+    )?;
+
+    let connection_crd = Connection::crd();
+    write(dir, "stardelt.io_connections.yaml", &connection_crd)?;
+    write_schema(
+        schema_dir,
+        "connection.schema.json",
+        "Connection",
+        &connection_crd,
     )?;
 
     println!(
