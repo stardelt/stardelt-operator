@@ -33,5 +33,8 @@ jobs:
       - name: cargo test
         run: cargo test
 
+      - name: Generated files are current
+        run: cargo run --bin crdgen && git diff --exit-code chart/crds schemas
+
       - name: Chart pins agree with stardelt-platform
         run: bash scripts/check-platform-pins.sh

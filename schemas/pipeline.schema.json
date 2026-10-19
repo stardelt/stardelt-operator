@@ -1,0 +1,145 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A transform pipeline: ordered sql/python/dbt/quality steps on one engine.",
+  "properties": {
+    "spec": {
+      "description": "A transform pipeline: an ordered list of steps, run by one engine.",
+      "properties": {
+        "engine": {
+          "default": "airflow",
+          "description": "Engine that orchestrates (and for `spark`, executes) the pipeline.",
+          "enum": [
+            "airflow",
+            "spark"
+          ],
+          "type": "string"
+        },
+        "schedule": {
+          "description": "Optional cron schedule; a pipeline without a schedule is run on demand.",
+          "nullable": true,
+          "type": "string"
+        },
+        "steps": {
+          "description": "Steps in apply order; must not be empty.",
+          "items": {
+            "description": "One step of a `Pipeline`. Steps run in declaration order.",
+            "properties": {
+              "config": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "description": "Step-specific parameters (model path, SQL file, gate threshold, …).",
+                "type": "object"
+              },
+              "kind": {
+                "description": "What a pipeline step does — the step contract behind `Pipeline`\n(master spec §5, plugs 6, 7 and 12).",
+                "enum": [
+                  "sql",
+                  "python",
+                  "dbt",
+                  "quality"
+                ],
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "name"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "steps"
+      ],
+      "type": "object"
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "type": "string"
+        },
+        "runs": {
+          "default": [],
+          "items": {
+            "description": "Last-known run of a pipeline. Intentionally minimal: the authoritative history\nbelongs to the engine adapter (Airflow / Spark); this is the operator's view.",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "startedAt": {
+                "nullable": true,
+                "type": "string"
+              },
+              "state": {
+                "description": "Free-form until the adapters land (`queued` | `running` | `succeeded` | `failed`).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "state"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "Pipeline",
+  "type": "object"
+}

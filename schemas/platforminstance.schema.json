@@ -1,0 +1,226 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A stardelt platform instance.",
+  "properties": {
+    "spec": {
+      "description": "Cluster-scoped root resource: declares which pillars and profile are installed.",
+      "properties": {
+        "dryRun": {
+          "default": true,
+          "description": "Plan only (no cluster changes) until explicitly disabled. Safe default.",
+          "type": "boolean"
+        },
+        "namespace": {
+          "default": "stardelt",
+          "description": "Namespace the platform's own components are installed into.",
+          "type": "string"
+        },
+        "pillars": {
+          "default": {
+            "batch": false,
+            "lakehouse": true,
+            "ml": false,
+            "notebooks": false,
+            "streaming": false
+          },
+          "description": "Which pillars a platform instance enables.",
+          "properties": {
+            "batch": {
+              "default": false,
+              "type": "boolean"
+            },
+            "lakehouse": {
+              "default": true,
+              "type": "boolean"
+            },
+            "ml": {
+              "default": false,
+              "type": "boolean"
+            },
+            "notebooks": {
+              "default": false,
+              "description": "Multi-user notebooks (JupyterHub). Off by default: a notebook stack is\nheavy, and a cluster that only serves queries should not carry it.",
+              "type": "boolean"
+            },
+            "streaming": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "profile": {
+          "default": "demo",
+          "description": "Deployment size / capability profile.",
+          "enum": [
+            "demo",
+            "full",
+            "airgap"
+          ],
+          "type": "string"
+        },
+        "set": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "description": "`--set` overrides per component: `set.<component>.<helm.key>: \"value\"`.\nHighest precedence — Helm applies `--set` after any values document.",
+          "type": "object"
+        },
+        "values": {
+          "additionalProperties": {
+            "type": "object",
+            "x-kubernetes-preserve-unknown-fields": true
+          },
+          "description": "Free-form Helm values per component, e.g. `values.trino.worker.resources`.\nDeep-merged over the golden defaults, so one key can be pinned without\nrestating the rest.",
+          "type": "object"
+        },
+        "valuesFrom": {
+          "additionalProperties": {
+            "description": "External source of one component's Helm values: set exactly one of\n`configMapRef` or `secretRef`.",
+            "properties": {
+              "configMapRef": {
+                "description": "Read the values document from this ConfigMap key.",
+                "nullable": true,
+                "properties": {
+                  "key": {
+                    "description": "Key holding the YAML values document.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Name of the ConfigMap or Secret.",
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "description": "Namespace of the referenced object. Defaults to the resource's own\nnamespace; required for cluster-scoped resources (`PlatformInstance`).",
+                    "nullable": true,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key",
+                  "name"
+                ],
+                "type": "object"
+              },
+              "secretRef": {
+                "description": "Read the values document from this Secret key (decoded, then parsed as YAML).",
+                "nullable": true,
+                "properties": {
+                  "key": {
+                    "description": "Key holding the YAML values document.",
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Name of the ConfigMap or Secret.",
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "description": "Namespace of the referenced object. Defaults to the resource's own\nnamespace; required for cluster-scoped resources (`PlatformInstance`).",
+                    "nullable": true,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key",
+                  "name"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "object"
+          },
+          "description": "External values documents per component, read from a ConfigMap or Secret key.",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "components": {
+          "default": [],
+          "items": {
+            "properties": {
+              "appliedHash": {
+                "description": "Fingerprint (args + values) of the release that was applied last time a\nhash was recorded; lets the next reconcile skip an unchanged component.",
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "ready": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "name",
+              "ready"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "PlatformInstance",
+  "type": "object"
+}

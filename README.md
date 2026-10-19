@@ -123,6 +123,20 @@ spec:
       config: { gate: "warn" }
 ```
 
+## Editor support
+
+`cargo run --bin crdgen` also writes JSON Schemas for every CRD into `schemas/`
+(`platforminstance.schema.json`, `tenant.schema.json`, `lakehouse.schema.json`,
+`ingestionsource.schema.json`, `pipeline.schema.json`). Add
+
+```yaml
+# yaml-language-server: $schema=https://raw.githubusercontent.com/stardelt/stardelt-operator/main/schemas/pipeline.schema.json
+```
+
+as the first line of a file (replace the file name by the kind) to get validation
+and completion in editors that use the YAML language server (for example VS Code
+with the YAML extension).
+
 ## Architecture
 
 Built with [kube-rs](https://kube.rs). The operator does **not** re-implement upstream charts;
