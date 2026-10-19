@@ -1,0 +1,20 @@
+# The catalog database is the CloudNative-PG Cluster `lakekeeper-pg` that the
+# operator applies itself (prerequisites.rs); the short Service name resolves
+# inside the Lakehouse's namespace. Authorization stays `allowall` until the
+# OpenFGA work (docs#64); the bundled Postgres and OpenFGA are off.
+helmWait: true
+postgresql:
+  enabled: false
+externalDatabase:
+  type: postgres
+  host_read: lakekeeper-pg-rw
+  host_write: lakekeeper-pg-rw
+  port: 5432
+  database: lakekeeper
+  userSecret: lakekeeper-pg-app
+  userSecretKey: username
+  passwordSecret: lakekeeper-pg-app
+  passwordSecretKey: password
+authz:
+  backend: allowall
+internalOpenFGA: false

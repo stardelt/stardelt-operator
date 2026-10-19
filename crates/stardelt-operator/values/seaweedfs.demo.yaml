@@ -1,0 +1,14 @@
+master:
+  data:
+    size: 1Gi
+# Arrays replace in `deep_merge` (Helm's semantics): a profile that
+# sizes a volume must restate the whole list entry.
+volume:
+  dataDirs:
+  - name: data
+    type: persistentVolumeClaim
+    size: 5Gi
+    maxVolumes: 100
+filer:
+  data:
+    size: 1Gi
