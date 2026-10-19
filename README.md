@@ -83,6 +83,8 @@ spec:
   deletionPolicy: Retain                     # Retain (default) | Delete — what a delete does to the data (D18)
 ```
 
+`deletionPolicy: Delete` uninstalls the releases and removes the database and object-store volumes; irreversible (a `dryRun` Lakehouse applied nothing, so deleting it removes no data).
+
 A `Lakehouse` also installs Trino with the `warehouse` Iceberg catalog pre-wired: it points at
 the Lakehouse's own Lakekeeper (`http://lakekeeper:8181/catalog`) and its SeaweedFS S3 service
 (`http://seaweedfs-s3:8333`) — namespace-local names, so the same resource works in any
