@@ -93,32 +93,29 @@ pub fn golden_values(component: &str) -> Value {
                 "catalogs",
                 serde_json::json!({ "warehouse": WAREHOUSE_CATALOG }),
             ),
-            // Worker-local file-system cache for object-store reads
-            // (stardelt-platform#134): the `fs.cache.*` catalog props above
-            // point at `/var/trino/cache`, which must exist on the coordinator
-            // AND every worker — without the mount the coordinator CrashLoops
-            // (`IllegalArgumentException: Cannot write to cache directory
-            // /var/trino/cache`). The props and the mounts ship together here
-            // so neither can land without the other. Mirrors the
-            // `coordinator:` / `worker:` blocks of
-            // `stardelt-platform/helm-values/trino.yaml` (and its
-            // `chart/values.yaml` twin): an `emptyDir` with `sizeLimit: 12Gi`,
-            // not memory-backed, so a pod restart or scale-to-zero discards
-            // the cache and the next scan repopulates it.
+            // Query memory guards (stardelt-platform#54, operator#73): the per-node limit
+            // plus the heap headroom must stay well below the JVM heap, so one oversized
+            // join fails with EXCEEDED_LOCAL_MEMORY_LIMIT instead of OOM-killing the worker.
+            // 800MB + 600MB headroom = 1400MB <= 2G heap. The `demo` profile restates the
+            // slim numbers in `profile_values`.
+            //
+            // `coordinatorExtraConfig` is coordinator-only on purpose: the chart renders
+            // `additionalConfigProperties` into the worker ConfigMap too, and a worker
+            // rejects keys it does not bind. It is a string, so a CR that sets it replaces
+            // both lines (Helm replaces strings, it does not merge them).
             (
-                "coordinator",
+                "server",
                 serde_json::json!({
-                    "additionalVolumes": [{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }],
-                    "additionalVolumeMounts": [{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }]
+                    "config": { "query": { "maxMemory": "800MB" } },
+                    "coordinatorExtraConfig": "query.max-execution-time=10m\nquery.max-run-time=15m\n"
                 }),
             ),
-            (
-                "worker",
-                serde_json::json!({
-                    "additionalVolumes": [{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }],
-                    "additionalVolumeMounts": [{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }]
-                }),
-            ),
+            // Coordinator and workers get the same block: the file-system cache volume
+            // (stardelt-platform#134; the `fs.cache.*` catalog props point at
+            // /var/trino/cache and without the mount the coordinator CrashLoops), a bounded
+            // heap-dump volume, the 2G heap and the kubelet limits that hold it.
+            ("coordinator", trino_node_values()),
+            ("worker", trino_node_values()),
         ]),
         // The catalog database is the CloudNative-PG Cluster `lakekeeper-pg` that the
         // operator applies itself (prerequisites.rs); the short Service name resolves
@@ -266,6 +263,37 @@ pub fn golden_values(component: &str) -> Value {
     }
 }
 
+/// The `coordinator:` / `worker:` block of the Trino golden values (the platform BASE,
+/// `stardelt-platform/helm-values/trino.yaml`). Both roles get the same block.
+///
+/// The three lists (`additionalJVMConfig`, `additionalVolumes`, `additionalVolumeMounts`)
+/// are replaced, not merged, by a profile or CR that sets them: an override must restate
+/// the whole list. `-XX:HeapDumpPath` complements `+HeapDumpOnOutOfMemoryError`, which the
+/// chart already enables; it sends the dump to the 2Gi `trino-dumps` emptyDir so a dump
+/// never fills the node.
+fn trino_node_values() -> Value {
+    serde_json::json!({
+        "jvm": { "maxHeapSize": "2G" },
+        "config": {
+            "query": { "maxMemoryPerNode": "800MB" },
+            "memory": { "heapHeadroomPerNode": "600MB" }
+        },
+        "additionalJVMConfig": ["-Xms1G", "-XX:HeapDumpPath=/dumps"],
+        "resources": {
+            "requests": { "cpu": "500m", "memory": "2300Mi" },
+            "limits": { "memory": "3000Mi" }
+        },
+        "additionalVolumes": [
+            { "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } },
+            { "name": "trino-dumps", "emptyDir": { "sizeLimit": "2Gi" } }
+        ],
+        "additionalVolumeMounts": [
+            { "name": "trino-fscache", "mountPath": "/var/trino/cache" },
+            { "name": "trino-dumps", "mountPath": "/dumps" }
+        ]
+    })
+}
+
 /// Sizing for one profile, applied between the golden values and anything the CR asks for.
 ///
 /// The platform already thinks this way: `make install-core SLIM=1` layers
@@ -281,34 +309,36 @@ pub fn profile_values(component: &str, profile: Profile) -> Value {
         return Value::Object(Map::new());
     }
     match component {
-        // Constraint from the platform values: query.maxMemory + 30% heap headroom must fit
-        // the heap. 900MB + 450MB = 1350MB ≤ 1500m. Lowering the heap without
-        // query.maxMemoryPerNode makes Trino refuse to start.
-        "trino" => json_obj(&[
-            (
-                "server",
-                serde_json::json!({
-                    "workers": 1,
-                    "config": { "query": { "maxMemory": "900MB" } }
-                }),
-            ),
-            (
-                "coordinator",
-                serde_json::json!({
-                    "jvm": { "maxHeapSize": "1500m" },
-                    "additionalJVMConfig": ["-Xms512m"],
-                    "config": { "query": { "maxMemoryPerNode": "1GB" } }
-                }),
-            ),
-            (
-                "worker",
-                serde_json::json!({
-                    "jvm": { "maxHeapSize": "1500m" },
-                    "additionalJVMConfig": ["-Xms512m"],
-                    "config": { "query": { "maxMemoryPerNode": "1GB" } }
-                }),
-            ),
-        ]),
+        // The slim numbers of `stardelt-platform/helm-values/slim/trino.yaml`
+        // (platform#54, operator#73), laid over the golden Trino values:
+        //   600MB per node + 450MB headroom = 1050MB <= 1500m heap, ~450MB for the engine.
+        // `additionalJVMConfig` is a list, so it replaces the golden one: the heap-dump
+        // flag is restated here. `resources` merge key by key.
+        "trino" => {
+            let node = serde_json::json!({
+                "jvm": { "maxHeapSize": "1500m" },
+                "additionalJVMConfig": ["-Xms512m", "-XX:HeapDumpPath=/dumps"],
+                "config": {
+                    "query": { "maxMemoryPerNode": "600MB" },
+                    "memory": { "heapHeadroomPerNode": "450MB" }
+                },
+                "resources": {
+                    "requests": { "cpu": "250m", "memory": "1800Mi" },
+                    "limits": { "memory": "2200Mi" }
+                }
+            });
+            json_obj(&[
+                (
+                    "server",
+                    serde_json::json!({
+                        "workers": 1,
+                        "config": { "query": { "maxMemory": "600MB" } }
+                    }),
+                ),
+                ("coordinator", node.clone()),
+                ("worker", node),
+            ])
+        }
         "seaweedfs" => json_obj(&[
             ("master", serde_json::json!({ "data": { "size": "1Gi" } })),
             // Arrays replace in `deep_merge` (Helm's semantics): a profile that
@@ -529,12 +559,12 @@ mod tests {
             for role in ["coordinator", "worker"] {
                 assert_eq!(
                     trino[role]["additionalVolumes"],
-                    serde_json::json!([{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }]),
+                    serde_json::json!([{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }, { "name": "trino-dumps", "emptyDir": { "sizeLimit": "2Gi" } }]),
                     "profile {profile:?}: {role} lost the cache volume"
                 );
                 assert_eq!(
                     trino[role]["additionalVolumeMounts"],
-                    serde_json::json!([{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }]),
+                    serde_json::json!([{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }, { "name": "trino-dumps", "mountPath": "/dumps" }]),
                     "profile {profile:?}: {role} lost the cache mount"
                 );
                 assert!(
@@ -557,6 +587,89 @@ mod tests {
         }
     }
 
+    /// A Trino size such as `600MB`, `1500m` or `2G`, in mebibytes.
+    fn megabytes(size: &str) -> u64 {
+        let unit_at = size
+            .find(|c: char| !c.is_ascii_digit())
+            .expect("a size has a unit");
+        let (digits, unit) = size.split_at(unit_at);
+        let n: u64 = digits.parse().expect("a size starts with digits");
+        match unit {
+            "MB" | "m" | "Mi" => n,
+            "GB" | "G" | "Gi" => n * 1024,
+            other => panic!("unknown size unit {other:?} in {size:?}"),
+        }
+    }
+
+    #[test]
+    fn trino_memory_guards_hold_in_every_profile() {
+        // platform#54 / operator#73: one oversized query must fail closed
+        // (EXCEEDED_LOCAL_MEMORY_LIMIT) instead of OOM-killing the worker. So the per-node
+        // limit plus the heap headroom leaves at least 400MB of the heap free, and the
+        // kubelet limit sits above the heap.
+        let expected = [
+            (Profile::Demo, "1500m", "600MB", "450MB", "1800Mi", "2200Mi"),
+            (Profile::Full, "2G", "800MB", "600MB", "2300Mi", "3000Mi"),
+            (Profile::Airgap, "2G", "800MB", "600MB", "2300Mi", "3000Mi"),
+        ];
+        for (profile, heap, per_node, headroom, request, limit) in expected {
+            let trino = effective_values("trino", profile, None, None);
+            for role in ["coordinator", "worker"] {
+                let checks = [
+                    ("/jvm/maxHeapSize", heap),
+                    ("/config/query/maxMemoryPerNode", per_node),
+                    ("/config/memory/heapHeadroomPerNode", headroom),
+                    ("/resources/requests/memory", request),
+                    ("/resources/limits/memory", limit),
+                ];
+                for (pointer, want) in checks {
+                    assert_eq!(
+                        trino[role].pointer(pointer),
+                        Some(&serde_json::json!(want)),
+                        "{profile:?} {role} {pointer}"
+                    );
+                }
+                // The heap dump goes to the bounded emptyDir, in every profile.
+                assert!(
+                    trino[role]["additionalJVMConfig"]
+                        .to_string()
+                        .contains("-XX:HeapDumpPath=/dumps"),
+                    "{profile:?} {role}: lost the heap-dump path"
+                );
+                assert!(
+                    megabytes(per_node) + megabytes(headroom) + 400 <= megabytes(heap),
+                    "{profile:?} {role}: per-node + headroom leave no room in the heap"
+                );
+                assert!(
+                    megabytes(limit) > megabytes(heap),
+                    "{profile:?} {role}: the kubelet limit must exceed the heap"
+                );
+            }
+            // The cluster-wide limit equals the per-node limit, as in the platform values.
+            assert_eq!(
+                trino["server"]["config"]["query"]["maxMemory"],
+                serde_json::json!(per_node),
+                "{profile:?}"
+            );
+            // The time limits are coordinator-only: a string in
+            // `server.coordinatorExtraConfig`, never in `additionalConfigProperties`
+            // (the chart renders that one into the worker ConfigMap too).
+            let extra = trino["server"]["coordinatorExtraConfig"]
+                .as_str()
+                .expect("a properties string");
+            assert!(
+                extra.contains("query.max-execution-time=10m"),
+                "{profile:?}"
+            );
+            assert!(extra.contains("query.max-run-time=15m"), "{profile:?}");
+            assert_eq!(
+                trino["additionalConfigProperties"],
+                serde_json::json!(["http-server.process-forwarded=true"]),
+                "{profile:?}: coordinator-only keys must not reach the worker"
+            );
+        }
+    }
+
     #[test]
     fn demo_profile_sizes_the_stack_for_a_small_node() {
         // Trino: the heap and the per-node memory limit are a pair — Trino refuses to start
@@ -568,7 +681,7 @@ mod tests {
         );
         assert_eq!(
             trino["coordinator"]["config"]["query"]["maxMemoryPerNode"],
-            serde_json::json!("1GB")
+            serde_json::json!("600MB")
         );
         assert_eq!(trino["server"]["workers"], serde_json::json!(1));
         // SeaweedFS: gigabyte-scale volumes instead of the chart's defaults.
