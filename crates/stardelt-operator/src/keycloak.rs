@@ -11,12 +11,13 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::{
+    ByteString,
     api::{
         apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
         core::v1::{
             Capabilities, ConfigMap, ConfigMapEnvSource, ConfigMapVolumeSource, Container,
             ContainerPort, EnvFromSource, EnvVar, EnvVarSource, HTTPGetAction, PodSecurityContext,
-            PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile,
+            PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, Secret,
             SecretKeySelector, SecurityContext, Service, ServicePort, ServiceSpec, Volume,
             VolumeMount,
         },
@@ -50,6 +51,104 @@ pub const IMAGE: &str = "quay.io/keycloak/keycloak:26.8.1";
 /// Hosts are rendered per instance; the client secrets stay `${STARDELT_*_SECRET}` placeholders
 /// that Keycloak resolves from the Deployment's environment.
 pub const REALM_TEMPLATE: &str = include_str!("keycloak_realm.json");
+
+/// A Secret the platform IdP needs, as `stardelt-platform` `scripts/identity-bootstrap.sh`
+/// creates it. `fixed` keys carry the same literal value on every install; `generated` keys get a
+/// fresh [`generate_secret`] value when the key is first added. A key that is already there is
+/// never rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentitySecret {
+    /// Name of the Secret.
+    pub name: &'static str,
+    /// Keys that always hold the same literal value (`username=admin`).
+    pub fixed: &'static [(&'static str, &'static str)],
+    /// Keys generated once, then kept for the life of the install.
+    pub generated: &'static [&'static str],
+}
+
+impl IdentitySecret {
+    /// Every key of the Secret, fixed keys first, then generated ones — the order
+    /// `identity-bootstrap.sh` writes them in.
+    pub fn key_names(&self) -> Vec<&'static str> {
+        self.fixed
+            .iter()
+            .map(|(key, _)| *key)
+            .chain(self.generated.iter().copied())
+            .collect()
+    }
+}
+
+/// The identity Secrets the operator manages for `identity.mode: platform`, with the exact names
+/// and key sets of `scripts/identity-bootstrap.sh` (the same keys the realm's
+/// `${STARDELT_*_SECRET}` placeholders resolve from). The script also creates
+/// `stardelt-nova-session` and the Trino Secrets; those belong to the Nova and Trino components,
+/// not to Keycloak, and are not managed here.
+pub const IDENTITY_SECRETS: [IdentitySecret; 3] = [
+    IdentitySecret {
+        name: "keycloak-admin",
+        fixed: &[("username", "admin")],
+        generated: &["password"],
+    },
+    IdentitySecret {
+        name: "stardelt-realm-admin",
+        fixed: &[("username", "admin")],
+        generated: &["password"],
+    },
+    IdentitySecret {
+        name: "stardelt-oidc-clients",
+        fixed: &[],
+        generated: &[
+            "nova",
+            "superset",
+            "airflow",
+            "jupyterhub",
+            "trino",
+            "trino-group-sync",
+            "pipeline-runner",
+        ],
+    },
+];
+
+/// One generated credential: 48 lower-case hex chars (`openssl rand -hex 24` equivalent), from
+/// the same `getrandom` the S3 keys use. A failure is returned, never panicked on: the caller
+/// reports it as a status message.
+pub fn generate_secret() -> Result<String, IdentityError> {
+    let mut bytes = [0u8; 24];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| IdentityError(format!("cannot generate an identity credential: {e}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// Which keys a Secret still needs: `desired` minus the keys in `existing`, in `desired` order.
+/// The values in `existing` are irrelevant — the operator never rewrites a key that is there, so
+/// it only needs to know which names are present — and keys nobody asked for are ignored.
+pub fn missing_keys(existing: &BTreeMap<String, String>, desired: &[&str]) -> Vec<String> {
+    desired
+        .iter()
+        .filter(|key| !existing.contains_key(**key))
+        .map(|key| (*key).to_string())
+        .collect()
+}
+
+/// The Secret for one row of [`IDENTITY_SECRETS`], applied only when the Secret is absent: fixed
+/// keys as given, generated keys with a fresh credential.
+pub fn identity_secret(desired: &IdentitySecret, namespace: &str) -> Result<Secret, IdentityError> {
+    let mut data = BTreeMap::new();
+    for (key, value) in desired.fixed {
+        data.insert((*key).to_string(), ByteString(value.as_bytes().to_vec()));
+    }
+    for key in desired.generated {
+        data.insert(
+            (*key).to_string(),
+            ByteString(generate_secret()?.into_bytes()),
+        );
+    }
+    Ok(Secret {
+        metadata: meta(desired.name, namespace),
+        data: Some(data),
+        ..Secret::default()
+    })
+}
 
 /// The Realm import of this instance, or the reason it cannot be rendered.
 fn realm_json(spec: &PlatformInstanceSpec) -> Result<String, IdentityError> {
@@ -684,5 +783,109 @@ mod tests {
             !REALM_TEMPLATE.contains("__STARDELT"),
             "secrets are ${{...}} placeholders, not host placeholders"
         );
+    }
+
+    #[test]
+    fn the_identity_secret_table_matches_the_platform_bootstrap() {
+        assert_eq!(
+            IDENTITY_SECRETS.map(|desired| desired.name),
+            [
+                "keycloak-admin",
+                "stardelt-realm-admin",
+                "stardelt-oidc-clients"
+            ]
+        );
+        for desired in IDENTITY_SECRETS {
+            match desired.name {
+                "keycloak-admin" | "stardelt-realm-admin" => {
+                    assert_eq!(desired.fixed.to_vec(), [("username", "admin")]);
+                    assert_eq!(desired.generated.to_vec(), ["password"]);
+                }
+                "stardelt-oidc-clients" => {
+                    assert!(desired.fixed.is_empty());
+                    assert_eq!(
+                        desired.generated.to_vec(),
+                        [
+                            "nova",
+                            "superset",
+                            "airflow",
+                            "jupyterhub",
+                            "trino",
+                            "trino-group-sync",
+                            "pipeline-runner"
+                        ]
+                    );
+                }
+                other => panic!("unexpected Secret {other}"),
+            }
+        }
+        assert_eq!(IDENTITY_SECRETS[0].key_names(), ["username", "password"]);
+        assert_eq!(
+            IDENTITY_SECRETS[2].key_names(),
+            [
+                "nova",
+                "superset",
+                "airflow",
+                "jupyterhub",
+                "trino",
+                "trino-group-sync",
+                "pipeline-runner"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_generated_secret_is_48_lower_case_hex_chars_and_unique() {
+        let first = generate_secret().expect("a credential");
+        let second = generate_secret().expect("a credential");
+        assert_eq!(first.len(), 48);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "not lower-case hex"
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn missing_keys_keeps_the_desired_order_and_ignores_keys_nobody_asked_for() {
+        let desired = ["nova", "superset", "airflow"];
+        assert_eq!(missing_keys(&BTreeMap::new(), &desired), desired);
+        let existing = BTreeMap::from([
+            ("superset".to_string(), "present".to_string()),
+            ("legacy".to_string(), "ignored".to_string()),
+        ]);
+        assert_eq!(missing_keys(&existing, &desired), ["nova", "airflow"]);
+        let complete: BTreeMap<String, String> = desired
+            .iter()
+            .map(|key| ((*key).to_string(), String::new()))
+            .collect();
+        assert!(missing_keys(&complete, &desired).is_empty());
+    }
+
+    #[test]
+    fn an_identity_secret_is_labelled_and_carries_fixed_and_generated_keys() {
+        let secret = identity_secret(&IDENTITY_SECRETS[0], "stardelt").expect("a Secret");
+        assert_eq!(secret.metadata.name.as_deref(), Some("keycloak-admin"));
+        assert_eq!(secret.metadata.namespace.as_deref(), Some("stardelt"));
+        assert!(
+            secret.metadata.owner_references.is_none(),
+            "the realm owns the credentials, not the PlatformInstance"
+        );
+        assert_eq!(
+            secret.metadata.labels.as_ref().expect("labels")["app.kubernetes.io/part-of"],
+            "stardelt"
+        );
+        let data = secret.data.expect("data");
+        assert_eq!(data["username"].0, b"admin".to_vec());
+        assert_eq!(data["password"].0.len(), 48, "48 hex chars");
+
+        let clients = identity_secret(&IDENTITY_SECRETS[2], "stardelt").expect("a Secret");
+        let data = clients.data.expect("data");
+        assert_eq!(data.len(), 7, "one credential per client");
+        for key in IDENTITY_SECRETS[2].generated {
+            assert_eq!(data[*key].0.len(), 48, "{key}");
+        }
     }
 }

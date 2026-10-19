@@ -2,6 +2,8 @@
 //! a component status. The objects are built in `prerequisites.rs` and sent with
 //! the helpers in `objects.rs`.
 
+use std::collections::BTreeMap;
+
 use k8s_openapi::{
     ByteString,
     api::{
@@ -10,7 +12,11 @@ use k8s_openapi::{
         core::v1::{ConfigMap, Secret, Service},
     },
 };
-use kube::{Api, ResourceExt, core::DynamicObject};
+use kube::{
+    Api, ResourceExt,
+    api::{Patch, PatchParams},
+    core::DynamicObject,
+};
 
 use crate::{
     controller::Context,
@@ -363,16 +369,120 @@ pub async fn ensure_keycloak_pg(
     }
 }
 
-/// Secrets the Keycloak Deployment reads. `keycloak-pg-app` is created by CloudNative-PG,
-/// `keycloak-admin`, `stardelt-realm-admin` and `stardelt-oidc-clients` by the platform's
-/// identity bootstrap (wave 2c-iii creates them from the operator). Without them Keycloak
-/// crashes on boot, so the workload waits instead of applying.
+/// Secrets the Keycloak Deployment reads. `keycloak-pg-app` is created by CloudNative-PG; the
+/// other three by [`ensure_identity_secrets`] (wave 2c-iii — before that the platform's
+/// `scripts/identity-bootstrap.sh` created them). Without them Keycloak crashes on boot, so the
+/// workload waits instead of applying. The names come from [`keycloak::IDENTITY_SECRETS`], so
+/// there is one table of what the operator creates.
 pub const KEYCLOAK_SECRETS: [&str; 4] = [
     "keycloak-pg-app",
-    "keycloak-admin",
-    "stardelt-realm-admin",
-    "stardelt-oidc-clients",
+    keycloak::IDENTITY_SECRETS[0].name,
+    keycloak::IDENTITY_SECRETS[1].name,
+    keycloak::IDENTITY_SECRETS[2].name,
 ];
+
+/// The identity Secrets for `identity.mode: platform`, with the semantics of
+/// `scripts/identity-bootstrap.sh`: a Secret is created when it is absent; an existing Secret
+/// gets only the keys it lacks, and no value that is already there is ever rewritten (the
+/// imported realm holds those credentials, so a reconcile must not rotate them). No owner
+/// reference: the realm, not the `PlatformInstance`, owns the credentials.
+pub async fn ensure_identity_secrets(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "identity-secrets";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let (mut created, mut kept) = (0, 0);
+    for desired in &keycloak::IDENTITY_SECRETS {
+        let existing = match secrets.get_opt(desired.name).await {
+            Ok(existing) => existing,
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        };
+        let Some(existing) = existing else {
+            let secret = match keycloak::identity_secret(desired, namespace) {
+                Ok(secret) => secret,
+                Err(e) => return Some(status(NAME, false, e.to_string())),
+            };
+            if let Err(e) = apply::<Secret>(&ctx.client, namespace, &secret, spec.dry_run).await {
+                return Some(status(NAME, false, e.to_string()));
+            }
+            created += 1;
+            continue;
+        };
+        // Kept, not rotated: only the keys this Secret lacks are generated and patched in.
+        kept += 1;
+        let missing = keycloak::missing_keys(&keys_of(&existing), &desired.key_names());
+        let mut values = BTreeMap::new();
+        for key in missing {
+            let value = match desired.fixed.iter().find(|(name, _)| *name == key.as_str()) {
+                Some((_, value)) => (*value).to_string(),
+                None => match keycloak::generate_secret() {
+                    Ok(value) => value,
+                    Err(e) => return Some(status(NAME, false, e.to_string())),
+                },
+            };
+            values.insert(key, value);
+        }
+        if values.is_empty() {
+            continue;
+        }
+        if let Err(e) =
+            patch_identity_secret(&ctx.client, namespace, desired.name, &values, spec.dry_run).await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    Some(status(
+        NAME,
+        true,
+        format!("ready: created {created} / kept {kept}"),
+    ))
+}
+
+/// The key names of a Secret. Values are never read: the operator only decides which keys are
+/// absent, and a credential must never be logged.
+fn keys_of(secret: &Secret) -> BTreeMap<String, String> {
+    secret
+        .data
+        .as_ref()
+        .map(|data| {
+            data.keys()
+                .map(|key| (key.clone(), String::new()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merge-patches `stringData` into an existing Secret: the API server adds exactly these keys to
+/// `data` and leaves every other key — and every existing value — alone. `stringData` is
+/// write-only, so the credentials never come back out of the API server.
+async fn patch_identity_secret(
+    client: &kube::Client,
+    namespace: &str,
+    name: &str,
+    keys: &BTreeMap<String, String>,
+    dry_run: bool,
+) -> Result<(), kube::Error> {
+    let params = PatchParams {
+        dry_run,
+        ..PatchParams::default()
+    };
+    Api::<Secret>::namespaced(client.clone(), namespace)
+        .patch(
+            name,
+            &params,
+            &Patch::Merge(serde_json::json!({ "stringData": keys })),
+        )
+        .await?;
+    Ok(())
+}
 
 /// The Keycloak workload (realm and environment ConfigMaps, Service, Deployment) for
 /// `identity.mode: platform`. `None` in the other modes: without Keycloak nothing serves the
@@ -899,6 +1009,335 @@ mod tests {
         assert_eq!(
             status.message.as_deref(),
             Some("waiting for the Deployment to become ready")
+        );
+    }
+
+    /// A fake API server for the identity Secrets: GET answers from `store`, a server-side apply
+    /// stores the object (as the API server would), a merge patch merges `stringData` into
+    /// `data`, and a dry-run PATCH is validated but not persisted. Every request is recorded.
+    type Store = Arc<Mutex<BTreeMap<String, serde_json::Value>>>;
+
+    fn identity_client(
+        initial: BTreeMap<String, serde_json::Value>,
+    ) -> (kube::Client, Store, Recorded) {
+        let store: Store = Arc::new(Mutex::new(initial));
+        let recorder: Recorded = Arc::default();
+        let service_store = store.clone();
+        let service_recorder = recorder.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let store = service_store.clone();
+            let recorder = service_recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            let dry_run = request
+                .uri()
+                .query()
+                .is_some_and(|query| query.contains("dryRun"));
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                let body = String::from_utf8_lossy(&body).to_string();
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    body.clone(),
+                ));
+                let name = path.rsplit('/').next().expect("a name").to_string();
+                let (status, document) = if method == "GET" {
+                    match store.lock().expect("store poisoned").get(&name) {
+                        Some(object) => (200, object.to_string()),
+                        None => (
+                            404,
+                            r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#
+                                .to_string(),
+                        ),
+                    }
+                } else if dry_run {
+                    (200, body)
+                } else {
+                    let patch: serde_json::Value =
+                        serde_json::from_str(&body).expect("a JSON body");
+                    let mut store = store.lock().expect("store poisoned");
+                    let inserted = name.clone();
+                    let object = store.entry(name).or_insert_with(|| {
+                        serde_json::json!({
+                            "apiVersion": "v1",
+                            "kind": "Secret",
+                            "metadata": { "name": inserted },
+                            "data": {},
+                        })
+                    });
+                    match patch.get("stringData").and_then(|value| value.as_object()) {
+                        Some(string_data) => {
+                            let data = object["data"].as_object_mut().expect("data");
+                            for (key, value) in string_data {
+                                data.insert(key.clone(), value.clone());
+                            }
+                        }
+                        None => *object = patch,
+                    }
+                    (200, object.to_string())
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(document.into_bytes()))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (kube::Client::new(service, "stardelt"), store, recorder)
+    }
+
+    /// How many writes a request log holds.
+    fn patch_count(requests: &Recorded) -> usize {
+        requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|(method, _, _)| method == "PATCH")
+            .count()
+    }
+
+    /// The body of the first PATCH against Secret `name`.
+    fn applied_secret(requests: &Recorded, name: &str) -> serde_json::Value {
+        let suffix = format!("/secrets/{name}");
+        requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .find(|(method, path, _)| method == "PATCH" && path.ends_with(&suffix))
+            .map(|(_, _, body)| serde_json::from_str(body).expect("a JSON body"))
+            .expect("an applied Secret")
+    }
+
+    /// A base64 string for 48 bytes: 64 characters, no padding (`openssl rand -hex 24`).
+    fn assert_base64_of_48_bytes(value: &str) {
+        assert_eq!(value.len(), 64, "not 48 bytes of base64");
+        assert!(
+            value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'),
+            "not base64"
+        );
+    }
+
+    fn secret_object(name: &str, data: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": name },
+            "data": data
+                .iter()
+                .map(|(key, value)| {
+                    ((*key).to_string(), serde_json::Value::String((*value).to_string()))
+                })
+                .collect::<serde_json::Map<_, _>>(),
+        })
+    }
+
+    #[tokio::test]
+    async fn identity_secrets_exist_only_for_mode_platform() {
+        for mode in ["none", "external"] {
+            let (client, _store, requests) = identity_client(BTreeMap::new());
+            assert!(
+                ensure_identity_secrets(&context(client), &platform(mode, false))
+                    .await
+                    .is_none(),
+                "{mode}"
+            );
+            assert!(
+                requests.lock().expect("requests poisoned").is_empty(),
+                "{mode} must not touch the cluster"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn identity_secrets_are_created_with_the_script_keys_and_kept_on_a_second_reconcile() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("platform", false);
+        let status = ensure_identity_secrets(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.name, "identity-secrets");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("ready: created 3 / kept 0"),
+            "counts, never values"
+        );
+        assert_eq!(patch_count(&requests), 3, "one apply per Secret");
+
+        let admin = applied_secret(&requests, "keycloak-admin");
+        assert_eq!(admin["apiVersion"], "v1");
+        assert_eq!(admin["kind"], "Secret");
+        assert_eq!(admin["metadata"]["name"], "keycloak-admin");
+        assert_eq!(
+            admin["metadata"]["labels"]["app.kubernetes.io/part-of"],
+            "stardelt"
+        );
+        assert!(
+            admin["metadata"].get("ownerReferences").is_none(),
+            "the realm owns the credentials"
+        );
+        assert_eq!(admin["data"]["username"], "YWRtaW4=", "base64 of admin");
+        assert_base64_of_48_bytes(admin["data"]["password"].as_str().expect("a password"));
+
+        let realm_admin = applied_secret(&requests, "stardelt-realm-admin");
+        assert_eq!(realm_admin["data"]["username"], "YWRtaW4=");
+        assert_base64_of_48_bytes(
+            realm_admin["data"]["password"]
+                .as_str()
+                .expect("a password"),
+        );
+
+        let clients = applied_secret(&requests, "stardelt-oidc-clients");
+        let data = clients["data"].as_object().expect("data");
+        assert_eq!(
+            data.keys().collect::<Vec<_>>(),
+            [
+                "airflow",
+                "jupyterhub",
+                "nova",
+                "pipeline-runner",
+                "superset",
+                "trino",
+                "trino-group-sync"
+            ]
+        );
+        let mut credentials: Vec<&str> = Vec::new();
+        for applied in [&admin, &realm_admin, &clients] {
+            for (key, value) in applied["data"].as_object().expect("data") {
+                if key != "username" {
+                    credentials.push(value.as_str().expect("a base64 string"));
+                }
+            }
+        }
+        assert_eq!(credentials.len(), 9, "two passwords and seven clients");
+        let unique: std::collections::BTreeSet<&str> = credentials.iter().copied().collect();
+        assert_eq!(unique.len(), 9, "two credentials are identical");
+
+        // The mock now serves the objects it stored; a second reconcile must change nothing.
+        let before = store.lock().expect("store poisoned").clone();
+        let status = ensure_identity_secrets(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("ready: created 0 / kept 3"));
+        assert_eq!(patch_count(&requests), 3, "a reconcile may not write");
+        assert_eq!(
+            *store.lock().expect("store poisoned"),
+            before,
+            "a credential was rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_identity_secret_gets_only_its_missing_keys() {
+        let initial = BTreeMap::from([
+            (
+                "keycloak-admin".to_string(),
+                secret_object(
+                    "keycloak-admin",
+                    &[
+                        ("username", "YWRtaW4="),
+                        ("password", "b2xkLWtleWNsb2FrLXBhc3N3b3Jk"),
+                    ],
+                ),
+            ),
+            (
+                "stardelt-realm-admin".to_string(),
+                secret_object(
+                    "stardelt-realm-admin",
+                    &[
+                        ("username", "YWRtaW4="),
+                        ("password", "b2xkLXJlYWxtLXBhc3N3b3Jk"),
+                    ],
+                ),
+            ),
+            (
+                "stardelt-oidc-clients".to_string(),
+                secret_object(
+                    "stardelt-oidc-clients",
+                    &[
+                        ("nova", "b2xkLW5vdmE="),
+                        ("superset", "b2xkLXN1cGVyc2V0"),
+                        ("airflow", "b2xkLWFpcmZsb3c="),
+                        ("jupyterhub", "b2xkLWp1cHl0ZXJodWI="),
+                    ],
+                ),
+            ),
+        ]);
+        let (client, store, requests) = identity_client(initial);
+        let status = ensure_identity_secrets(&context(client), &platform("platform", false))
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("ready: created 0 / kept 3"));
+        assert_eq!(
+            patch_count(&requests),
+            1,
+            "only the Secret with missing keys"
+        );
+
+        let patch = applied_secret(&requests, "stardelt-oidc-clients");
+        let added = patch["stringData"].as_object().expect("stringData");
+        assert_eq!(
+            added.keys().collect::<Vec<_>>(),
+            ["pipeline-runner", "trino", "trino-group-sync"]
+        );
+        for value in added.values() {
+            let value = value.as_str().expect("a plain value");
+            assert_eq!(value.len(), 48);
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "not lower-case hex"
+            );
+        }
+
+        // Every key the Secret already had kept its value.
+        let store = store.lock().expect("store poisoned");
+        let data = store["stardelt-oidc-clients"]["data"]
+            .as_object()
+            .expect("data");
+        for (key, value) in [
+            ("nova", "b2xkLW5vdmE="),
+            ("superset", "b2xkLXN1cGVyc2V0"),
+            ("airflow", "b2xkLWFpcmZsb3c="),
+            ("jupyterhub", "b2xkLWp1cHl0ZXJodWI="),
+        ] {
+            assert_eq!(data[key], value, "{key} was rewritten");
+        }
+        assert_eq!(
+            store["keycloak-admin"]["data"]["password"],
+            "b2xkLWtleWNsb2FrLXBhc3N3b3Jk"
+        );
+        assert_eq!(
+            store["stardelt-realm-admin"]["data"]["password"],
+            "b2xkLXJlYWxtLXBhc3N3b3Jk"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_secrets_dry_run_writes_nothing() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let status = ensure_identity_secrets(&context(client), &platform("platform", true))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
+        assert_eq!(patch_count(&requests), 3);
+        assert!(
+            store.lock().expect("store poisoned").is_empty(),
+            "dry-run persisted a Secret"
         );
     }
 }
