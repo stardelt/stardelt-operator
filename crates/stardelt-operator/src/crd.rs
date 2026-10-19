@@ -979,6 +979,211 @@ pub struct ConnectionStatus {
     pub observed_generation: Option<i64>,
 }
 
+/// What a volume holds. A `libraries` volume is code that every reader executes, so it
+/// restricts `write` to groups that also manage it (decision D28, internal note
+/// `design/volumes.md` §5).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumePurpose {
+    /// Files of any kind: drops, exports, model artifacts, notebook output.
+    #[default]
+    Data,
+    /// Wheels and requirement files, installed into readers' environments.
+    Libraries,
+}
+
+/// What a grant lets a group do: `read` a file or list a folder, `write` upload, change or
+/// delete one, `manage` change the grants and delete the volume.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum VolumeVerb {
+    Read,
+    Write,
+    Manage,
+}
+
+/// One group's rights on a volume. Subjects are groups, never users.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct VolumeGrant {
+    /// The Keycloak group whose members hold these verbs.
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub group: String,
+    /// At least one verb; each verb at most once.
+    #[schemars(length(min = 1, max = 3))]
+    pub verbs: Vec<VolumeVerb>,
+}
+
+/// Storage the platform owns: the volume gets `volumes/<catalog>/<name>/` in the platform
+/// object store. `managed: {}` selects it.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
+pub struct ManagedStorage {}
+
+/// A prefix in the customer's own bucket, reached through an `s3` connection.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ExternalStorage {
+    /// Name of the `s3` connection that holds the endpoint, bucket and credentials.
+    #[schemars(
+        length(min = 1, max = 40),
+        regex(pattern = r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
+    )]
+    pub connection: String,
+    /// Key prefix inside the bucket; absent means the prefix the connection already scopes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 512), regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_./-]*$"))]
+    pub prefix: Option<String>,
+}
+
+/// Where a volume's files live: exactly one of platform-managed storage or an external
+/// prefix. Files live in the volume bucket, never in the table bucket (D28).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct VolumeStorage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedStorage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalStorage>,
+}
+
+/// A governed folder of files in the object store with an owner group and grants.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "Volume",
+    namespaced,
+    status = "VolumeStatus",
+    shortname = "vol",
+    doc = "A governed folder of files in the object store with an owner group and grants."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "has(self.storage.managed) != has(self.storage.external)",
+        "message": "storage must be either managed or external, not both and not neither"
+    },
+    {
+        "rule": "!has(self.storage.external) || !has(self.storage.external.prefix) || (!self.storage.external.prefix.contains('..') && !self.storage.external.prefix.contains('//'))",
+        "message": "an external prefix must not contain .. or //"
+    },
+    {
+        "rule": "self.grants.all(g, self.grants.exists_one(h, h.group == g.group))",
+        "message": "each group may appear once in grants"
+    },
+    {
+        "rule": "self.grants.all(g, g.verbs.all(v, g.verbs.exists_one(w, w == v)))",
+        "message": "a verb may appear once per grant"
+    },
+    {
+        "rule": "self.purpose != 'libraries' || self.grants.all(g, !('write' in g.verbs) || ('manage' in g.verbs))",
+        "message": "on a libraries volume only a group that also manages it may write"
+    }
+]))]
+pub struct VolumeSpec {
+    /// The catalog (Lakehouse) this volume belongs to; the owner group is inherited.
+    #[schemars(
+        length(min = 1, max = 40),
+        regex(pattern = r"^[a-z]([-a-z0-9]*[a-z0-9])?$")
+    )]
+    pub catalog: String,
+    #[serde(default)]
+    pub purpose: VolumePurpose,
+    pub storage: VolumeStorage,
+    #[serde(default)]
+    #[schemars(length(max = 20))]
+    pub grants: Vec<VolumeGrant>,
+}
+
+impl VolumeSpec {
+    /// The rules the schema's CEL validations also enforce, plus the resource name, in one
+    /// place for the controller and the tests.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !name_ok {
+            return Err(format!(
+                "volume name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
+            ));
+        }
+        if self.storage.managed.is_some() == self.storage.external.is_some() {
+            return Err(
+                "storage must be either managed or external, not both and not neither".to_string(),
+            );
+        }
+        if let Some(external) = &self.storage.external
+            && let Some(prefix) = &external.prefix
+            && (prefix.contains("..") || prefix.contains("//"))
+        {
+            return Err("an external prefix must not contain .. or //".to_string());
+        }
+        let groups: std::collections::BTreeSet<&str> =
+            self.grants.iter().map(|g| g.group.as_str()).collect();
+        if groups.len() != self.grants.len() {
+            return Err("each group may appear once in grants".to_string());
+        }
+        for grant in &self.grants {
+            let verbs: std::collections::BTreeSet<&VolumeVerb> = grant.verbs.iter().collect();
+            if verbs.len() != grant.verbs.len() {
+                return Err("a verb may appear once per grant".to_string());
+            }
+        }
+        if self.purpose == VolumePurpose::Libraries
+            && !self.grants.iter().all(|g| {
+                !g.verbs.contains(&VolumeVerb::Write) || g.verbs.contains(&VolumeVerb::Manage)
+            })
+        {
+            return Err(
+                "on a libraries volume only a group that also manages it may write".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// `volumes/<catalog>/<name>/` for managed storage, or the external prefix (an empty
+    /// string when the connection already scopes one).
+    pub fn derived_prefix(&self, name: &str) -> String {
+        if self.storage.managed.is_some() {
+            format!("volumes/{}/{name}/", self.catalog)
+        } else {
+            self.storage
+                .external
+                .as_ref()
+                .and_then(|external| external.prefix.clone())
+                .unwrap_or_default()
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct VolumeStatus {
+    /// True when the prefix exists and its grants apply; filled by a later controller.
+    #[serde(default)]
+    pub ready: bool,
+    /// The object-store prefix the volume maps to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    #[serde(default, rename = "sizeBytes", skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objects: Option<i64>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct ComponentStatus {
     pub name: String,
@@ -1681,5 +1886,195 @@ mod tests {
             !yaml.contains("password:"),
             "no field may be called password"
         );
+    }
+
+    fn volume(spec: serde_json::Value) -> Volume {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Volume",
+            "metadata": { "name": "raw-landing", "namespace": "stardelt" },
+            "spec": spec
+        }))
+        .expect("deserialize Volume")
+    }
+
+    fn volume_spec(patch: serde_json::Value) -> serde_json::Value {
+        let mut spec = serde_json::json!({
+            "catalog": "analytics",
+            "purpose": "data",
+            "storage": { "managed": {} },
+            "grants": [
+                { "group": "analysts", "verbs": ["read"] },
+                { "group": "engineers", "verbs": ["read", "write"] }
+            ]
+        });
+        for (k, v) in patch.as_object().unwrap() {
+            if v.is_null() {
+                spec.as_object_mut().unwrap().remove(k);
+            } else {
+                spec[k] = v.clone();
+            }
+        }
+        spec
+    }
+
+    #[test]
+    fn a_managed_volume_parses_and_derives_its_prefix() {
+        let v = volume(volume_spec(serde_json::json!({})));
+        assert_eq!(v.spec.purpose, VolumePurpose::Data);
+        assert!(v.spec.storage.managed.is_some());
+        assert!(v.spec.storage.external.is_none());
+        assert!(v.spec.validate("raw-landing").is_ok());
+        assert_eq!(
+            v.spec.derived_prefix("raw-landing"),
+            "volumes/analytics/raw-landing/"
+        );
+    }
+
+    #[test]
+    fn an_external_volume_parses_and_keeps_its_prefix() {
+        let v = volume(volume_spec(serde_json::json!({
+            "storage": { "external": { "connection": "raw-s3", "prefix": "landing/" } }
+        })));
+        assert_eq!(
+            v.spec.storage.external.as_ref().unwrap().connection,
+            "raw-s3"
+        );
+        assert!(v.spec.validate("raw-landing").is_ok());
+        assert_eq!(v.spec.derived_prefix("raw-landing"), "landing/");
+        let root = volume(volume_spec(serde_json::json!({
+            "storage": { "external": { "connection": "raw-s3" } }
+        })));
+        assert_eq!(root.spec.derived_prefix("raw-landing"), "");
+    }
+
+    #[test]
+    fn managed_storage_serializes_as_an_empty_object() {
+        let v = volume(volume_spec(serde_json::json!({})));
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["spec"]["storage"]["managed"], serde_json::json!({}));
+        assert_eq!(json["spec"]["storage"].get("external"), None);
+    }
+
+    #[test]
+    fn the_storage_choice_is_exclusive() {
+        let both = volume(volume_spec(serde_json::json!({
+            "storage": { "managed": {}, "external": { "connection": "raw-s3" } }
+        })));
+        assert_eq!(
+            both.spec.validate("raw-landing").unwrap_err(),
+            "storage must be either managed or external, not both and not neither"
+        );
+        let neither = volume(volume_spec(serde_json::json!({ "storage": {} })));
+        assert_eq!(
+            neither.spec.validate("raw-landing").unwrap_err(),
+            "storage must be either managed or external, not both and not neither"
+        );
+    }
+
+    #[test]
+    fn an_external_prefix_cannot_climb_out_of_its_volume() {
+        for prefix in ["a/../b", "a//b"] {
+            let bad = volume(volume_spec(serde_json::json!({
+                "storage": { "external": { "connection": "raw-s3", "prefix": prefix } }
+            })));
+            assert_eq!(
+                bad.spec.validate("raw-landing").unwrap_err(),
+                "an external prefix must not contain .. or //",
+                "{prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_group_appears_once_in_grants() {
+        let bad = volume(volume_spec(serde_json::json!({
+            "grants": [
+                { "group": "analysts", "verbs": ["read"] },
+                { "group": "analysts", "verbs": ["write"] }
+            ]
+        })));
+        assert_eq!(
+            bad.spec.validate("raw-landing").unwrap_err(),
+            "each group may appear once in grants"
+        );
+    }
+
+    #[test]
+    fn a_verb_appears_once_per_grant() {
+        let bad = volume(volume_spec(serde_json::json!({
+            "grants": [ { "group": "analysts", "verbs": ["read", "read"] } ]
+        })));
+        assert_eq!(
+            bad.spec.validate("raw-landing").unwrap_err(),
+            "a verb may appear once per grant"
+        );
+    }
+
+    #[test]
+    fn a_libraries_volume_only_lets_managers_write() {
+        let ok = volume(volume_spec(serde_json::json!({
+            "purpose": "libraries",
+            "grants": [
+                { "group": "analysts", "verbs": ["read"] },
+                { "group": "engineers", "verbs": ["read", "write", "manage"] }
+            ]
+        })));
+        assert!(ok.spec.validate("raw-landing").is_ok());
+        let bad = volume(volume_spec(serde_json::json!({
+            "purpose": "libraries",
+            "grants": [ { "group": "engineers", "verbs": ["write"] } ]
+        })));
+        assert_eq!(
+            bad.spec.validate("raw-landing").unwrap_err(),
+            "on a libraries volume only a group that also manages it may write"
+        );
+    }
+
+    #[test]
+    fn verbs_sort_in_ascending_rights() {
+        let mut verbs = vec![VolumeVerb::Manage, VolumeVerb::Read, VolumeVerb::Write];
+        verbs.sort();
+        assert_eq!(
+            verbs,
+            vec![VolumeVerb::Read, VolumeVerb::Write, VolumeVerb::Manage]
+        );
+    }
+
+    #[test]
+    fn volume_names_are_checked() {
+        let spec = volume(volume_spec(serde_json::json!({}))).spec;
+        for name in ["", "Vol", "1vol", "raw_landing", "raw-", &"a".repeat(41)] {
+            assert!(spec.validate(name).is_err(), "{name}");
+        }
+        for name in ["raw-landing", "a", &"a".repeat(40)] {
+            assert!(spec.validate(name).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_volume_crd_carries_the_cel_rules_and_the_bounds() {
+        let crd = Volume::crd();
+        assert_eq!(crd.spec.names.plural, "volumes");
+        assert_eq!(crd.spec.names.short_names, Some(vec!["vol".to_string()]));
+        let yaml = serde_yaml::to_string(&crd).unwrap();
+        for needle in [
+            "x-kubernetes-validations",
+            "storage must be either managed or external, not both and not neither",
+            "an external prefix must not contain .. or //",
+            "each group may appear once in grants",
+            "a verb may appear once per grant",
+            "on a libraries volume only a group that also manages it may write",
+        ] {
+            assert!(yaml.contains(needle), "the CRD lacks `{needle}`");
+        }
+        for bound in [
+            "maxItems: 20",
+            "maxItems: 3",
+            "maxLength: 512",
+            "maxLength: 64",
+        ] {
+            assert!(yaml.contains(bound), "the CRD lacks `{bound}`");
+        }
     }
 }
