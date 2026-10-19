@@ -13,7 +13,8 @@ use kube::{Api, ResourceExt, core::DynamicObject};
 
 use crate::{
     controller::Context,
-    crd::{ComponentStatus, Lakehouse, StorageImpl},
+    crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
+    identity,
     objects::{apply, apply_dynamic, cnpg_cluster_resource, owner_reference},
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, S3_CONFIG_SECRET, S3_SECRET, S3Keys, S3Location,
@@ -293,6 +294,37 @@ pub async fn ensure_discovery(
         ),
         Err(e) => status(NAME, false, e.to_string()),
     }
+}
+
+/// Publish the identity contract (ConfigMap `stardelt-identity`, decision D20) in the platform
+/// namespace. `None` when sign-in is off: nothing is planned, nothing is applied, and an
+/// existing ConfigMap written by the chart or the scripts is left alone.
+pub async fn ensure_identity(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "identity";
+    if spec.identity.mode == IdentityMode::None {
+        return None;
+    }
+    let config_map = match identity::config_map(spec, &spec.namespace) {
+        Ok(Some(config_map)) => config_map,
+        Ok(None) => return None,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    Some(
+        match apply::<ConfigMap>(&ctx.client, &spec.namespace, &config_map, false).await {
+            Ok(_) => status(
+                NAME,
+                true,
+                format!("published ConfigMap {}", identity::CONFIGMAP_NAME),
+            ),
+            Err(e) => status(NAME, false, e.to_string()),
+        },
+    )
 }
 
 #[cfg(test)]

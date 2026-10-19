@@ -6,6 +6,9 @@
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::api::core::v1::ConfigMap;
+use kube::api::ObjectMeta;
+
 use crate::crd::{IdentityMode, PlatformInstanceSpec};
 
 /// Name of the ConfigMap in the platform namespace.
@@ -72,6 +75,39 @@ pub fn contract(
         // Nova answers on the base domain itself; every other application on a subdomain.
         ("publicUrl".to_string(), format!("https://{domain}")),
     ])))
+}
+
+/// The ConfigMap `stardelt-identity` to apply in `namespace`, or `None` when sign-in is off.
+///
+/// It carries no owner reference: uninstalling the platform keeps the contract (decision D18,
+/// `deletionPolicy: Retain`), and the chart or `scripts/identity-bootstrap.sh` may already own
+/// other keys of the same object (for example `trinoUrl`), which server-side apply leaves alone.
+pub fn config_map(
+    spec: &PlatformInstanceSpec,
+    namespace: &str,
+) -> Result<Option<ConfigMap>, IdentityError> {
+    let Some(data) = contract(spec)? else {
+        return Ok(None);
+    };
+    Ok(Some(ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(CONFIGMAP_NAME.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    "app.kubernetes.io/part-of".to_string(),
+                    "stardelt".to_string(),
+                ),
+                (
+                    MODE_LABEL.to_string(),
+                    mode_label(spec.identity.mode).to_string(),
+                ),
+            ])),
+            ..ObjectMeta::default()
+        },
+        data: Some(data),
+        ..ConfigMap::default()
+    }))
 }
 
 /// Value of [`MODE_LABEL`].
@@ -171,6 +207,41 @@ mod tests {
         assert!(contract(&http).unwrap_err().0.contains("https"));
         let no_domain = spec(external("https://idp.example.com"), None);
         assert!(contract(&no_domain).unwrap_err().0.contains("baseDomain"));
+    }
+
+    #[test]
+    fn the_config_map_is_named_labelled_and_carries_the_contract() {
+        let s = spec(
+            external("https://idp.example.com"),
+            Some("data.example.com"),
+        );
+        let cm = config_map(&s, "stardelt").unwrap().unwrap();
+        assert_eq!(cm.metadata.name.as_deref(), Some("stardelt-identity"));
+        assert_eq!(cm.metadata.namespace.as_deref(), Some("stardelt"));
+        let labels = cm.metadata.labels.unwrap();
+        assert_eq!(labels["stardelt.io/identity-mode"], "external");
+        assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
+        assert!(
+            cm.metadata.owner_references.is_none(),
+            "uninstalling keeps the contract"
+        );
+        assert_eq!(cm.data.unwrap()["issuerUrl"], "https://idp.example.com");
+    }
+
+    #[test]
+    fn without_sign_in_there_is_no_config_map_and_bad_settings_are_errors() {
+        assert!(
+            config_map(&spec(IdentitySpec::default(), None), "stardelt")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            config_map(
+                &spec(external("http://x"), Some("d.example.com")),
+                "stardelt"
+            )
+            .is_err()
+        );
     }
 
     #[test]
