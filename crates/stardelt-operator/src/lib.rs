@@ -8,5 +8,8 @@
 pub mod controller;
 pub mod crd;
 pub mod helm;
+pub mod objects;
 pub mod planner;
+pub mod prerequisites;
+pub mod provision;
 pub mod values;

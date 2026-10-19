@@ -80,6 +80,30 @@ pub fn golden_values(component: &str) -> Value {
                 serde_json::json!({ "warehouse": WAREHOUSE_CATALOG }),
             ),
         ]),
+        // The catalog database is the CloudNative-PG Cluster `lakekeeper-pg` that the
+        // operator applies itself (prerequisites.rs); the short Service name resolves
+        // inside the Lakehouse's namespace. Authorization stays `allowall` until the
+        // OpenFGA work (docs#64); the bundled Postgres and OpenFGA are off.
+        "lakekeeper" => json_obj(&[
+            ("helmWait", serde_json::json!(true)),
+            ("postgresql", serde_json::json!({ "enabled": false })),
+            (
+                "externalDatabase",
+                serde_json::json!({
+                    "type": "postgres",
+                    "host_read": "lakekeeper-pg-rw",
+                    "host_write": "lakekeeper-pg-rw",
+                    "port": 5432,
+                    "database": "lakekeeper",
+                    "userSecret": "lakekeeper-pg-app",
+                    "userSecretKey": "username",
+                    "passwordSecret": "lakekeeper-pg-app",
+                    "passwordSecretKey": "password"
+                }),
+            ),
+            ("authz", serde_json::json!({ "backend": "allowall" })),
+            ("internalOpenFGA", serde_json::json!(false)),
+        ]),
         // Sign-in goes through the platform IdP, exactly like
         // stardelt-platform/helm-values/jupyterhub.yaml: the hub reads the identity
         // contract (ConfigMap stardelt-identity, Secret stardelt-oidc-clients) of
@@ -183,7 +207,20 @@ pub fn golden_values(component: &str) -> Value {
                     "data": { "type": "persistentVolumeClaim" }
                 }),
             ),
-            ("s3", serde_json::json!({ "enabled": true })),
+            // The S3 identities come from Secret `seaweedfs-s3-config`, written by the
+            // operator from the same key pair as `stardelt-s3-creds`; no key in values.
+            (
+                "s3",
+                serde_json::json!({
+                    "enabled": true,
+                    "enableAuth": true,
+                    "existingConfigSecret": "seaweedfs-s3-config",
+                    "createBuckets": [
+                        { "name": "lakehouse", "anonymousRead": false },
+                        { "name": "backups", "anonymousRead": false }
+                    ]
+                }),
+            ),
         ]),
         _ => Value::Object(Map::new()),
     }
@@ -614,6 +651,35 @@ mod tests {
         assert!(
             matches!(err, ValuesError::InvalidYaml(_)),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn lakekeeper_golden_values_use_the_operator_owned_database() {
+        let l = golden_values("lakekeeper");
+        assert_eq!(l["postgresql"]["enabled"], serde_json::json!(false));
+        assert_eq!(
+            l["externalDatabase"]["host_write"],
+            serde_json::json!("lakekeeper-pg-rw")
+        );
+        assert_eq!(
+            l["externalDatabase"]["passwordSecret"],
+            serde_json::json!("lakekeeper-pg-app")
+        );
+        assert_eq!(l["authz"]["backend"], serde_json::json!("allowall"));
+    }
+
+    #[test]
+    fn seaweedfs_golden_values_read_identities_from_the_generated_secret() {
+        let s = golden_values("seaweedfs");
+        assert_eq!(
+            s["s3"]["existingConfigSecret"],
+            serde_json::json!("seaweedfs-s3-config")
+        );
+        assert_eq!(s["s3"]["enableAuth"], serde_json::json!(true));
+        assert_eq!(
+            s["s3"]["createBuckets"][0]["name"],
+            serde_json::json!("lakehouse")
         );
     }
 }

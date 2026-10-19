@@ -29,10 +29,11 @@ use serde_json::json;
 use crate::crd::Profile;
 use crate::crd::{
     ComponentStatus, ComponentValues, Condition, Lakehouse, LakehouseStatus, PlatformInstance,
-    PlatformInstanceStatus, Tenant, TenantStatus, ValuesSource,
+    PlatformInstanceStatus, StorageImpl, Tenant, TenantStatus, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
+use crate::provision::{ensure_bootstrap, ensure_catalog_database, ensure_s3_secrets};
 use crate::values::{effective_values, parse_values_document};
 
 pub struct Context {
@@ -555,7 +556,17 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         .as_ref()
         .map(|s| s.components.as_slice())
         .unwrap_or(&[]);
-    let outcome = apply_plan(
+    // Prerequisites first (decision D17): the S3 Secrets and the catalog database.
+    // Lakekeeper is installed only once its database is Ready, so `helm --wait`
+    // never blocks on a database that does not exist yet.
+    let s3 = ensure_s3_secrets(&ctx, &lh, &namespace).await;
+    let database = ensure_catalog_database(&ctx, &lh, &namespace).await;
+    let database_ready = database.ready;
+    let plan: Vec<ComponentPlan> = plan
+        .into_iter()
+        .filter(|c| c.name != "lakekeeper" || database_ready || lh.spec.dry_run)
+        .collect();
+    let mut outcome = apply_plan(
         &ctx,
         &namespace,
         &plan,
@@ -565,7 +576,39 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         previous,
     )
     .await;
+    if !lh.spec.dry_run && !database_ready {
+        outcome.components.push(ComponentStatus {
+            name: "lakekeeper".into(),
+            ready: false,
+            message: Some("waiting for the catalog database".into()),
+            applied_hash: None,
+        });
+    }
+    // The bootstrap Job needs the charts it talks to.
+    let ready = |name: &str| outcome.components.iter().any(|c| c.name == name && c.ready);
+    let charts_ready = ready("lakekeeper")
+        && (lh.spec.storage.implementation != StorageImpl::Seaweedfs || ready("seaweedfs"));
+    let bootstrap = if charts_ready || lh.spec.dry_run {
+        ensure_bootstrap(&ctx, &lh, &namespace, previous).await
+    } else {
+        ComponentStatus {
+            name: "lakekeeper-bootstrap".into(),
+            ready: false,
+            message: Some("waiting for Lakekeeper and SeaweedFS".into()),
+            applied_hash: None,
+        }
+    };
+    let mut components = vec![s3, database];
+    components.append(&mut outcome.components);
+    components.push(bootstrap);
+    outcome.components = components;
     let phase = phase(lh.spec.dry_run, &outcome);
+    // Check back quickly while the install is still converging.
+    let requeue = if outcome.components.iter().all(|c| c.ready) {
+        300
+    } else {
+        30
+    };
 
     let prev = lh
         .status
@@ -593,7 +636,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     )
     .await?;
     tracing::info!(lakehouse = %name, phase, dry_run = lh.spec.dry_run, "reconciled");
-    Ok(Action::requeue(Duration::from_secs(300)))
+    Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
 async fn reconcile_platform(
@@ -616,7 +659,7 @@ async fn reconcile_platform(
         .unwrap_or(&[]);
     let outcome = apply_plan(
         &ctx,
-        "stardelt",
+        &instance.spec.namespace,
         &plan,
         &overrides,
         instance.spec.dry_run,

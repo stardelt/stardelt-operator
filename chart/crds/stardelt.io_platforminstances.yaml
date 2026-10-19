@@ -24,6 +24,10 @@ spec:
                 default: true
                 description: Plan only (no cluster changes) until explicitly disabled. Safe default.
                 type: boolean
+              namespace:
+                default: stardelt
+                description: Namespace the platform's own components are installed into.
+                type: string
               pillars:
                 default:
                   batch: false
