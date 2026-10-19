@@ -20,10 +20,53 @@ spec:
           spec:
             description: 'Cluster-scoped root resource: declares which pillars and profile are installed.'
             properties:
+              baseDomain:
+                description: |-
+                  Public DNS name the platform is served under, for example `data.example.com`: Nova answers
+                  on the name itself and every other application on a subdomain (`id`, `trino`, `superset`...).
+                maxLength: 253
+                minLength: 3
+                nullable: true
+                pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$
+                type: string
               dryRun:
                 default: true
                 description: Plan only (no cluster changes) until explicitly disabled. Safe default.
                 type: boolean
+              identity:
+                default:
+                  adminGroup: stardelt-admins
+                  groupClaim: groups
+                  mode: none
+                description: How users sign in; see [`IdentitySpec`].
+                properties:
+                  adminGroup:
+                    default: stardelt-admins
+                    description: Members of this group are platform administrators.
+                    type: string
+                  groupClaim:
+                    default: groups
+                    description: Name of the token claim that carries group (or role) names.
+                    type: string
+                  issuerUrl:
+                    description: |-
+                      OIDC issuer URL, `https://` only. Required for `external`; for `platform` it is derived
+                      from `baseDomain` and must be left out.
+                    nullable: true
+                    type: string
+                  mode:
+                    default: none
+                    description: |-
+                      Where users sign in (decision D20). Two modes besides none: an identity provider the
+                      organization already runs (`external`, for example Entra or Okta), or one the platform runs
+                      itself (`platform`, Keycloak). An organization often runs the platform several times against
+                      one external provider; each instance then has its own app registrations and group mapping.
+                    enum:
+                    - none
+                    - platform
+                    - external
+                    type: string
+                type: object
               namespace:
                 default: stardelt
                 description: Namespace the platform's own components are installed into.
@@ -132,6 +175,13 @@ spec:
                 description: External values documents per component, read from a ConfigMap or Secret key.
                 type: object
             type: object
+            x-kubernetes-validations:
+            - message: identity.mode external needs identity.issuerUrl, an https:// URL
+              rule: '!has(self.identity) || !has(self.identity.mode) || self.identity.mode != ''external'' || (has(self.identity.issuerUrl) && self.identity.issuerUrl.startsWith(''https://''))'
+            - message: identity.mode platform derives the issuer from baseDomain; leave identity.issuerUrl out
+              rule: '!has(self.identity) || !has(self.identity.mode) || self.identity.mode != ''platform'' || !has(self.identity.issuerUrl)'
+            - message: identity needs baseDomain (the application hosts and redirect addresses are built from it)
+              rule: '!has(self.identity) || !has(self.identity.mode) || self.identity.mode == ''none'' || has(self.baseDomain)'
           status:
             nullable: true
             properties:

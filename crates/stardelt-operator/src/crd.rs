@@ -135,6 +135,59 @@ fn component_values_schema(_: &mut schemars::generate::SchemaGenerator) -> schem
     .expect("the schema literal above is valid JSON Schema")
 }
 
+/// Where users sign in (decision D20). Two modes besides none: an identity provider the
+/// organization already runs (`external`, for example Entra or Okta), or one the platform runs
+/// itself (`platform`, Keycloak). An organization often runs the platform several times against
+/// one external provider; each instance then has its own app registrations and group mapping.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityMode {
+    /// No sign-in: every component keeps its development default. Only for an unreachable stack.
+    #[default]
+    None,
+    /// The platform installs and configures Keycloak (realm `stardelt`) at `id.<baseDomain>`.
+    Platform,
+    /// An existing OIDC provider; `issuerUrl` is required.
+    External,
+}
+
+fn default_group_claim() -> String {
+    "groups".into()
+}
+
+fn default_admin_group() -> String {
+    "stardelt-admins".into()
+}
+
+/// Identity settings of a platform instance; the operator publishes them to the components as
+/// the ConfigMap `stardelt-identity` (see [`crate::identity::contract`]).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct IdentitySpec {
+    #[serde(default)]
+    pub mode: IdentityMode,
+    /// OIDC issuer URL, `https://` only. Required for `external`; for `platform` it is derived
+    /// from `baseDomain` and must be left out.
+    #[serde(default, rename = "issuerUrl", skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    /// Name of the token claim that carries group (or role) names.
+    #[serde(default = "default_group_claim", rename = "groupClaim")]
+    pub group_claim: String,
+    /// Members of this group are platform administrators.
+    #[serde(default = "default_admin_group", rename = "adminGroup")]
+    pub admin_group: String,
+}
+
+impl Default for IdentitySpec {
+    fn default() -> Self {
+        Self {
+            mode: IdentityMode::None,
+            issuer_url: None,
+            group_claim: default_group_claim(),
+            admin_group: default_admin_group(),
+        }
+    }
+}
+
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -145,6 +198,20 @@ fn component_values_schema(_: &mut schemars::generate::SchemaGenerator) -> schem
     shortname = "platform",
     doc = "A stardelt platform instance."
 )]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode != 'external' || (has(self.identity.issuerUrl) && self.identity.issuerUrl.startsWith('https://'))",
+        "message": "identity.mode external needs identity.issuerUrl, an https:// URL"
+    },
+    {
+        "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode != 'platform' || !has(self.identity.issuerUrl)",
+        "message": "identity.mode platform derives the issuer from baseDomain; leave identity.issuerUrl out"
+    },
+    {
+        "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode == 'none' || has(self.baseDomain)",
+        "message": "identity needs baseDomain (the application hosts and redirect addresses are built from it)"
+    }
+]))]
 pub struct PlatformInstanceSpec {
     #[serde(default = "default_profile")]
     pub profile: Profile,
@@ -160,6 +227,21 @@ pub struct PlatformInstanceSpec {
     /// Namespace the platform's own components are installed into.
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    /// Public DNS name the platform is served under, for example `data.example.com`: Nova answers
+    /// on the name itself and every other application on a subdomain (`id`, `trino`, `superset`...).
+    #[serde(
+        default,
+        rename = "baseDomain",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        length(min = 3, max = 253),
+        regex(pattern = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+    )]
+    pub base_domain: Option<String>,
+    /// How users sign in; see [`IdentitySpec`].
+    #[serde(default)]
+    pub identity: IdentitySpec,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
