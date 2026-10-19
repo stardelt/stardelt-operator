@@ -11,7 +11,7 @@ metadata:
   name: stardelt-operator
 rules:
   - apiGroups: ["stardelt.io"]
-    resources: ["platforminstances", "lakehouses", "ingestionsources", "pipelines"]
+    resources: ["platforminstances", "lakehouses", "ingestionsources", "pipelines", "connections"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["stardelt.io"]
     resources:
@@ -19,6 +19,7 @@ rules:
       - "lakehouses/status"
       - "ingestionsources/status"
       - "pipelines/status"
+      - "connections/status"
     verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["events"]

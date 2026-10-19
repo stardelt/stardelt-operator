@@ -19,7 +19,7 @@ watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
 | `Lakehouse` | namespaced | a managed catalog + storage (+ query) unit on object storage |
 | `IngestionSource` | namespaced | ingestion into Iceberg — one contract, three domains (`saas` / `enterprise` / `cdc`) |
 | `Pipeline` | namespaced | ordered `sql` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
-| `Connection` | namespaced | a typed connection to an outside system: settings in the resource, credentials in the secret store (types: `postgresql`, `mysql`, `sqlserver`, `oracle`, `rest-api`, `s3`, `kafka`, `sftp`, `generic`); the resource is validated, nothing reconciles it yet |
+| `Connection` | namespaced | a typed connection to an outside system: settings in the resource, credentials in the secret store (types: `postgresql`, `mysql`, `sqlserver`, `oracle`, `rest-api`, `s3`, `kafka`, `sftp`, `generic`); validated at admission and synced into the Secret `conn-<name>` through External Secrets |
 | `Volume` | namespaced | a governed folder of files in the object store with an owner group and grants (`read` / `write` / `manage`), on managed or external storage; the resource is validated, nothing reconciles it yet |
 
 `StreamApp` and the ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see
@@ -198,6 +198,14 @@ Each `type` requires settings and secret keys (a database: `config.host`, `user`
 and `token` or `clientId` and `clientSecret`; `s3`: `config.bucket`, `accessKeyId`, `secretAccessKey`; `sftp`:
 `config.host`, `user` and `password` or `privateKey`; `kafka`: `config.bootstrapServers`). The API server enforces the
 rules at admission; `ConnectionSpec::validate` repeats them for the controller.
+
+The controller (`connection.rs`) creates one External Secrets `ExternalSecret` `conn-<name>` per connection, owned by the
+`Connection`, that reads the fields in `secret.keys` from the store path derived from the scope through the
+`SecretStore` of the owner group (`openbao-<group>`) or of managed connections (`openbao-managed`), and keeps the Kubernetes
+Secret `conn-<name>` up to date. `kubectl get connection` status: `Ready` is `True` when the Secret is synced; the reason is
+`Synced`, `Syncing`, `InvalidSpec`, `RemoteRefNotAllowed` (a path of one's own is refused until an external store is
+configured), `GroupNameNotSupported` (the group name cannot name a store: lower-case letters, digits and dashes only) or
+`ExternalSecretsNotInstalled`. Deleting the `Connection` removes the sync and the Secret; the value in the store stays.
 
 A `Volume` is a governed folder of files beside the tables. `storage.managed: {}` puts it at
 `volumes/<catalog>/<name>/` in the platform object store; `storage.external` names an `s3` connection and a prefix in
