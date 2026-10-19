@@ -415,6 +415,32 @@ spec:
   audiences: [trino]           # trino (default) and/or lakekeeper
 ```
 
+## Catalog
+
+A `Catalog` is one data domain inside the catalog software of a `Lakehouse`: its storage location, one owner group and the
+grants of other groups. `metadata.name` is the name users type (`finance.orders`), the Trino catalog and the catalog's
+warehouse: lower-case letters and digits only, because it is an unquoted SQL identifier. Subjects are groups, never people;
+the verbs are `browse`, `select`, `write`, `create` and `manage` (no deny, no per-column grants); ownership means `manage`
+and does not mean `select`. Today the resource is validated and nothing reconciles it yet.
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: Catalog
+metadata:
+  name: finance
+  namespace: stardelt
+spec:
+  lakehouseRef: { name: default }
+  owner: stardelt-finops
+  storage:                      # optional: the Lakehouse's storage defaults apply when omitted
+    bucket: finance
+    credentialSecretRef: { name: finance-s3-creds, key: identity-entry }
+  grants:
+    - { group: stardelt-finops, verb: browse }
+    - { group: stardelt-analytics, verb: select }
+  managedAccess: false          # true: only platform administrators can grant on this catalog
+```
+
 ## Links
 
 - [stardelt.io/roadmap](https://stardelt.io/roadmap)
