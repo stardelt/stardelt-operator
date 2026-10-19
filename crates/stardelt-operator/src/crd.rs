@@ -1332,6 +1332,210 @@ pub struct ServicePrincipalStatus {
     pub observed_generation: Option<i64>,
 }
 
+/// What a grant lets a group do with a catalog (decision D21, internal note
+/// `design/multitenant-catalogs.md` §5.2). Six verbs exist; `use` belongs to compute (`SqlWarehouse`)
+/// and is not a data verb. There is no deny, no `ALL PRIVILEGES` and no per-column verb.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DataVerb {
+    /// Metadata and existence only; no rows.
+    Browse,
+    /// Read data.
+    Select,
+    /// Insert, update, delete, merge, alter.
+    Write,
+    /// Create schemas and tables inside the catalog.
+    Create,
+    /// Grant, revoke, transfer ownership, drop and rename the catalog.
+    Manage,
+}
+
+/// One group, one verb. Subjects are groups, never people.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct CatalogGrant {
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub group: String,
+    pub verb: DataVerb,
+}
+
+/// The `Lakehouse` that hosts a catalog or a warehouse.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct LakehouseRef {
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    )]
+    pub name: String,
+}
+
+/// A reference to one key of a Secret in the same namespace.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct SecretKeySelector {
+    #[schemars(
+        length(min = 1, max = 253),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+    )]
+    pub name: String,
+    #[schemars(length(min = 1, max = 253), regex(pattern = r"^[-._a-zA-Z0-9]+$"))]
+    pub key: String,
+}
+
+/// Where a catalog's data files live. Omitted: the `Lakehouse`'s storage defaults.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
+pub struct CatalogStorage {
+    /// An isolated bucket per catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 3, max = 63),
+        regex(pattern = r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+    )]
+    pub bucket: Option<String>,
+    /// Required where all catalogs share one bucket (the demo profile); no leading slash, no `..`.
+    #[serde(default, rename = "keyPrefix", skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 512), regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_./-]*$"))]
+    pub key_prefix: Option<String>,
+    /// The per-catalog storage identity. A reference only: the Secret is never part of this resource.
+    #[serde(
+        default,
+        rename = "credentialSecretRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential_secret_ref: Option<SecretKeySelector>,
+}
+
+/// One data domain inside the catalog software of a `Lakehouse`: its storage, its owner and its
+/// grants. `metadata.name` is the name users type (`finance.orders`) and the name of the
+/// catalog's warehouse; there is no alias.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "Catalog",
+    namespaced,
+    status = "CatalogDomainStatus",
+    shortname = "cat",
+    doc = "A data domain: a catalog with its storage location, an owner group and grants."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.grants.all(g, self.grants.exists_one(h, h.group == g.group && h.verb == g.verb))",
+        "message": "each group may hold each verb once"
+    },
+    {
+        "rule": "!has(self.storage) || !has(self.storage.keyPrefix) || (!self.storage.keyPrefix.contains('..') && !self.storage.keyPrefix.contains('//'))",
+        "message": "storage.keyPrefix must not contain .. or //"
+    }
+]))]
+pub struct CatalogDomainSpec {
+    #[serde(rename = "lakehouseRef")]
+    pub lakehouse_ref: LakehouseRef,
+    #[serde(
+        default,
+        rename = "displayName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(max = 100))]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 500))]
+    pub description: Option<String>,
+    /// Exactly one group. Ownership means `manage` and does not mean `select`.
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<CatalogStorage>,
+    #[serde(default)]
+    #[schemars(length(max = 50))]
+    pub grants: Vec<CatalogGrant>,
+    /// True: the owner cannot grant on this catalog; only platform administrators can.
+    #[serde(default, rename = "managedAccess")]
+    pub managed_access: bool,
+}
+
+/// Trino catalog names that are taken by the engine or by the platform.
+const RESERVED_CATALOG_NAMES: [&str; 6] = [
+    "system",
+    "information_schema",
+    "memory",
+    "tpch",
+    "tpcds",
+    "jmx",
+];
+
+impl CatalogDomainSpec {
+    /// The rules the schema enforces, repeated for the controller and the tests, plus the name:
+    /// it becomes a Trino catalog and a Lakekeeper warehouse, so it is an unquoted SQL identifier
+    /// (lower-case letters and digits, starting with a letter, 1 to 40) and not a reserved name.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+        if !name_ok {
+            return Err(format!(
+                "catalog name `{name}` must be 1 to 40 lower-case letters and digits, starting with a letter (it is a SQL identifier)"
+            ));
+        }
+        if RESERVED_CATALOG_NAMES.contains(&name) {
+            return Err(format!("catalog name `{name}` is reserved"));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for grant in &self.grants {
+            if !seen.insert((grant.group.as_str(), grant.verb)) {
+                return Err(format!(
+                    "group `{}` holds `{:?}` twice",
+                    grant.group, grant.verb
+                ));
+            }
+        }
+        if let Some(prefix) = self.storage.as_ref().and_then(|s| s.key_prefix.as_deref())
+            && (prefix.contains("..") || prefix.contains("//"))
+        {
+            return Err("storage.keyPrefix must not contain .. or //".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct CatalogDomainStatus {
+    #[serde(default)]
+    pub phase: String,
+    /// The Lakekeeper warehouse id, so Nova and the access bridge never guess it by name.
+    #[serde(
+        default,
+        rename = "warehouseId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub warehouse_id: Option<String>,
+    /// The Trino catalog name actually rendered.
+    #[serde(
+        default,
+        rename = "catalogName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub catalog_name: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct ComponentStatus {
     pub name: String,
@@ -2305,6 +2509,143 @@ mod tests {
         assert!(yaml.contains("each audience may appear once"));
         assert!(
             !yaml.contains("clientSecret") && !yaml.contains("password"),
+            "no field holds a credential"
+        );
+    }
+
+    fn catalog(spec: serde_json::Value) -> Catalog {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Catalog",
+            "metadata": { "name": "finance", "namespace": "stardelt" },
+            "spec": spec
+        }))
+        .expect("deserialize Catalog")
+    }
+
+    fn finance(patch: serde_json::Value) -> serde_json::Value {
+        let mut spec = serde_json::json!({
+            "lakehouseRef": { "name": "default" },
+            "owner": "stardelt-finops",
+            "grants": [
+                { "group": "stardelt-finops", "verb": "browse" },
+                { "group": "stardelt-analytics", "verb": "browse" },
+                { "group": "stardelt-analytics", "verb": "select" }
+            ]
+        });
+        for (k, v) in patch.as_object().unwrap() {
+            if v.is_null() {
+                spec.as_object_mut().unwrap().remove(k);
+            } else {
+                spec[k] = v.clone();
+            }
+        }
+        spec
+    }
+
+    #[test]
+    fn a_catalog_parses_with_its_owner_grants_and_defaults() {
+        let c = catalog(finance(serde_json::json!({})));
+        assert_eq!(c.spec.owner, "stardelt-finops");
+        assert_eq!(c.spec.grants.len(), 3);
+        assert_eq!(c.spec.grants[2].verb, DataVerb::Select);
+        assert!(
+            !c.spec.managed_access,
+            "managed access is off unless asked for"
+        );
+        assert!(c.spec.storage.is_none());
+        assert!(c.spec.validate("finance").is_ok());
+    }
+
+    #[test]
+    fn a_catalog_may_name_its_own_bucket_prefix_and_credential() {
+        let c = catalog(finance(serde_json::json!({
+            "storage": { "bucket": "finance", "keyPrefix": "warehouse/finance",
+                         "credentialSecretRef": { "name": "finance-s3-creds", "key": "identity-entry" } },
+            "managedAccess": true
+        })));
+        let storage = c.spec.storage.as_ref().unwrap();
+        assert_eq!(storage.bucket.as_deref(), Some("finance"));
+        assert_eq!(
+            storage.credential_secret_ref.as_ref().unwrap().key,
+            "identity-entry"
+        );
+        assert!(c.spec.managed_access);
+        assert!(c.spec.validate("finance").is_ok());
+    }
+
+    #[test]
+    fn names_that_are_not_sql_identifiers_or_are_reserved_are_refused() {
+        let spec = catalog(finance(serde_json::json!({}))).spec;
+        for name in [
+            "",
+            "Finance",
+            "1fin",
+            "fin-ance",
+            "fin_ance",
+            "fin.ance",
+            &"a".repeat(41),
+        ] {
+            assert!(
+                spec.validate(name).unwrap_err().contains("SQL identifier"),
+                "{name}"
+            );
+        }
+        for name in ["system", "information_schema", "memory", "tpch"] {
+            assert!(spec.validate(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_grant_and_a_climbing_prefix_are_refused() {
+        let twice = catalog(finance(serde_json::json!({
+            "grants": [ { "group": "g", "verb": "select" }, { "group": "g", "verb": "select" } ]
+        })));
+        assert!(
+            twice
+                .spec
+                .validate("finance")
+                .unwrap_err()
+                .contains("twice")
+        );
+        // the same group may hold different verbs
+        let two_verbs = catalog(finance(serde_json::json!({
+            "grants": [ { "group": "g", "verb": "browse" }, { "group": "g", "verb": "select" } ]
+        })));
+        assert!(two_verbs.spec.validate("finance").is_ok());
+        let climbing = catalog(finance(
+            serde_json::json!({ "storage": { "keyPrefix": "a/../b" } }),
+        ));
+        assert!(
+            climbing
+                .spec
+                .validate("finance")
+                .unwrap_err()
+                .contains("keyPrefix")
+        );
+    }
+
+    #[test]
+    fn there_is_no_use_verb_no_deny_and_no_credential_value_in_the_catalog_crd() {
+        assert!(
+            serde_json::from_value::<CatalogGrant>(
+                serde_json::json!({ "group": "g", "verb": "use" })
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CatalogGrant>(
+                serde_json::json!({ "group": "g", "verb": "deny" })
+            )
+            .is_err()
+        );
+        let crd = Catalog::crd();
+        assert_eq!(crd.spec.names.plural, "catalogs");
+        let yaml = serde_yaml::to_string(&crd).unwrap();
+        assert!(yaml.contains("each group may hold each verb once"));
+        assert!(yaml.contains("credentialSecretRef"));
+        assert!(
+            !yaml.contains("secretKey:") && !yaml.contains("password"),
             "no field holds a credential"
         );
     }

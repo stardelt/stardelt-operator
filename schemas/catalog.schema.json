@@ -1,0 +1,206 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A data domain: a catalog with its storage location, an owner group and grants.",
+  "properties": {
+    "spec": {
+      "description": "One data domain inside the catalog software of a `Lakehouse`: its storage, its owner and its\ngrants. `metadata.name` is the name users type (`finance.orders`) and the name of the\ncatalog's warehouse; there is no alias.",
+      "properties": {
+        "description": {
+          "maxLength": 500,
+          "nullable": true,
+          "type": "string"
+        },
+        "displayName": {
+          "maxLength": 100,
+          "nullable": true,
+          "type": "string"
+        },
+        "grants": {
+          "default": [],
+          "items": {
+            "description": "One group, one verb. Subjects are groups, never people.",
+            "properties": {
+              "group": {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                "type": "string"
+              },
+              "verb": {
+                "description": "What a grant lets a group do with a catalog (decision D21, internal note\n`design/multitenant-catalogs.md` §5.2). Six verbs exist; `use` belongs to compute (`SqlWarehouse`)\nand is not a data verb. There is no deny, no `ALL PRIVILEGES` and no per-column verb.",
+                "enum": [
+                  "browse",
+                  "select",
+                  "write",
+                  "create",
+                  "manage"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "group",
+              "verb"
+            ],
+            "type": "object"
+          },
+          "maxItems": 50,
+          "type": "array"
+        },
+        "lakehouseRef": {
+          "description": "The `Lakehouse` that hosts a catalog or a warehouse.",
+          "properties": {
+            "name": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "managedAccess": {
+          "default": false,
+          "description": "True: the owner cannot grant on this catalog; only platform administrators can.",
+          "type": "boolean"
+        },
+        "owner": {
+          "description": "Exactly one group. Ownership means `manage` and does not mean `select`.",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "storage": {
+          "description": "Where a catalog's data files live. Omitted: the `Lakehouse`'s storage defaults.",
+          "nullable": true,
+          "properties": {
+            "bucket": {
+              "description": "An isolated bucket per catalog.",
+              "maxLength": 63,
+              "minLength": 3,
+              "nullable": true,
+              "pattern": "^[a-z0-9][a-z0-9.-]*[a-z0-9]$",
+              "type": "string"
+            },
+            "credentialSecretRef": {
+              "description": "The per-catalog storage identity. A reference only: the Secret is never part of this resource.",
+              "nullable": true,
+              "properties": {
+                "key": {
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "pattern": "^[-._a-zA-Z0-9]+$",
+                  "type": "string"
+                },
+                "name": {
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "name"
+              ],
+              "type": "object"
+            },
+            "keyPrefix": {
+              "description": "Required where all catalogs share one bucket (the demo profile); no leading slash, no `..`.",
+              "maxLength": 512,
+              "nullable": true,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "lakehouseRef",
+        "owner"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "each group may hold each verb once",
+          "rule": "self.grants.all(g, self.grants.exists_one(h, h.group == g.group && h.verb == g.verb))"
+        },
+        {
+          "message": "storage.keyPrefix must not contain .. or //",
+          "rule": "!has(self.storage) || !has(self.storage.keyPrefix) || (!self.storage.keyPrefix.contains('..') && !self.storage.keyPrefix.contains('//'))"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "catalogName": {
+          "description": "The Trino catalog name actually rendered.",
+          "nullable": true,
+          "type": "string"
+        },
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "type": "string"
+        },
+        "warehouseId": {
+          "description": "The Lakekeeper warehouse id, so Nova and the access bridge never guess it by name.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "Catalog",
+  "type": "object"
+}
