@@ -3,7 +3,7 @@
 Kubernetes operator for stardelt — the control-plane pillar (master spec §5–§6). It
 watches the stardelt CRDs and reconciles them into upstream Helm releases (Lakekeeper,
 SeaweedFS, Trino, …). **Pre-alpha:** the CRD types, planner and controller are in place and
-unit-tested; `Tenant`, `PlatformInstance` and `Lakehouse` have been reconciled successfully
+unit-tested; `PlatformInstance` and `Lakehouse` have been reconciled successfully
 against the dev cluster. New resources default to `spec.dryRun: true`, so they plan first.
 
 ## Read first

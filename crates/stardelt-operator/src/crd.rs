@@ -178,38 +178,6 @@ pub struct PlatformInstanceStatus {
     pub components: Vec<ComponentStatus>,
 }
 
-/// Namespaced isolation boundary: a tenant's data and identities.
-#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
-#[kube(
-    group = "stardelt.io",
-    version = "v1alpha1",
-    kind = "Tenant",
-    namespaced,
-    status = "TenantStatus",
-    shortname = "tenant",
-    doc = "A tenant: an isolation boundary for data and identities."
-)]
-pub struct TenantSpec {
-    #[serde(default, rename = "displayName")]
-    pub display_name: Option<String>,
-    #[serde(default = "default_profile")]
-    pub profile: Profile,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
-pub struct TenantStatus {
-    #[serde(default)]
-    pub phase: String,
-    #[serde(default)]
-    pub conditions: Vec<Condition>,
-    #[serde(
-        default,
-        rename = "observedGeneration",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub observed_generation: Option<i64>,
-}
-
 /// Catalog implementation (the plug behind the Iceberg REST contract).
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]

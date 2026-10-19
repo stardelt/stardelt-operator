@@ -16,7 +16,6 @@ watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
 | CRD | Scope | Purpose |
 |---|---|---|
 | `PlatformInstance` | cluster | which pillars + profile are installed |
-| `Tenant` | namespaced | isolation boundary for data and identities |
 | `Lakehouse` | namespaced | a managed catalog + storage (+ query) unit on object storage |
 | `IngestionSource` | namespaced | ingestion into Iceberg — one contract, three domains (`saas` / `enterprise` / `cdc`) |
 | `Pipeline` | namespaced | ordered `sql` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
@@ -149,7 +148,7 @@ spec:
 ## Editor support
 
 `cargo run --bin crdgen` also writes JSON Schemas for every CRD into `schemas/`
-(`platforminstance.schema.json`, `tenant.schema.json`, `lakehouse.schema.json`,
+(`platforminstance.schema.json`, `lakehouse.schema.json`,
 `ingestionsource.schema.json`, `pipeline.schema.json`). Add
 
 ```yaml
@@ -172,8 +171,8 @@ it watches CRDs and applies upstream Helm releases via the `helm` binary in its 
 - `src/values.rs` — pure functions: the golden per-component values, parsing of external
   documents, and the merge order.
 - `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
-- `src/controller.rs` — reconciles `Tenant` → Namespace, `PlatformInstance` → its cluster-scoped
-  plan and `Lakehouse` → its component plan.
+- `src/controller.rs` — reconciles `PlatformInstance` → its cluster-scoped plan and `Lakehouse`
+  → its component plan.
 - `src/bin/crdgen.rs` — emits `chart/crds/` from the types.
 
 ### Component values
@@ -253,7 +252,7 @@ Set `dryRun: false` to actually apply. `.status.phase` is `Planned` while dry-ru
 once every component applied, `Progressing` while one still needs to converge, and `Degraded`
 when a values source cannot be resolved — an admin error that will not heal by itself.
 
-`Tenant`, `Lakehouse` and `PlatformInstance` also write a `Ready` condition and
+`Lakehouse` and `PlatformInstance` also write a `Ready` condition and
 `.status.observedGeneration` (the generation the status was computed from), so
 `kubectl wait --for=condition=Ready` and GitOps health checks work. `lastTransitionTime`
 changes only when `Ready` flips.
@@ -271,7 +270,7 @@ spec:
 ### RBAC
 
 An installer operator is privileged by nature: the chart grants cluster-wide apply rights so
-Helm can create whatever the upstream charts contain. Tenants additionally create Namespaces.
+Helm can create whatever the upstream charts contain.
 
 ### Component scope — a known correction
 

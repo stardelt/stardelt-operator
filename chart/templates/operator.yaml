@@ -11,12 +11,11 @@ metadata:
   name: stardelt-operator
 rules:
   - apiGroups: ["stardelt.io"]
-    resources: ["platforminstances", "tenants", "lakehouses", "ingestionsources", "pipelines"]
+    resources: ["platforminstances", "lakehouses", "ingestionsources", "pipelines"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["stardelt.io"]
     resources:
       - "platforminstances/status"
-      - "tenants/status"
       - "lakehouses/status"
       - "ingestionsources/status"
       - "pipelines/status"
@@ -24,7 +23,7 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]
-  # Tenants own their Namespace.
+  # Helm creates the target namespace (--create-namespace).
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch", "create"]
