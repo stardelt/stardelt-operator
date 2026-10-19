@@ -1,7 +1,6 @@
 //! Controller runtime.
 //!
 //! Watches the stardelt CRDs and reconciles them into real resources:
-//! - `Tenant` → a Namespace (the isolation boundary)
 //! - `PlatformInstance` → platform-level prerequisites (CNPG operator), once
 //! - `Lakehouse` → its namespace-scoped plan (storage + catalog)
 //!
@@ -12,16 +11,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use k8s_openapi::{
-    api::{
-        apps::v1::{Deployment, StatefulSet},
-        core::v1::{ConfigMap, Namespace, Secret},
-    },
-    apimachinery::pkg::apis::meta::v1::ObjectMeta,
+use k8s_openapi::api::{
+    apps::v1::{Deployment, StatefulSet},
+    core::v1::{ConfigMap, Secret},
 };
 use kube::{
     Api, Client, ResourceExt,
-    api::{ListParams, Patch, PatchParams, PostParams},
+    api::{ListParams, Patch, PatchParams},
     runtime::{Controller, controller::Action, watcher},
 };
 use serde_json::json;
@@ -29,7 +25,7 @@ use serde_json::json;
 use crate::crd::Profile;
 use crate::crd::{
     ComponentStatus, ComponentValues, Condition, Lakehouse, LakehouseStatus, PlatformInstance,
-    PlatformInstanceStatus, StorageImpl, Tenant, TenantStatus, ValuesSource,
+    PlatformInstanceStatus, StorageImpl, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
@@ -55,23 +51,17 @@ pub async fn run() -> anyhow::Result<()> {
         watcher::Config::default(),
     )
     .run(reconcile_lakehouse, error_policy, ctx.clone());
-    let tenants = Controller::new(
-        Api::<Tenant>::all(client.clone()),
-        watcher::Config::default(),
-    )
-    .run(reconcile_tenant, error_policy, ctx.clone());
     let platforms = Controller::new(
         Api::<PlatformInstance>::all(client.clone()),
         watcher::Config::default(),
     )
     .run(reconcile_platform, error_policy, ctx.clone());
 
-    tracing::info!("stardelt-operator watching PlatformInstance, Tenant and Lakehouse");
-    futures::pin_mut!(lakehouses, tenants, platforms);
+    tracing::info!("stardelt-operator watching PlatformInstance and Lakehouse");
+    futures::pin_mut!(lakehouses, platforms);
     loop {
         tokio::select! {
             _ = lakehouses.next() => {}
-            _ = tenants.next() => {}
             _ = platforms.next() => {}
         }
     }
@@ -101,58 +91,6 @@ fn ready_condition(
 
 fn now_rfc3339() -> String {
     k8s_openapi::jiff::Timestamp::now().to_string()
-}
-
-/// A Tenant owns its Namespace.
-async fn reconcile_tenant(tenant: Arc<Tenant>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
-    let name = tenant.name_any();
-    let namespaces: Api<Namespace> = Api::all(ctx.client.clone());
-
-    if namespaces.get_opt(&name).await?.is_none() {
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert("stardelt.io/tenant".to_string(), name.clone());
-        let namespace = Namespace {
-            metadata: ObjectMeta {
-                name: Some(name.clone()),
-                labels: Some(labels),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        match namespaces.create(&PostParams::default(), &namespace).await {
-            Ok(_) => tracing::info!(tenant = %name, "namespace created"),
-            Err(kube::Error::Api(e)) if e.code == 409 => {}
-            Err(e) => return Err(e),
-        }
-    }
-
-    // Status must be patched through the namespaced API: `Api::all` has no
-    // status endpoint for a namespaced resource (it 404s).
-    let api: Api<Tenant> = Api::namespaced(
-        ctx.client.clone(),
-        tenant.namespace().as_deref().unwrap_or("default"),
-    );
-    let prev = tenant
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
-    let status = TenantStatus {
-        phase: "Ready".into(),
-        conditions: vec![ready_condition(
-            "Ready",
-            tenant.metadata.generation,
-            prev,
-            &now_rfc3339(),
-        )],
-        observed_generation: tenant.metadata.generation,
-    };
-    api.patch_status(
-        &name,
-        &PatchParams::default(),
-        &Patch::Merge(json!({ "status": status })),
-    )
-    .await?;
-    Ok(Action::requeue(Duration::from_secs(300)))
 }
 
 /// Per-component value overrides for one resource, plus the namespace that
@@ -1116,14 +1054,7 @@ mod tests {
                         path: path.clone(),
                         body: String::from_utf8_lossy(&body).to_string(),
                     });
-                let document = if method == "PATCH" && path.contains("tenants") {
-                    json!({
-                        "apiVersion": "stardelt.io/v1alpha1",
-                        "kind": "Tenant",
-                        "metadata": { "name": "acme", "namespace": "stardelt" },
-                        "spec": {}
-                    })
-                } else if method == "PATCH" && path.contains("lakehouses") {
+                let document = if method == "PATCH" && path.contains("lakehouses") {
                     json!({
                         "apiVersion": "stardelt.io/v1alpha1",
                         "kind": "Lakehouse",
@@ -1175,52 +1106,6 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&patch.body).expect("patch body is JSON");
         body["status"].clone()
-    }
-
-    #[tokio::test]
-    async fn tenant_status_carries_ready_and_observed_generation() {
-        let (client, requests) = status_mock_client();
-        let ctx = Arc::new(Context {
-            client,
-            helm: helm_stub(),
-        });
-        let tenant: Tenant = serde_json::from_value(json!({
-            "apiVersion": "stardelt.io/v1alpha1",
-            "kind": "Tenant",
-            "metadata": { "name": "acme", "namespace": "stardelt", "generation": 7 },
-            "spec": {},
-            "status": {
-                "phase": "Ready",
-                "observedGeneration": 6,
-                "conditions": [{
-                    "type": "Ready",
-                    "status": "True",
-                    "reason": "Ready",
-                    "lastTransitionTime": "old"
-                }]
-            }
-        }))
-        .expect("deserialize Tenant");
-
-        reconcile_tenant(Arc::new(tenant), ctx)
-            .await
-            .expect("reconcile Tenant");
-
-        let status = patched_status(&requests, "tenants");
-        assert_eq!(status["observedGeneration"], json!(7));
-        let ready = &status["conditions"][0];
-        assert_eq!(ready["type"], json!("Ready"));
-        assert_eq!(ready["status"], json!("True"));
-        assert_eq!(
-            ready["observedGeneration"],
-            json!(7),
-            "the condition must not report the generation it did not observe"
-        );
-        assert_eq!(
-            ready["lastTransitionTime"],
-            json!("old"),
-            "an unchanged Ready keeps its transition time"
-        );
     }
 
     #[tokio::test]
