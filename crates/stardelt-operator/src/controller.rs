@@ -30,7 +30,7 @@ use crate::crd::{
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::provision::{
-    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_s3_secrets,
+    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity, ensure_s3_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -600,7 +600,7 @@ async fn reconcile_platform(
         .as_ref()
         .map(|s| s.components.as_slice())
         .unwrap_or(&[]);
-    let outcome = apply_plan(
+    let mut outcome = apply_plan(
         &ctx,
         &instance.spec.namespace,
         &plan,
@@ -610,6 +610,10 @@ async fn reconcile_platform(
         previous,
     )
     .await;
+    // The identity contract is published after the components it points the others to.
+    if let Some(identity) = ensure_identity(&ctx, &instance.spec).await {
+        outcome.components.push(identity);
+    }
     let phase = phase(instance.spec.dry_run, &outcome);
 
     let prev = instance
