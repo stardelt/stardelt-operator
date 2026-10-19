@@ -16,8 +16,6 @@ jobs:
     name: lakehouse on kind
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    env:
-      E2E_DIAG_DIR: ${{ runner.temp }}/stardelt-e2e
     steps:
       - uses: actions/checkout@v7
 
@@ -36,5 +34,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: e2e-diagnostics
-          path: ${{ runner.temp }}/stardelt-e2e/
+          path: /tmp/stardelt-e2e/
           if-no-files-found: ignore
