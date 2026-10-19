@@ -157,6 +157,9 @@ pub struct PlatformInstanceSpec {
     /// (today: `cnpg`).
     #[serde(flatten)]
     pub component_values: ComponentValues,
+    /// Namespace the platform's own components are installed into.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -290,6 +293,10 @@ pub struct LakehouseSpec {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_namespace() -> String {
+    "stardelt".into()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -543,6 +550,30 @@ mod tests {
         assert!(pi.spec.pillars.lakehouse);
         assert!(!pi.spec.pillars.batch);
         assert!(pi.spec.dry_run, "a new PlatformInstance must plan only");
+    }
+
+    #[test]
+    fn platform_instance_namespace_defaults_to_stardelt() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {}
+        }))
+        .expect("deserialize PlatformInstance");
+        assert_eq!(pi.spec.namespace, "stardelt");
+    }
+
+    #[test]
+    fn platform_instance_namespace_is_configurable() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": { "namespace": "lab" }
+        }))
+        .expect("deserialize PlatformInstance");
+        assert_eq!(pi.spec.namespace, "lab");
     }
 
     #[test]
