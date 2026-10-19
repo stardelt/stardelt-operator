@@ -19,6 +19,7 @@ watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
 | `Lakehouse` | namespaced | a managed catalog + storage (+ query) unit on object storage |
 | `IngestionSource` | namespaced | ingestion into Iceberg — one contract, three domains (`saas` / `enterprise` / `cdc`) |
 | `Pipeline` | namespaced | ordered `sql` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
+| `Connection` | namespaced | a typed connection to an outside system: settings in the resource, credentials in the secret store (types: `postgresql`, `mysql`, `sqlserver`, `oracle`, `rest-api`, `s3`, `kafka`, `sftp`, `generic`); the resource is validated, nothing reconciles it yet |
 
 `StreamApp` and the ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see
 the master spec §5).
@@ -169,11 +170,39 @@ spec:
       config: { gate: "warn" }
 ```
 
+A `Connection` never holds a secret value. `scope: group` is managed and used by the members of `ownerGroup`;
+`scope: managed` is written by administrators, readable by nobody, and used only by platform-run code for the
+groups in `usableBy`:
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: Connection
+metadata:
+  name: crm-db
+  namespace: stardelt
+spec:
+  scope: group             # group (default) | managed
+  ownerGroup: analytics    # scope group; for scope managed use usableBy: [analytics, finance]
+  type: sqlserver          # postgresql | mysql | sqlserver | oracle | rest-api | s3 | kafka | sftp | generic
+  config:                  # settings only; a name like password or token is refused
+    host: crm.example.com
+    port: "1433"
+    database: sales
+  secret:
+    keys: [user, password] # the secret fields; the store path is derived from the scope
+  refreshInterval: 15m     # 1m to 24h
+```
+
+Each `type` requires settings and secret keys (a database: `config.host`, `user`, `password`; `rest-api`: `config.baseUrl`
+and `token` or `clientId` and `clientSecret`; `s3`: `config.bucket`, `accessKeyId`, `secretAccessKey`; `sftp`:
+`config.host`, `user` and `password` or `privateKey`; `kafka`: `config.bootstrapServers`). The API server enforces the
+rules at admission; `ConnectionSpec::validate` repeats them for the controller.
+
 ## Editor support
 
 `cargo run --bin crdgen` also writes JSON Schemas for every CRD into `schemas/`
 (`platforminstance.schema.json`, `lakehouse.schema.json`,
-`ingestionsource.schema.json`, `pipeline.schema.json`). Add
+`ingestionsource.schema.json`, `pipeline.schema.json`, `connection.schema.json`). Add
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/stardelt/stardelt-operator/main/schemas/pipeline.schema.json

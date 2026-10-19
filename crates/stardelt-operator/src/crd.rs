@@ -659,6 +659,326 @@ pub struct PipelineStatus {
     pub runs: Vec<PipelineRun>,
 }
 
+/// Whose credential a connection holds and who may use it (decision D27,
+/// internal note `design/secrets-and-connections.md` §8). Personal connections have no
+/// resource: they live only in the secret store and never reach a pipeline.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConnectionScope {
+    /// Managed and used by the members of `ownerGroup`; they may reveal the value in their own code.
+    #[default]
+    Group,
+    /// Written by administrators and readable by nobody. Only code the platform runs (a
+    /// connection test, a federated catalog, an ingestion template) uses it, for the groups
+    /// in `usableBy`.
+    Managed,
+}
+
+/// What a connection reaches. The type decides which settings and secret keys are required.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConnectionType {
+    Postgresql,
+    Mysql,
+    Sqlserver,
+    Oracle,
+    RestApi,
+    S3,
+    Kafka,
+    Sftp,
+    Generic,
+}
+
+/// Where the secret part of a connection lives.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ConnectionSecret {
+    /// Path in the secret store. Absent: derived from the scope, `connections/group/<ownerGroup>/<name>`
+    /// or `connections/managed/<name>`. Set it only when the platform reads the customer's own store
+    /// (`spec.secrets` mode `external`); in platform mode the controller refuses a value, because
+    /// a path chosen by the author could point at another group's secret.
+    #[serde(default, rename = "remoteRef", skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 512),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_./-]*$")
+    )]
+    pub remote_ref: Option<String>,
+    /// Names of the secret fields, for example `user` and `password`. They become the keys of the
+    /// synced Kubernetes Secret and the environment variables `CONN_<NAME>_<KEY>`.
+    #[schemars(length(min = 1, max = 16), inner(length(min = 1, max = 63)))]
+    pub keys: Vec<String>,
+}
+
+/// A typed connection to a system outside the platform: non-secret settings here, the secret
+/// fields in the secret store (decision D23). No value of a secret is ever part of this resource.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "Connection",
+    namespaced,
+    status = "ConnectionStatus",
+    shortname = "conn",
+    doc = "A typed connection to an outside system: settings here, the credentials in the secret store."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.scope != 'group' || (has(self.ownerGroup) && !has(self.usableBy))",
+        "message": "a group connection needs ownerGroup and no usableBy"
+    },
+    {
+        "rule": "self.scope != 'managed' || (has(self.usableBy) && !has(self.ownerGroup))",
+        "message": "a managed connection needs usableBy and no ownerGroup"
+    },
+    {
+        "rule": "!has(self.usableBy) || self.usableBy.all(g, g.matches('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'))",
+        "message": "usableBy must list group names (letters, digits, dot, underscore, dash)"
+    },
+    {
+        "rule": "!has(self.secret.remoteRef) || (!self.secret.remoteRef.contains('..') && !self.secret.remoteRef.contains('//'))",
+        "message": "secret.remoteRef must not contain .. or //"
+    },
+    {
+        "rule": "self.secret.keys.all(k, k.matches('^[A-Za-z][A-Za-z0-9_]{0,62}$') && self.secret.keys.exists_one(j, j == k))",
+        "message": "secret.keys must be unique names of letters, digits and underscore"
+    },
+    {
+        "rule": "!has(self.config) || self.config.all(k, k.matches('^[A-Za-z][A-Za-z0-9_.-]{0,62}$') && !k.lowerAscii().matches('(password|passwd|passphrase|secret|token|credential)'))",
+        "message": "config holds settings, not secrets: a name like password, secret or token belongs in secret.keys"
+    },
+    {
+        "rule": "!(self.type in ['postgresql', 'mysql', 'sqlserver', 'oracle']) || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && 'password' in self.secret.keys)",
+        "message": "a database connection needs config.host and the secret keys user and password"
+    },
+    {
+        "rule": "self.type != 'rest-api' || (has(self.config) && 'baseUrl' in self.config && ('token' in self.secret.keys || ('clientId' in self.secret.keys && 'clientSecret' in self.secret.keys)))",
+        "message": "a rest-api connection needs config.baseUrl and the secret key token, or clientId and clientSecret"
+    },
+    {
+        "rule": "self.type != 's3' || (has(self.config) && 'bucket' in self.config && 'accessKeyId' in self.secret.keys && 'secretAccessKey' in self.secret.keys)",
+        "message": "an s3 connection needs config.bucket and the secret keys accessKeyId and secretAccessKey"
+    },
+    {
+        "rule": "self.type != 'sftp' || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && ('password' in self.secret.keys || 'privateKey' in self.secret.keys))",
+        "message": "an sftp connection needs config.host and the secret keys user and password or privateKey"
+    },
+    {
+        "rule": "self.type != 'kafka' || (has(self.config) && 'bootstrapServers' in self.config)",
+        "message": "a kafka connection needs config.bootstrapServers"
+    }
+]))]
+pub struct ConnectionSpec {
+    #[serde(default)]
+    pub scope: ConnectionScope,
+    /// Scope `group`: the Keycloak group whose members manage and use the connection.
+    #[serde(
+        default,
+        rename = "ownerGroup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub owner_group: Option<String>,
+    /// Scope `managed`: the groups whose platform-run work may use the connection.
+    #[serde(default, rename = "usableBy", skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 20), inner(length(min = 1, max = 64)))]
+    pub usable_by: Vec<String>,
+    #[serde(rename = "type")]
+    pub type_: ConnectionType,
+    /// Non-secret settings, for example `host`, `port`, `database`, `bucket`, `baseUrl`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(extend("maxProperties" = 32))]
+    pub config: BTreeMap<String, String>,
+    pub secret: ConnectionSecret,
+    /// How often the synced Secret is refreshed from the store, for example `15m`. Between one minute and 24 hours.
+    #[serde(default = "default_refresh_interval", rename = "refreshInterval")]
+    #[schemars(regex(pattern = r"^[0-9]{1,4}(m|h)$"))]
+    pub refresh_interval: String,
+}
+
+fn default_refresh_interval() -> String {
+    "15m".to_string()
+}
+
+impl ConnectionSpec {
+    /// The rules the schema's CEL validations also enforce, plus those a schema cannot express
+    /// (the resource name, the refresh range), in one place for the controller and the tests.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !name_ok {
+            return Err(format!(
+                "connection name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
+            ));
+        }
+        let group_ok = |g: &str| {
+            !g.is_empty()
+                && g.len() <= 64
+                && g.as_bytes()[0].is_ascii_alphanumeric()
+                && g.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        match self.scope {
+            ConnectionScope::Group => match self.owner_group.as_deref() {
+                Some(g) if group_ok(g) && self.usable_by.is_empty() => {}
+                _ => {
+                    return Err(
+                        "a group connection needs a valid ownerGroup and no usableBy".to_string(),
+                    );
+                }
+            },
+            ConnectionScope::Managed => {
+                if self.owner_group.is_some()
+                    || self.usable_by.is_empty()
+                    || !self.usable_by.iter().all(|g| group_ok(g))
+                {
+                    return Err(
+                        "a managed connection needs usableBy (valid group names) and no ownerGroup"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        if let Some(path) = &self.secret.remote_ref
+            && (path.contains("..") || path.contains("//"))
+        {
+            return Err("secret.remoteRef must not contain .. or //".to_string());
+        }
+        let keys = &self.secret.keys;
+        let key_ok = |k: &str| {
+            !k.is_empty()
+                && k.len() <= 63
+                && k.as_bytes()[0].is_ascii_alphabetic()
+                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        };
+        let unique: std::collections::BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+        if keys.is_empty()
+            || keys.len() > 16
+            || unique.len() != keys.len()
+            || !keys.iter().all(|k| key_ok(k))
+        {
+            return Err(
+                "secret.keys must be 1 to 16 unique names of letters, digits and underscore"
+                    .to_string(),
+            );
+        }
+        for key in self.config.keys() {
+            let lower = key.to_ascii_lowercase();
+            if [
+                "password",
+                "passwd",
+                "passphrase",
+                "secret",
+                "token",
+                "credential",
+            ]
+            .iter()
+            .any(|part| lower.contains(part))
+            {
+                return Err(format!(
+                    "config.{key} looks like a secret: settings go in config, secrets in secret.keys"
+                ));
+            }
+        }
+        let has_config = |k: &str| self.config.contains_key(k);
+        let has_key = |k: &str| keys.iter().any(|x| x == k);
+        let needs = |ok: bool, what: &str| if ok { Ok(()) } else { Err(what.to_string()) };
+        match self.type_ {
+            ConnectionType::Postgresql
+            | ConnectionType::Mysql
+            | ConnectionType::Sqlserver
+            | ConnectionType::Oracle => needs(
+                has_config("host") && has_key("user") && has_key("password"),
+                "a database connection needs config.host and the secret keys user and password",
+            )?,
+            ConnectionType::RestApi => needs(
+                has_config("baseUrl")
+                    && (has_key("token") || (has_key("clientId") && has_key("clientSecret"))),
+                "a rest-api connection needs config.baseUrl and the secret key token, or clientId and clientSecret",
+            )?,
+            ConnectionType::S3 => needs(
+                has_config("bucket") && has_key("accessKeyId") && has_key("secretAccessKey"),
+                "an s3 connection needs config.bucket and the secret keys accessKeyId and secretAccessKey",
+            )?,
+            ConnectionType::Sftp => needs(
+                has_config("host")
+                    && has_key("user")
+                    && (has_key("password") || has_key("privateKey")),
+                "an sftp connection needs config.host and the secret keys user and password or privateKey",
+            )?,
+            ConnectionType::Kafka => needs(
+                has_config("bootstrapServers"),
+                "a kafka connection needs config.bootstrapServers",
+            )?,
+            ConnectionType::Generic => {}
+        }
+        let digits: String = self
+            .refresh_interval
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        let minutes = match (digits.parse::<u32>(), self.refresh_interval.chars().last()) {
+            (Ok(n), Some('m')) => n,
+            (Ok(n), Some('h')) => n.saturating_mul(60),
+            _ => 0,
+        };
+        if !(1..=1440).contains(&minutes) {
+            return Err("refreshInterval must be between 1m and 24h, for example 15m".to_string());
+        }
+        Ok(())
+    }
+
+    /// The path in the secret store this connection reads, when the platform runs the store:
+    /// `connections/group/<ownerGroup>/<name>` or `connections/managed/<name>`.
+    pub fn derived_remote_ref(&self, name: &str) -> String {
+        match (self.scope, self.owner_group.as_deref()) {
+            (ConnectionScope::Group, Some(group)) => format!("connections/group/{group}/{name}"),
+            _ => format!("connections/managed/{name}"),
+        }
+    }
+}
+
+/// The Kubernetes Secret a connection is synced into.
+pub fn connection_secret_name(name: &str) -> String {
+    format!("conn-{name}")
+}
+
+/// Prefix of the environment variables a task gets from the Secret: `crm-db` becomes `CONN_CRM_DB_`.
+pub fn connection_env_prefix(name: &str) -> String {
+    format!("CONN_{}_", name.to_ascii_uppercase().replace('-', "_"))
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct ConnectionStatus {
+    /// True when the Secret exists and holds every key in `spec.secret.keys`.
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(
+        default,
+        rename = "secretName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub secret_name: Option<String>,
+    /// RFC 3339 time of the last successful sync from the store.
+    #[serde(default, rename = "lastSync", skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct ComponentStatus {
     pub name: String,
@@ -1176,6 +1496,190 @@ mod tests {
             per_component.type_.as_deref(),
             Some("object"),
             "values.<component> is a values document, i.e. an object"
+        );
+    }
+
+    fn connection(spec: serde_json::Value) -> Connection {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Connection",
+            "metadata": { "name": "crm-db", "namespace": "stardelt" },
+            "spec": spec
+        }))
+        .expect("deserialize Connection")
+    }
+
+    fn crm(patch: serde_json::Value) -> serde_json::Value {
+        let mut spec = serde_json::json!({
+            "scope": "group",
+            "ownerGroup": "analytics",
+            "type": "sqlserver",
+            "config": { "host": "crm.example.com", "port": "1433", "database": "sales" },
+            "secret": { "keys": ["user", "password"] }
+        });
+        for (k, v) in patch.as_object().unwrap() {
+            if v.is_null() {
+                spec.as_object_mut().unwrap().remove(k);
+            } else {
+                spec[k] = v.clone();
+            }
+        }
+        spec
+    }
+
+    #[test]
+    fn a_group_connection_parses_and_derives_its_store_path_and_names() {
+        let c = connection(crm(serde_json::json!({})));
+        assert_eq!(c.spec.scope, ConnectionScope::Group);
+        assert_eq!(c.spec.type_, ConnectionType::Sqlserver);
+        assert_eq!(c.spec.refresh_interval, "15m");
+        assert!(c.spec.secret.remote_ref.is_none());
+        assert!(c.spec.validate("crm-db").is_ok());
+        assert_eq!(
+            c.spec.derived_remote_ref("crm-db"),
+            "connections/group/analytics/crm-db"
+        );
+        assert_eq!(connection_secret_name("crm-db"), "conn-crm-db");
+        assert_eq!(connection_env_prefix("crm-db"), "CONN_CRM_DB_");
+    }
+
+    #[test]
+    fn a_managed_connection_names_the_groups_that_may_use_it() {
+        let c = connection(crm(serde_json::json!({
+            "scope": "managed", "ownerGroup": null, "usableBy": ["analytics", "finance"]
+        })));
+        assert!(c.spec.validate("crm-db").is_ok());
+        assert_eq!(
+            c.spec.derived_remote_ref("crm-db"),
+            "connections/managed/crm-db"
+        );
+    }
+
+    #[test]
+    fn the_scope_rules_are_enforced() {
+        let bad =
+            |patch: serde_json::Value| connection(crm(patch)).spec.validate("crm-db").unwrap_err();
+        assert!(bad(serde_json::json!({ "ownerGroup": null })).contains("ownerGroup"));
+        assert!(bad(serde_json::json!({ "usableBy": ["finance"] })).contains("usableBy"));
+        assert!(bad(serde_json::json!({ "ownerGroup": "../finance" })).contains("ownerGroup"));
+        assert!(bad(serde_json::json!({ "ownerGroup": "a/b" })).contains("ownerGroup"));
+        assert!(
+            bad(serde_json::json!({ "scope": "managed", "ownerGroup": null })).contains("usableBy")
+        );
+        assert!(
+            bad(serde_json::json!({ "scope": "managed", "usableBy": ["x/y"], "ownerGroup": null }))
+                .contains("usableBy")
+        );
+    }
+
+    #[test]
+    fn each_type_demands_its_settings_and_secret_keys() {
+        let bad =
+            |patch: serde_json::Value| connection(crm(patch)).spec.validate("crm-db").unwrap_err();
+        assert!(bad(serde_json::json!({ "config": { "port": "1433" } })).contains("config.host"));
+        assert!(
+            bad(serde_json::json!({ "secret": { "keys": ["user"] } }))
+                .contains("user and password")
+        );
+        assert!(bad(serde_json::json!({ "type": "rest-api", "config": { "baseUrl": "https://x" }, "secret": { "keys": ["clientId"] } })).contains("rest-api"));
+        assert!(bad(serde_json::json!({ "type": "s3", "config": { "bucket": "b" }, "secret": { "keys": ["accessKeyId"] } })).contains("s3"));
+        assert!(bad(serde_json::json!({ "type": "sftp", "config": { "host": "h" }, "secret": { "keys": ["user"] } })).contains("sftp"));
+        assert!(
+            bad(serde_json::json!({ "type": "kafka", "config": {}, "secret": { "keys": ["x"] } }))
+                .contains("kafka")
+        );
+        for ok in [
+            serde_json::json!({ "type": "rest-api", "config": { "baseUrl": "https://x" }, "secret": { "keys": ["token"] } }),
+            serde_json::json!({ "type": "rest-api", "config": { "baseUrl": "https://x" }, "secret": { "keys": ["clientId", "clientSecret"] } }),
+            serde_json::json!({ "type": "s3", "config": { "bucket": "b" }, "secret": { "keys": ["accessKeyId", "secretAccessKey"] } }),
+            serde_json::json!({ "type": "sftp", "config": { "host": "h" }, "secret": { "keys": ["user", "privateKey"] } }),
+            serde_json::json!({ "type": "generic", "config": {}, "secret": { "keys": ["anything"] } }),
+        ] {
+            assert!(connection(crm(ok)).spec.validate("c").is_ok());
+        }
+    }
+
+    #[test]
+    fn secrets_do_not_hide_in_config_and_keys_stay_clean() {
+        let bad =
+            |patch: serde_json::Value| connection(crm(patch)).spec.validate("crm-db").unwrap_err();
+        assert!(
+            bad(serde_json::json!({ "config": { "host": "h", "dbPassword": "x" } }))
+                .contains("looks like a secret")
+        );
+        assert!(
+            bad(serde_json::json!({ "config": { "host": "h", "API_TOKEN": "x" } }))
+                .contains("looks like a secret")
+        );
+        assert!(
+            bad(serde_json::json!({ "secret": { "keys": ["user", "password", "user"] } }))
+                .contains("unique")
+        );
+        assert!(
+            bad(serde_json::json!({ "secret": { "keys": ["user", "pass word"] } }))
+                .contains("secret.keys")
+        );
+    }
+
+    #[test]
+    fn a_store_path_cannot_climb_out_of_its_prefix() {
+        let ok = connection(crm(
+            serde_json::json!({ "secret": { "keys": ["user", "password"], "remoteRef": "kv/team/crm" } }),
+        ));
+        assert!(ok.spec.validate("crm-db").is_ok());
+        for path in ["connections/group/finance/../analytics/x", "a//b"] {
+            let bad = connection(crm(
+                serde_json::json!({ "secret": { "keys": ["user", "password"], "remoteRef": path } }),
+            ));
+            assert!(
+                bad.spec
+                    .validate("crm-db")
+                    .unwrap_err()
+                    .contains("remoteRef"),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_and_refresh_interval_are_checked() {
+        let spec = connection(crm(serde_json::json!({}))).spec;
+        for name in ["", "Crm", "1crm", "crm_db", "crm-", &"a".repeat(41)] {
+            assert!(spec.validate(name).is_err(), "{name}");
+        }
+        let mut s = spec.clone();
+        for (interval, ok) in [
+            ("15m", true),
+            ("1m", true),
+            ("24h", true),
+            ("0m", false),
+            ("25h", false),
+            ("90s", false),
+            ("m", false),
+        ] {
+            s.refresh_interval = interval.to_string();
+            assert_eq!(s.validate("c").is_ok(), ok, "{interval}");
+        }
+    }
+
+    #[test]
+    fn the_connection_crd_carries_the_cel_rules_and_the_bounds() {
+        let crd = Connection::crd();
+        assert_eq!(crd.spec.names.plural, "connections");
+        let yaml = serde_yaml::to_string(&crd).unwrap();
+        for needle in [
+            "x-kubernetes-validations",
+            "a group connection needs ownerGroup and no usableBy",
+            "a managed connection needs usableBy and no ownerGroup",
+            "config holds settings, not secrets",
+            "maxProperties: 32",
+            "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+        ] {
+            assert!(yaml.contains(needle), "the CRD lacks `{needle}`");
+        }
+        assert!(
+            !yaml.contains("password:"),
+            "no field may be called password"
         );
     }
 }
