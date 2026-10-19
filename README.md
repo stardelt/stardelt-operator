@@ -43,8 +43,20 @@ spec:
   profile: demo
   pillars: { notebooks: true }      # adds JupyterHub to the cluster-scoped plan
   namespace: stardelt               # where the platform's own components are installed (default)
+  baseDomain: data.example.com      # Nova answers here, every other application on a subdomain
+  identity:                         # where users sign in (decision D20)
+    mode: external                  # none (default) | platform (Keycloak at id.<baseDomain>) | external
+    issuerUrl: https://login.microsoftonline.com/<tenant-id>/v2.0   # external only, https
+    groupClaim: groups              # default
+    adminGroup: stardelt-admins     # default
   dryRun: true                      # plan first; flip to apply
 ```
+
+`identity` and `baseDomain` are validated by the API server (an `external` provider needs an
+`https://` issuer, `platform` derives it and refuses one, both need `baseDomain`). `contract()`
+in `src/identity.rs` turns them into the data of the ConfigMap `stardelt-identity` that every
+component reads; publishing that ConfigMap from the controller is the next wave step. Until then
+`make install-identity` in `stardelt-platform` writes it.
 
 Notebooks are platform-level on purpose: one hub serves every lakehouse, and it is a whole
 stack (hub, proxy, single-user pods) rather than a per-catalog concern. The golden values

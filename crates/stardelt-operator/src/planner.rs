@@ -236,6 +236,8 @@ mod tests {
             dry_run: true,
             component_values: Default::default(),
             namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
         };
         assert!(!without.pillars.notebooks, "notebooks stay opt-in");
         assert_eq!(names(&plan_platform(&without)), vec!["cnpg"]);
@@ -258,6 +260,8 @@ mod tests {
             dry_run: true,
             component_values: Default::default(),
             namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
         };
         assert_eq!(names(&plan_platform(&pi)), vec!["cnpg"]);
         // It must not leak into a per-Lakehouse plan.
@@ -282,6 +286,8 @@ mod tests {
             dry_run: true,
             component_values: Default::default(),
             namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
             .into_iter()
@@ -304,6 +310,8 @@ mod tests {
             dry_run: true,
             component_values: Default::default(),
             namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
             .into_iter()
