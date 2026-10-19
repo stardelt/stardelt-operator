@@ -13,11 +13,11 @@ use std::time::Duration;
 use futures::StreamExt;
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
-    core::v1::{ConfigMap, Secret},
+    core::v1::{ConfigMap, PersistentVolumeClaim, Secret},
 };
 use kube::{
     Api, Client, ResourceExt,
-    api::{ListParams, Patch, PatchParams},
+    api::{DeleteParams, ListParams, Patch, PatchParams},
     runtime::{Controller, controller::Action, watcher},
 };
 use serde_json::json;
@@ -28,7 +28,9 @@ use crate::crd::{
     PlatformInstance, PlatformInstanceStatus, StorageImpl, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
+use crate::objects::cnpg_cluster_resource;
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
+use crate::prerequisites::CATALOG_CLUSTER;
 use crate::provision::{
     ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_keycloak, ensure_keycloak_pg, ensure_s3_secrets,
@@ -507,6 +509,11 @@ async fn patch_lakehouse_status(
 /// (wave 3a-ii, decision D18).
 const LAKEHOUSE_FINALIZER: &str = "stardelt.io/lakehouse-deletion";
 
+/// Label the SeaweedFS chart puts on its three data PVCs. Only volumes carrying
+/// it are ever deleted; another release's volumes in the same namespace are
+/// never touched.
+const SEAWEEDFS_VOLUME_SELECTOR: &str = "app.kubernetes.io/instance=seaweedfs";
+
 fn lakehouse_api(ctx: &Context, lh: &Lakehouse) -> Api<Lakehouse> {
     match lh.namespace() {
         Some(ns) => Api::namespaced(ctx.client.clone(), &ns),
@@ -556,29 +563,68 @@ async fn remove_lakehouse_finalizer(ctx: &Context, lh: &Lakehouse) -> Result<(),
     patch_lakehouse_finalizers(ctx, lh, finalizers).await
 }
 
-/// Deletion path of a `Lakehouse` (wave 3a-ii). The finalizer keeps the resource
-/// visible until this returns, so it is called before any planning or status.
+/// Delete a named object, treating `404` as success. A `Delete` is not atomic:
+/// after a partial run the next reconcile starts from the top, and the objects
+/// removed before the failure must not stop it.
+async fn delete_ignoring_not_found<K>(api: &Api<K>, name: &str) -> Result<(), kube::Error>
+where
+    K: Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    match api.delete(name, &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the data of a `Lakehouse` (`deletionPolicy: Delete`, wave 3a-iii):
+/// the SeaweedFS PVCs that Helm leaves behind on uninstall, then the catalog
+/// CNPG `Cluster`, whose own PVC goes through its ownerReference and the
+/// storage class's reclaim policy. `delete_object_store` is false for BYO S3:
+/// that storage is not ours, so no volume is listed or deleted. The S3 Secrets
+/// hold credentials, not data, and stay.
+async fn delete_lakehouse_data(
+    ctx: &Context,
+    namespace: &str,
+    delete_object_store: bool,
+) -> Result<(), kube::Error> {
+    if delete_object_store {
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+        let params = ListParams {
+            label_selector: Some(SEAWEEDFS_VOLUME_SELECTOR.to_string()),
+            ..Default::default()
+        };
+        for pvc in pvcs.list(&params).await?.items {
+            let name = pvc.name_any();
+            delete_ignoring_not_found(&pvcs, &name).await?;
+            tracing::info!(pvc = %name, %namespace, "object-store volume deleted");
+        }
+    }
+    let clusters: Api<kube::api::DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), namespace, &cnpg_cluster_resource());
+    delete_ignoring_not_found(&clusters, CATALOG_CLUSTER).await?;
+    tracing::info!(cluster = CATALOG_CLUSTER, %namespace, "catalog database deleted");
+    Ok(())
+}
+
+/// Deletion path of a `Lakehouse` (waves 3a-ii and 3a-iii). The finalizer keeps
+/// the resource visible until this returns, so it is called before any planning
+/// or status.
 ///
 /// `Retain` (the default) uninstalls the releases this operator owns in the
 /// reverse of the apply order — query, catalog, storage — and leaves every
 /// data-bearing object alone: the catalog CNPG `Cluster` (its deletion would take
 /// its PVC with it), the S3 Secrets and the StatefulSet PVCs. The discovery
 /// ConfigMap disappears through its ownerReference once the finalizer is removed.
+/// `Delete` runs the same uninstalls and then [`delete_lakehouse_data`]; `404`s
+/// are tolerated so a retry after a partial failure completes the rest.
 async fn delete_lakehouse(lh: &Lakehouse, ctx: &Context) -> Result<Action, kube::Error> {
     let name = lh.name_any();
     let namespace = lh.namespace().unwrap_or_else(|| "default".into());
 
-    if lh.spec.deletion_policy == DeletionPolicy::Delete {
-        // 3a-iii deletes the data. Refusing is safer than silently retaining data
-        // the user asked to delete, so the finalizer stays.
-        tracing::warn!(
-            lakehouse = %name,
-            "deletionPolicy Delete is not implemented yet; keeping the data (wave 3a-iii)"
-        );
-        return Ok(Action::requeue(Duration::from_secs(300)));
-    }
-
     if lh.spec.dry_run {
+        // A dry-run resource never applied anything, so it owns no data to
+        // delete, even with `deletionPolicy: Delete`.
         tracing::info!(
             lakehouse = %name,
             "dry-run Lakehouse deleted; nothing was applied to the cluster"
@@ -636,11 +682,32 @@ async fn delete_lakehouse(lh: &Lakehouse, ctx: &Context) -> Result<Action, kube:
         );
     }
 
+    if lh.spec.deletion_policy == DeletionPolicy::Delete {
+        // The data goes only once every release is gone, so nothing is left
+        // running against volumes that disappear. A failure keeps the finalizer
+        // and the next reconcile retries from the top; 404s are success.
+        let delete_object_store = lh.spec.storage.implementation == StorageImpl::Seaweedfs;
+        if let Err(e) = delete_lakehouse_data(ctx, &namespace, delete_object_store).await {
+            tracing::warn!(
+                lakehouse = %name,
+                error = %e,
+                "data deletion failed; keeping the finalizer"
+            );
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+    }
+
     remove_lakehouse_finalizer(ctx, lh).await?;
-    tracing::info!(
-        lakehouse = %name,
-        "releases uninstalled; data retained (deletionPolicy Retain)"
-    );
+    match lh.spec.deletion_policy {
+        DeletionPolicy::Retain => tracing::info!(
+            lakehouse = %name,
+            "releases uninstalled; data retained (deletionPolicy Retain)"
+        ),
+        DeletionPolicy::Delete => tracing::info!(
+            lakehouse = %name,
+            "releases uninstalled and data deleted (deletionPolicy Delete)"
+        ),
+    }
     Ok(Action::await_change())
 }
 
@@ -1252,11 +1319,12 @@ mod tests {
         assert_eq!(c.last_transition_time.as_deref(), Some("new"));
     }
 
-    /// One request recorded by [`status_mock_client`].
+    /// One request recorded by [`status_mock_client`] or [`deletion_mock_client`].
     #[derive(Debug)]
     struct RecordedRequest {
         method: String,
         path: String,
+        query: String,
         body: String,
     }
 
@@ -1290,6 +1358,7 @@ mod tests {
             let lakehouses = lakehouses.clone();
             let method = request.method().to_string();
             let path = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
             async move {
                 let body = request
                     .into_body()
@@ -1302,6 +1371,7 @@ mod tests {
                     .push(RecordedRequest {
                         method: method.clone(),
                         path: path.clone(),
+                        query,
                         body: String::from_utf8_lossy(&body).to_string(),
                     });
                 let document = if method == "GET" && path.contains("lakehouses") {
@@ -1398,6 +1468,120 @@ mod tests {
             .filter(|call| call.args.first().map(String::as_str) == Some("uninstall"))
             .map(|call| call.args[1].clone())
             .collect()
+    }
+
+    /// The paths of every `DELETE`, in call order.
+    fn deleted(requests: &Arc<Mutex<Vec<RecordedRequest>>>) -> Vec<String> {
+        requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.path.clone())
+            .collect()
+    }
+
+    /// A kube client for the deletion tests. The PVC list returns exactly
+    /// `pvcs`; deleting a name in `missing` answers `404` and one in `failed`
+    /// answers `500`; every other delete succeeds. Requests are recorded in
+    /// order, so a test can check that deletes happen before the finalizer
+    /// patch.
+    fn deletion_mock_client(
+        pvcs: &[&str],
+        missing: &[&str],
+        failed: &[&str],
+    ) -> (Client, Arc<Mutex<Vec<RecordedRequest>>>) {
+        let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::default();
+        let recorder = requests.clone();
+        let pvcs: Vec<String> = pvcs.iter().map(|name| name.to_string()).collect();
+        let missing: Vec<String> = missing.iter().map(|name| name.to_string()).collect();
+        let failed: Vec<String> = failed.iter().map(|name| name.to_string()).collect();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let pvcs = pvcs.clone();
+            let missing = missing.clone();
+            let failed = failed.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            let name = path.rsplit('/').next().unwrap_or_default().to_string();
+            let failure = if method == "DELETE" && failed.contains(&name) {
+                Some((500, "InternalError"))
+            } else if method == "DELETE" && missing.contains(&name) {
+                Some((404, "NotFound"))
+            } else {
+                None
+            };
+            let document = if method == "GET" && path.ends_with("persistentvolumeclaims") {
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaimList",
+                    "metadata": { "resourceVersion": "1" },
+                    "items": pvcs.iter().map(|name| json!({
+                        "apiVersion": "v1",
+                        "kind": "PersistentVolumeClaim",
+                        "metadata": { "name": name, "namespace": "stardelt" }
+                    })).collect::<Vec<_>>()
+                })
+            } else if let Some((code, reason)) = failure {
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "metadata": {},
+                    "status": "Failure",
+                    "message": reason,
+                    "reason": reason,
+                    "code": code
+                })
+            } else if method == "DELETE" {
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "metadata": {},
+                    "status": "Success"
+                })
+            } else if method == "PATCH" {
+                json!({
+                    "apiVersion": "stardelt.io/v1alpha1",
+                    "kind": "Lakehouse",
+                    "metadata": { "name": "main", "namespace": "stardelt" },
+                    "spec": {}
+                })
+            } else {
+                json!({
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": { "name": "stardelt" }
+                })
+            };
+            let status = failure.map_or(200, |(code, _)| code);
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                recorder
+                    .lock()
+                    .expect("requests poisoned")
+                    .push(RecordedRequest {
+                        method,
+                        path,
+                        query,
+                        body: String::from_utf8_lossy(&body).to_string(),
+                    });
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&document).expect("mock document"),
+                        ))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (Client::new(service, "stardelt"), requests)
     }
 
     /// A `Lakehouse` the API server is deleting: it carries the operator's
@@ -1784,8 +1968,135 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deletion_policy_delete_is_refused_and_keeps_the_finalizer() {
-        let (client, requests) = status_mock_client(json!([]));
+    async fn delete_deletion_uninstalls_then_removes_volumes_and_catalog() {
+        let (client, requests) = deletion_mock_client(
+            &[
+                "data-seaweedfs-volume-0",
+                "data-filer-seaweedfs-filer-0",
+                "data-stardelt-seaweedfs-master-0",
+            ],
+            &[],
+            &[],
+        );
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(
+                json!({ "dryRun": false, "deletionPolicy": "Delete" }),
+            )),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            uninstalled(&helm),
+            vec![
+                "trino".to_string(),
+                "lakekeeper".to_string(),
+                "seaweedfs".to_string()
+            ],
+            "the releases go first, in reverse plan order"
+        );
+        assert_eq!(
+            deleted(&requests),
+            vec![
+                "/api/v1/namespaces/stardelt/persistentvolumeclaims/data-seaweedfs-volume-0"
+                    .to_string(),
+                "/api/v1/namespaces/stardelt/persistentvolumeclaims/data-filer-seaweedfs-filer-0"
+                    .to_string(),
+                "/api/v1/namespaces/stardelt/persistentvolumeclaims/data-stardelt-seaweedfs-master-0"
+                    .to_string(),
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg"
+                    .to_string(),
+            ],
+            "the object-store volumes go before the catalog Cluster"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "the finalizer is removed only after every delete"
+        );
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            requests.iter().any(|request| request.method == "GET"
+                && request.path.ends_with("persistentvolumeclaims")
+                && request
+                    .query
+                    .contains("labelSelector=app.kubernetes.io%2Finstance%3Dseaweedfs")),
+            "only the SeaweedFS volumes are listed: {requests:?}"
+        );
+        let last_delete = requests
+            .iter()
+            .rposition(|request| request.method == "DELETE")
+            .expect("the data deletes were issued");
+        let finalizer_patch = requests
+            .iter()
+            .rposition(|request| {
+                request.method == "PATCH" && request.body.contains("\"finalizers\"")
+            })
+            .expect("the finalizer was patched");
+        assert!(
+            finalizer_patch > last_delete,
+            "the finalizer is removed after the deletes: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn byo_s3_delete_skips_the_volumes_but_deletes_the_catalog() {
+        let (client, requests) = deletion_mock_client(&[], &[], &[]);
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(json!({
+                "dryRun": false,
+                "deletionPolicy": "Delete",
+                "storage": { "implementation": "byoS3", "bucket": "s3://acme-lake" }
+            }))),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            deleted(&requests),
+            vec![
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg"
+                    .to_string()
+            ],
+            "BYO S3 deletes no volume; the catalog is still ours"
+        );
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.path.contains("persistentvolumeclaims")),
+            "the object store is not ours, so its PVCs are not even listed: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_volume_delete_failure_keeps_the_finalizer() {
+        let (client, requests) = deletion_mock_client(
+            &[
+                "data-seaweedfs-volume-0",
+                "data-filer-seaweedfs-filer-0",
+                "data-stardelt-seaweedfs-master-0",
+            ],
+            &[],
+            &["data-seaweedfs-volume-0"],
+        );
         let helm = owned_helm();
         let ctx = Arc::new(Context {
             client,
@@ -1803,16 +2114,63 @@ mod tests {
 
         assert_eq!(
             action,
-            Action::requeue(Duration::from_secs(300)),
-            "Delete waits for 3a-iii"
+            Action::requeue(Duration::from_secs(30)),
+            "a failed delete is retried"
         );
-        assert!(
-            helm.calls.lock().expect("calls poisoned").is_empty(),
-            "nothing is uninstalled while Delete is unimplemented"
+        assert_eq!(
+            deleted(&requests),
+            vec![
+                "/api/v1/namespaces/stardelt/persistentvolumeclaims/data-seaweedfs-volume-0"
+                    .to_string()
+            ],
+            "the volumes stop at the first failure"
         );
         assert!(
             patched_finalizers(&requests).is_empty(),
-            "the finalizer stays so the data is never silently retained"
+            "the finalizer stays until every data object is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_retry_tolerates_404s_and_finishes() {
+        // A previous attempt removed two volumes and the Cluster but failed on
+        // the last one; the next reconcile sees a stale list and 404s, which
+        // are success.
+        let (client, requests) = deletion_mock_client(
+            &["data-stardelt-seaweedfs-master-0"],
+            &["data-stardelt-seaweedfs-master-0", "lakekeeper-pg"],
+            &[],
+        );
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(
+                json!({ "dryRun": false, "deletionPolicy": "Delete" }),
+            )),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            deleted(&requests),
+            vec![
+                "/api/v1/namespaces/stardelt/persistentvolumeclaims/data-stardelt-seaweedfs-master-0"
+                    .to_string(),
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg"
+                    .to_string(),
+            ],
+            "the retry asks for the remaining objects and tolerates missing ones"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "a retry that finds everything already gone removes the finalizer"
         );
     }
 
