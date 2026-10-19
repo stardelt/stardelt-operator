@@ -79,6 +79,23 @@ fn meta(name: &str, namespace: &str, lakehouse: &str, component: &str) -> Object
     }
 }
 
+/// Metadata of an object that belongs to the platform rather than to a Lakehouse:
+/// no `stardelt.io/lakehouse`, because identity is not scoped to one Lakehouse.
+fn platform_meta(name: &str, namespace: &str, component: &str) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name.into()),
+        namespace: Some(namespace.into()),
+        labels: Some(BTreeMap::from([
+            (
+                "app.kubernetes.io/part-of".to_string(),
+                "stardelt".to_string(),
+            ),
+            ("stardelt.io/component".to_string(), component.to_string()),
+        ])),
+        ..Default::default()
+    }
+}
+
 fn string_data(pairs: &[(&str, String)]) -> Option<BTreeMap<String, String>> {
     Some(
         pairs
@@ -139,6 +156,59 @@ pub fn catalog_cluster(lakehouse: &str, namespace: &str, profile: Profile) -> Dy
                 "requests": {"cpu": "50m", "memory": "256Mi"},
                 "limits": {"cpu": "1", "memory": "512Mi"},
             },
+        }}),
+    }
+}
+
+/// The CloudNative-PG `Cluster` that stores Keycloak's state (realms, users, sessions),
+/// for `identity.mode: platform`. Mirrors `manifests/keycloak.yaml` in stardelt-platform.
+pub fn keycloak_pg_cluster(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "Cluster".into(),
+        }),
+        metadata: platform_meta("keycloak-pg", namespace, "keycloak-pg"),
+        data: json!({"spec": {
+            "instances": 1,
+            "storage": {"size": "1Gi"},
+            "backup": {
+                "retentionPolicy": "14d",
+                "barmanObjectStore": {
+                    "destinationPath": "s3://backups/",
+                    "endpointURL": s3_endpoint(namespace),
+                    "s3Credentials": {
+                        "accessKeyId": {"name": S3_SECRET, "key": "access-key"},
+                        "secretAccessKey": {"name": S3_SECRET, "key": "secret-key"},
+                        "region": {"name": S3_SECRET, "key": "region"},
+                    },
+                    "wal": {"compression": "gzip", "maxParallel": 2},
+                    "data": {"compression": "gzip"},
+                },
+            },
+            "bootstrap": {"initdb": {"database": "keycloak", "owner": "keycloak"}},
+            "resources": {
+                "requests": {"cpu": "50m", "memory": "128Mi"},
+                "limits": {"cpu": "500m", "memory": "256Mi"},
+            },
+        }}),
+    }
+}
+
+/// The daily base backup of the identity database. Mirrors the platform manifest.
+pub fn keycloak_pg_backup(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "ScheduledBackup".into(),
+        }),
+        metadata: platform_meta("keycloak-pg-daily", namespace, "keycloak-pg"),
+        data: json!({"spec": {
+            "schedule": "0 45 2 * * *",
+            "immediate": true,
+            "backupOwnerReference": "self",
+            "method": "barmanObjectStore",
+            "cluster": {"name": "keycloak-pg"},
         }}),
     }
 }
@@ -330,6 +400,90 @@ mod tests {
             "lakekeeper"
         );
         assert_eq!(demo.metadata.name.as_deref(), Some("lakekeeper-pg"));
+    }
+
+    #[test]
+    fn keycloak_pg_cluster_mirrors_the_platform_manifest() {
+        let cluster = keycloak_pg_cluster("stardelt");
+        assert_eq!(
+            cluster
+                .types
+                .as_ref()
+                .map(|t| (t.api_version.as_str(), t.kind.as_str())),
+            Some(("postgresql.cnpg.io/v1", "Cluster"))
+        );
+        assert_eq!(cluster.metadata.name.as_deref(), Some("keycloak-pg"));
+        assert_eq!(cluster.metadata.namespace.as_deref(), Some("stardelt"));
+        let spec = &cluster.data["spec"];
+        assert_eq!(spec["instances"], 1);
+        assert_eq!(spec["storage"]["size"], "1Gi");
+        assert_eq!(spec["bootstrap"]["initdb"]["database"], "keycloak");
+        assert_eq!(spec["bootstrap"]["initdb"]["owner"], "keycloak");
+        assert_eq!(spec["resources"]["requests"]["cpu"], "50m");
+        assert_eq!(spec["resources"]["requests"]["memory"], "128Mi");
+        assert_eq!(spec["resources"]["limits"]["cpu"], "500m");
+        assert_eq!(spec["resources"]["limits"]["memory"], "256Mi");
+        assert_eq!(spec["backup"]["retentionPolicy"], "14d");
+        let store = &spec["backup"]["barmanObjectStore"];
+        assert_eq!(store["destinationPath"], "s3://backups/");
+        assert_eq!(
+            store["endpointURL"],
+            "http://seaweedfs-s3.stardelt.svc.cluster.local:8333"
+        );
+        for (slot, key) in [
+            ("accessKeyId", "access-key"),
+            ("secretAccessKey", "secret-key"),
+            ("region", "region"),
+        ] {
+            assert_eq!(store["s3Credentials"][slot]["name"], "stardelt-s3-creds");
+            assert_eq!(store["s3Credentials"][slot]["key"], key);
+        }
+        assert_eq!(store["wal"]["compression"], "gzip");
+        assert_eq!(store["wal"]["maxParallel"], 2);
+        assert_eq!(store["data"]["compression"], "gzip");
+        // The endpoint follows the platform namespace, like the chart's templated values.
+        assert_eq!(
+            keycloak_pg_cluster("lab").data["spec"]["backup"]["barmanObjectStore"]["endpointURL"],
+            "http://seaweedfs-s3.lab.svc.cluster.local:8333"
+        );
+    }
+
+    #[test]
+    fn keycloak_pg_backup_is_the_daily_barman_schedule() {
+        let backup = keycloak_pg_backup("stardelt");
+        assert_eq!(
+            backup
+                .types
+                .as_ref()
+                .map(|t| (t.api_version.as_str(), t.kind.as_str())),
+            Some(("postgresql.cnpg.io/v1", "ScheduledBackup"))
+        );
+        assert_eq!(backup.metadata.name.as_deref(), Some("keycloak-pg-daily"));
+        assert_eq!(backup.metadata.namespace.as_deref(), Some("stardelt"));
+        let spec = &backup.data["spec"];
+        assert_eq!(spec["schedule"], "0 45 2 * * *");
+        assert_eq!(spec["immediate"], true);
+        assert_eq!(spec["backupOwnerReference"], "self");
+        assert_eq!(spec["method"], "barmanObjectStore");
+        assert_eq!(spec["cluster"]["name"], "keycloak-pg");
+    }
+
+    #[test]
+    fn keycloak_pg_objects_carry_the_platform_labels() {
+        for (object, name) in [
+            (keycloak_pg_cluster("stardelt"), "keycloak-pg"),
+            (keycloak_pg_backup("stardelt"), "keycloak-pg-daily"),
+        ] {
+            assert_eq!(object.metadata.name.as_deref(), Some(name));
+            assert_eq!(object.metadata.namespace.as_deref(), Some("stardelt"));
+            let labels = object.metadata.labels.as_ref().expect("labels");
+            assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
+            assert_eq!(labels["stardelt.io/component"], "keycloak-pg");
+            assert!(
+                !labels.contains_key("stardelt.io/lakehouse"),
+                "platform-scoped objects are not tied to a Lakehouse"
+            );
+        }
     }
 
     #[test]
