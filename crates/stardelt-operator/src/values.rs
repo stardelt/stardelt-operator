@@ -40,6 +40,20 @@ s3.aws-secret-key=${ENV:S3_SECRET_KEY}
 s3.max-connections=16
 iceberg.split-manager-threads=4
 iceberg.metadata.parallelism=2
+# Worker-local file-system cache for object-store reads (platform#134,
+# Trino 480: `fs.cache.*` per catalog; there is no cache-manager setting
+# in 480). Measured on the dev cluster 2026-10-19 against a 38M-row /
+# 0.66 GB full scan of nyc_taxi.yellow_trips: repeat scans drop from
+# 154 S3 GETs + 660 MB to 1 GET + 0 MB, wall time 1.5-1.9s -> 1.2-1.7s.
+# The win is S3 offload (the single-replica SeaweedFS volume server is
+# the bottleneck the throttles above protect), not latency — Parquet
+# decode dominates on one node. Best-effort local cache only: a pod
+# restart or scale-to-zero (M-02) discards it with the emptyDir, and the
+# next scan repopulates (cold scan is slower: 5.1s vs 3.2s uncached).
+fs.cache.enabled=true
+fs.cache.directories=/var/trino/cache
+fs.cache.max-sizes=10GB
+fs.cache.ttl=7d
 "#;
 
 /// Golden Helm values for one component: the curated settings that cannot be
@@ -78,6 +92,32 @@ pub fn golden_values(component: &str) -> Value {
             (
                 "catalogs",
                 serde_json::json!({ "warehouse": WAREHOUSE_CATALOG }),
+            ),
+            // Worker-local file-system cache for object-store reads
+            // (stardelt-platform#134): the `fs.cache.*` catalog props above
+            // point at `/var/trino/cache`, which must exist on the coordinator
+            // AND every worker — without the mount the coordinator CrashLoops
+            // (`IllegalArgumentException: Cannot write to cache directory
+            // /var/trino/cache`). The props and the mounts ship together here
+            // so neither can land without the other. Mirrors the
+            // `coordinator:` / `worker:` blocks of
+            // `stardelt-platform/helm-values/trino.yaml` (and its
+            // `chart/values.yaml` twin): an `emptyDir` with `sizeLimit: 12Gi`,
+            // not memory-backed, so a pod restart or scale-to-zero discards
+            // the cache and the next scan repopulates it.
+            (
+                "coordinator",
+                serde_json::json!({
+                    "additionalVolumes": [{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }],
+                    "additionalVolumeMounts": [{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }]
+                }),
+            ),
+            (
+                "worker",
+                serde_json::json!({
+                    "additionalVolumes": [{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }],
+                    "additionalVolumeMounts": [{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }]
+                }),
             ),
         ]),
         // The catalog database is the CloudNative-PG Cluster `lakekeeper-pg` that the
@@ -469,6 +509,41 @@ mod tests {
                 warehouse.contains("s3.endpoint=http://seaweedfs-s3:8333"),
                 "profile {profile:?}: {warehouse}"
             );
+            // File-system cache (stardelt-platform#134): the four catalog props
+            // that point at the worker-local cache directory.
+            for prop in [
+                "fs.cache.enabled=true",
+                "fs.cache.directories=/var/trino/cache",
+                "fs.cache.max-sizes=10GB",
+                "fs.cache.ttl=7d",
+            ] {
+                assert!(
+                    warehouse.contains(prop),
+                    "profile {profile:?}: missing {prop} in {warehouse}"
+                );
+            }
+            // The props without the mount hard-fail the coordinator at startup
+            // (CrashLoop: Cannot write to cache directory /var/trino/cache),
+            // so the cache volume must ride along on BOTH coordinator and
+            // workers — and survive every profile overlay.
+            for role in ["coordinator", "worker"] {
+                assert_eq!(
+                    trino[role]["additionalVolumes"],
+                    serde_json::json!([{ "name": "trino-fscache", "emptyDir": { "sizeLimit": "12Gi" } }]),
+                    "profile {profile:?}: {role} lost the cache volume"
+                );
+                assert_eq!(
+                    trino[role]["additionalVolumeMounts"],
+                    serde_json::json!([{ "name": "trino-fscache", "mountPath": "/var/trino/cache" }]),
+                    "profile {profile:?}: {role} lost the cache mount"
+                );
+                assert!(
+                    !trino[role]["additionalVolumes"][0]["emptyDir"]
+                        .as_object()
+                        .is_some_and(|dir| dir.contains_key("medium")),
+                    "profile {profile:?}: {role} cache must not be memory-backed"
+                );
+            }
             assert_eq!(
                 trino["env"][0]["valueFrom"]["secretKeyRef"]["name"],
                 serde_json::json!("stardelt-s3-creds"),
