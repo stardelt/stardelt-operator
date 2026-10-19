@@ -279,6 +279,17 @@ pub enum StorageImpl {
     ByoS3,
 }
 
+/// What happens to the Lakehouse's data when the resource is deleted (decision D18).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "PascalCase")]
+pub enum DeletionPolicy {
+    /// Uninstall the releases; the catalog database, its PVC and the object store survive.
+    #[default]
+    Retain,
+    /// Uninstall the releases and delete the data (catalog PVC, object store PVCs).
+    Delete,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct CatalogSpec {
     #[serde(default)]
@@ -335,6 +346,9 @@ pub struct LakehouseSpec {
     /// Lakehouse can never silently clobber an existing install.
     #[serde(default)]
     pub adopt: bool,
+    /// What happens to the data when this resource is deleted (decision D18). Defaults to Retain.
+    #[serde(default, rename = "deletionPolicy")]
+    pub deletion_policy: DeletionPolicy,
     /// Per-component Helm value overrides for the planned components
     /// (`seaweedfs`, `lakekeeper` / `polaris`, `trino`).
     #[serde(flatten)]
@@ -721,6 +735,61 @@ mod tests {
         assert_eq!(lh.spec.storage.implementation, StorageImpl::ByoS3);
         assert_eq!(lh.spec.storage.bucket.as_deref(), Some("s3://acme-lake"));
         assert_eq!(lh.spec.profile, Profile::Full);
+    }
+
+    #[test]
+    fn lakehouse_deletion_policy_defaults_to_retain() {
+        let lh: Lakehouse = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt" },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+        assert_eq!(
+            lh.spec.deletion_policy,
+            DeletionPolicy::Retain,
+            "a Lakehouse must keep its data unless deletion is opted into (D18)"
+        );
+    }
+
+    #[test]
+    fn lakehouse_parses_deletion_policy_delete() {
+        let lh: Lakehouse = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt" },
+            "spec": { "deletionPolicy": "Delete" }
+        }))
+        .expect("deserialize Lakehouse");
+        assert_eq!(lh.spec.deletion_policy, DeletionPolicy::Delete);
+        assert_eq!(
+            serde_json::to_value(lh.spec.deletion_policy).expect("serialize policy"),
+            serde_json::json!("Delete"),
+            "the YAML value is PascalCase, like PV reclaim policies"
+        );
+    }
+
+    #[test]
+    fn lakehouse_schema_carries_the_deletion_policy_enum() {
+        let crd = Lakehouse::crd();
+        let schema = serde_json::to_value(
+            crd.spec.versions[0]
+                .schema
+                .as_ref()
+                .and_then(|s| s.open_api_v3_schema.clone())
+                .expect("Lakehouse CRD carries an openAPIV3Schema"),
+        )
+        .expect("serialize the Lakehouse schema");
+        let mut values: Vec<&str> =
+            schema["properties"]["spec"]["properties"]["deletionPolicy"]["enum"]
+                .as_array()
+                .expect("deletionPolicy is an enum in the schema")
+                .iter()
+                .map(|value| value.as_str().expect("enum values are strings"))
+                .collect();
+        values.sort_unstable();
+        assert_eq!(values, ["Delete", "Retain"]);
     }
 
     #[test]
