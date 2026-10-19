@@ -33,7 +33,9 @@ use crate::crd::{
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
-use crate::provision::{ensure_bootstrap, ensure_catalog_database, ensure_s3_secrets};
+use crate::provision::{
+    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_s3_secrets,
+};
 use crate::values::{effective_values, parse_values_document};
 
 pub struct Context {
@@ -598,9 +600,12 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             applied_hash: None,
         }
     };
+    // The discovery ConfigMap is published last: it advertises a working catalog.
+    let discovery = ensure_discovery(&ctx, &lh, &namespace, bootstrap.ready).await;
     let mut components = vec![s3, database];
     components.append(&mut outcome.components);
     components.push(bootstrap);
+    components.push(discovery);
     outcome.components = components;
     let phase = phase(lh.spec.dry_run, &outcome);
     // Check back quickly while the install is still converging.
@@ -1259,6 +1264,38 @@ mod tests {
             ready["lastTransitionTime"],
             json!("old"),
             "an unchanged Ready keeps its transition time"
+        );
+    }
+
+    #[tokio::test]
+    async fn lakehouse_status_ends_with_the_discovery_component() {
+        let (client, requests) = status_mock_client();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt", "generation": 1 },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        let status = patched_status(&requests, "lakehouses");
+        let components = status["components"].as_array().expect("components");
+        let last = components.last().expect("at least one component");
+        assert_eq!(last["name"], json!("discovery"));
+        assert_eq!(last["ready"], json!(false));
+        assert_eq!(last["message"], json!("planned (dry-run)"));
+        assert_eq!(
+            components[components.len() - 2]["name"],
+            json!("lakekeeper-bootstrap"),
+            "discovery is published after the bootstrap"
         );
     }
 

@@ -87,6 +87,29 @@ Without the Secret, Trino stays in `CreateContainerConfigError`.
 
 A Lakehouse installs, in this order: the S3 Secrets (stardelt-s3-creds and seaweedfs-s3-config, generated once and never overwritten), the catalog database (a CloudNative-PG Cluster named lakekeeper-pg), SeaweedFS, Lakekeeper (only once the database is Ready), Trino, and a bootstrap Job that creates the warehouse. For byoS3, create stardelt-s3-creds yourself with access-key, secret-key, endpoint, bucket and region. The CloudNative-PG operator must be installed first: create a PlatformInstance.
 
+### Discovery ConfigMap
+
+Once the warehouse is bootstrapped, the operator publishes ConfigMap `<lakehouse>-discovery` in the
+Lakehouse's namespace (labels `stardelt.io/lakehouse`, `stardelt.io/component=discovery`; owned by
+the Lakehouse, so it is removed with it). It is the connection contract for notebooks, jobs,
+dashboards and external tools: read these keys instead of hard-coding hostnames. The URLs are fully
+qualified, so they resolve from any namespace. There are no credentials in it; those stay in Secret
+`stardelt-s3-creds`.
+
+| Key | Example | Meaning |
+|---|---|---|
+| `lakehouse` | `main` | name of the Lakehouse |
+| `catalogUri` | `http://lakekeeper.data.svc.cluster.local:8181/catalog` | Iceberg REST catalog |
+| `warehouse` | `warehouse` | warehouse name in the catalog |
+| `s3Endpoint` | `http://seaweedfs-s3.data.svc.cluster.local:8333` | object store (from `stardelt-s3-creds`) |
+| `s3Bucket` | `lakehouse` | bucket (from `stardelt-s3-creds`) |
+| `s3Region` | `us-east-1` | region (from `stardelt-s3-creds`) |
+| `trinoUrl` | `http://trino.data.svc.cluster.local:8080` | Trino coordinator |
+| `trinoCatalog` | `warehouse` | Trino catalog that fronts the warehouse |
+
+A pod uses it with `envFrom: [{ configMapRef: { name: main-discovery } }]` (same namespace) or by
+reading the keys through the API. The status lists it as component `discovery`.
+
 Ingestion is one contract with three domain defaults (master spec §5, plugs 8–10). `domain`
 selects the plug and therefore the components the operator plans:
 
