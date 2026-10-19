@@ -1,0 +1,38 @@
+name: e2e
+
+# End-to-end test (operator#60): a Lakehouse on an empty kind cluster answers a Trino query.
+# It needs minutes and several GB, so it never runs on pull requests: nightly and on demand.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  lakehouse:
+    name: lakehouse on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Tool versions
+        run: |
+          docker --version
+          kind version
+          kubectl version --client
+          helm version --short
+
+      - name: End-to-end test
+        run: bash tests/e2e/lakehouse.sh
+
+      - name: Upload diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-diagnostics
+          path: /tmp/stardelt-e2e/
+          if-no-files-found: ignore
