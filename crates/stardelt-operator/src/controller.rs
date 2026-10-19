@@ -30,8 +30,8 @@ use crate::crd::{
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::provision::{
-    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity, ensure_keycloak,
-    ensure_keycloak_pg, ensure_s3_secrets,
+    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
+    ensure_identity_secrets, ensure_keycloak, ensure_keycloak_pg, ensure_s3_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -614,6 +614,11 @@ async fn reconcile_platform(
     // The identity database comes before the contract that points the components at it.
     if let Some(database) = ensure_keycloak_pg(&ctx, &instance.spec).await {
         outcome.components.push(database);
+    }
+    // The credentials the realm import resolves come next: the workload below mounts them, and
+    // the database is not needed for them.
+    if let Some(secrets) = ensure_identity_secrets(&ctx, &instance.spec).await {
+        outcome.components.push(secrets);
     }
     // The workload that serves the realm comes next: it reads the database and the
     // identity Secrets, and the contract below advertises its issuer.
