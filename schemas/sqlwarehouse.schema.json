@@ -1,0 +1,184 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A compute class for SQL: size, caps and the groups that may use it.",
+  "properties": {
+    "spec": {
+      "description": "The query-serving plug: one named compute class inside the engine of a `Lakehouse`, with its size,\nits caps and the groups that may use it (decision D21, internal note `design/multitenant-catalogs.md`\n§4.3). Exactly one warehouse per `Lakehouse` is the default.",
+      "properties": {
+        "concurrency": {
+          "description": "Overrides of the class defaults. An absent field keeps the class value.",
+          "nullable": true,
+          "properties": {
+            "memoryShare": {
+              "description": "Share of the engine's memory the class may use, for example `40%`.",
+              "nullable": true,
+              "pattern": "^([1-9][0-9]?|100)%$",
+              "type": "string"
+            },
+            "queued": {
+              "description": "Queries that may wait (the resource group's queue limit).",
+              "format": "int32",
+              "maximum": 10000.0,
+              "minimum": 0.0,
+              "nullable": true,
+              "type": "integer"
+            },
+            "running": {
+              "description": "Queries that run at the same time (the resource group's hard concurrency limit).",
+              "format": "int32",
+              "maximum": 100.0,
+              "minimum": 1.0,
+              "nullable": true,
+              "type": "integer"
+            },
+            "scheduling": {
+              "description": "How queued queries are chosen to run.",
+              "enum": [
+                "fifo",
+                "fair",
+                "weighted",
+                "weighted_fair",
+                null
+              ],
+              "nullable": true,
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "default": {
+          "default": false,
+          "description": "The class that queries land in when nothing selects another one.",
+          "type": "boolean"
+        },
+        "displayName": {
+          "maxLength": 100,
+          "nullable": true,
+          "type": "string"
+        },
+        "grants": {
+          "default": [],
+          "items": {
+            "description": "A group that may send queries into a warehouse (the compute verb `use`).",
+            "properties": {
+              "group": {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "group"
+            ],
+            "type": "object"
+          },
+          "maxItems": 50,
+          "type": "array"
+        },
+        "lakehouseRef": {
+          "description": "The `Lakehouse` that hosts a catalog or a warehouse.",
+          "properties": {
+            "name": {
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "type": "object"
+        },
+        "size": {
+          "default": "small",
+          "description": "The platform's compute classes. A class is a name for four numbers (running, queued, memory\nshare, scheduling), not a promise about hardware: the query engine has resource groups, not\nseparate clusters (internal note `design/multitenant-catalogs.md` §4.3).",
+          "enum": [
+            "xs",
+            "small",
+            "medium",
+            "large"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "lakehouseRef"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "each group may appear once in grants",
+          "rule": "self.grants.all(g, self.grants.exists_one(h, h.group == g.group))"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "engine": {
+          "description": "Which engine implements the class, for example `trino@default`.",
+          "nullable": true,
+          "type": "string"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "type": "string"
+        },
+        "renderedGroup": {
+          "description": "The resource group actually written.",
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "SqlWarehouse",
+  "type": "object"
+}

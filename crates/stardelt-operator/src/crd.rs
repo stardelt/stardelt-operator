@@ -1536,6 +1536,166 @@ pub struct CatalogDomainStatus {
     pub observed_generation: Option<i64>,
 }
 
+/// The platform's compute classes. A class is a name for four numbers (running, queued, memory
+/// share, scheduling), not a promise about hardware: the query engine has resource groups, not
+/// separate clusters (internal note `design/multitenant-catalogs.md` §4.3).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WarehouseSize {
+    Xs,
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+/// How queued queries are chosen to run.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WarehouseScheduling {
+    Fifo,
+    Fair,
+    Weighted,
+    WeightedFair,
+}
+
+/// Overrides of the class defaults. An absent field keeps the class value.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
+pub struct WarehouseConcurrency {
+    /// Queries that run at the same time (the resource group's hard concurrency limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 100))]
+    pub running: Option<i32>,
+    /// Queries that may wait (the resource group's queue limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 10000))]
+    pub queued: Option<i32>,
+    /// Share of the engine's memory the class may use, for example `40%`.
+    #[serde(
+        default,
+        rename = "memoryShare",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(regex(pattern = r"^([1-9][0-9]?|100)%$"))]
+    pub memory_share: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<WarehouseScheduling>,
+}
+
+/// A group that may send queries into a warehouse (the compute verb `use`).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct WarehouseGrant {
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub group: String,
+}
+
+/// The query-serving plug: one named compute class inside the engine of a `Lakehouse`, with its size,
+/// its caps and the groups that may use it (decision D21, internal note `design/multitenant-catalogs.md`
+/// §4.3). Exactly one warehouse per `Lakehouse` is the default.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "SqlWarehouse",
+    namespaced,
+    status = "SqlWarehouseStatus",
+    shortname = "wh",
+    doc = "A compute class for SQL: size, caps and the groups that may use it."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.grants.all(g, self.grants.exists_one(h, h.group == g.group))",
+        "message": "each group may appear once in grants"
+    }
+]))]
+pub struct SqlWarehouseSpec {
+    #[serde(rename = "lakehouseRef")]
+    pub lakehouse_ref: LakehouseRef,
+    #[serde(
+        default,
+        rename = "displayName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(max = 100))]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub size: WarehouseSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<WarehouseConcurrency>,
+    #[serde(default)]
+    #[schemars(length(max = 50))]
+    pub grants: Vec<WarehouseGrant>,
+    /// The class that queries land in when nothing selects another one.
+    #[serde(default)]
+    pub default: bool,
+}
+
+impl SqlWarehouseSpec {
+    /// The rules the schema enforces, repeated for the controller and the tests, plus the name: it
+    /// becomes the resource group (1 to 40 lower-case letters, digits and dashes, starting with a letter).
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !name_ok {
+            return Err(format!(
+                "warehouse name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for grant in &self.grants {
+            if !seen.insert(grant.group.as_str()) {
+                return Err(format!("group `{}` appears twice in grants", grant.group));
+            }
+        }
+        if let Some(c) = &self.concurrency {
+            if let Some(n) = c.running
+                && !(1..=100).contains(&n)
+            {
+                return Err("concurrency.running must be between 1 and 100".to_string());
+            }
+            if let Some(n) = c.queued
+                && !(0..=10000).contains(&n)
+            {
+                return Err("concurrency.queued must be between 0 and 10000".to_string());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct SqlWarehouseStatus {
+    #[serde(default)]
+    pub phase: String,
+    /// The resource group actually written.
+    #[serde(
+        default,
+        rename = "renderedGroup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub rendered_group: Option<String>,
+    /// Which engine implements the class, for example `trino@default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct ComponentStatus {
     pub name: String,
@@ -2648,5 +2808,73 @@ mod tests {
             !yaml.contains("secretKey:") && !yaml.contains("password"),
             "no field holds a credential"
         );
+    }
+
+    fn warehouse(spec: serde_json::Value) -> SqlWarehouse {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "SqlWarehouse",
+            "metadata": { "name": "big", "namespace": "stardelt" },
+            "spec": spec
+        }))
+        .expect("deserialize SqlWarehouse")
+    }
+
+    #[test]
+    fn a_warehouse_defaults_to_a_small_class_that_is_not_the_default_one() {
+        let w = warehouse(serde_json::json!({ "lakehouseRef": { "name": "default" } }));
+        assert_eq!(w.spec.size, WarehouseSize::Small);
+        assert!(!w.spec.default);
+        assert!(w.spec.grants.is_empty() && w.spec.concurrency.is_none());
+        assert!(w.spec.validate("big").is_ok());
+    }
+
+    #[test]
+    fn a_warehouse_parses_overrides_grants_and_scheduling_names() {
+        let w = warehouse(serde_json::json!({
+            "lakehouseRef": { "name": "default" }, "displayName": "Large (analytics)", "size": "large", "default": true,
+            "concurrency": { "running": 4, "queued": 20, "memoryShare": "40%", "scheduling": "weighted_fair" },
+            "grants": [ { "group": "stardelt-analytics" }, { "group": "stardelt-admins" } ]
+        }));
+        assert_eq!(w.spec.size, WarehouseSize::Large);
+        let c = w.spec.concurrency.as_ref().unwrap();
+        assert_eq!((c.running, c.queued), (Some(4), Some(20)));
+        assert_eq!(c.scheduling, Some(WarehouseScheduling::WeightedFair));
+        assert_eq!(c.memory_share.as_deref(), Some("40%"));
+        assert!(w.spec.default && w.spec.grants.len() == 2);
+        assert!(w.spec.validate("big").is_ok());
+    }
+
+    #[test]
+    fn names_duplicate_groups_and_out_of_range_caps_are_refused() {
+        let base = warehouse(serde_json::json!({ "lakehouseRef": { "name": "default" } })).spec;
+        for name in ["", "Big", "1big", "big_", "big-", &"a".repeat(41)] {
+            assert!(base.validate(name).is_err(), "{name}");
+        }
+        let twice = warehouse(serde_json::json!({
+            "lakehouseRef": { "name": "default" }, "grants": [ { "group": "g" }, { "group": "g" } ]
+        }));
+        assert!(twice.spec.validate("big").unwrap_err().contains("twice"));
+        for (running, queued) in [(0, 1), (101, 1), (1, -1), (1, 10001)] {
+            let w = warehouse(serde_json::json!({
+                "lakehouseRef": { "name": "default" }, "concurrency": { "running": running, "queued": queued }
+            }));
+            assert!(w.spec.validate("big").is_err(), "{running}/{queued}");
+        }
+    }
+
+    #[test]
+    fn unknown_sizes_and_scheduling_names_do_not_parse() {
+        for spec in [
+            serde_json::json!({ "lakehouseRef": { "name": "d" }, "size": "2x-small" }),
+            serde_json::json!({ "lakehouseRef": { "name": "d" }, "concurrency": { "scheduling": "round-robin" } }),
+        ] {
+            assert!(serde_json::from_value::<SqlWarehouseSpec>(spec).is_err());
+        }
+        let crd = SqlWarehouse::crd();
+        assert_eq!(crd.spec.names.plural, "sqlwarehouses");
+        let yaml = serde_yaml::to_string(&crd).unwrap();
+        assert!(yaml.contains("each group may appear once in grants"));
+        assert!(yaml.contains("weighted_fair"));
     }
 }
