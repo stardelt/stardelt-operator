@@ -181,6 +181,7 @@ mod tests {
             dry_run: true,
             component_values: Default::default(),
             adopt: false,
+            deletion_policy: Default::default(),
         }
     }
 

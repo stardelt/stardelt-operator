@@ -38,6 +38,13 @@ spec:
                     - polaris
                     type: string
                 type: object
+              deletionPolicy:
+                default: Retain
+                description: What happens to the data when this resource is deleted (decision D18). Defaults to Retain.
+                enum:
+                - Retain
+                - Delete
+                type: string
               dryRun:
                 default: true
                 description: Plan only (no cluster changes) until explicitly disabled.  Safe default.

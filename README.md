@@ -80,6 +80,7 @@ spec:
   catalog:  { implementation: lakekeeper }   # lakekeeper | polaris
   storage:  { implementation: seaweedfs }    # seaweedfs | byoS3
   profile: demo                              # demo | full | airgap
+  deletionPolicy: Retain                     # Retain (default) | Delete — what a delete does to the data (D18)
 ```
 
 A `Lakehouse` also installs Trino with the `warehouse` Iceberg catalog pre-wired: it points at
