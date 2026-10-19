@@ -342,12 +342,14 @@ pub struct IngestionSourceStatus {
     pub observed_generation: Option<i64>,
 }
 
-/// What a pipeline step does — the step contract behind `Pipeline`
-/// (master spec §5, plugs 6, 7 and 12).
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+/// What a pipeline task does — the task contract behind `Pipeline`
+/// (master spec §5, plugs 6, 7 and 12). `sql` is the first kind the platform
+/// runs (scheduled jobs phase J0); the others are accepted so manifests can be
+/// written ahead of their runtimes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum StepKind {
-    /// SQL transform, executed by the pipeline's engine.
+pub enum TaskKind {
+    /// SQL statement, run through the query engine as the run-as principal.
     Sql,
     /// Python transform.
     Python,
@@ -357,12 +359,29 @@ pub enum StepKind {
     Quality,
 }
 
-/// One step of a `Pipeline`. Steps run in declaration order.
+/// One task of a `Pipeline`. A task starts when every task in `dependsOn` has succeeded.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
-pub struct PipelineStep {
+pub struct PipelineTask {
+    /// Unique within the pipeline; becomes the task id in the engine.
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    )]
     pub name: String,
-    pub kind: StepKind,
-    /// Step-specific parameters (model path, SQL file, gate threshold, …).
+    pub kind: TaskKind,
+    /// Names of the tasks that must succeed first.
+    #[serde(default, rename = "dependsOn", skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 8))]
+    pub depends_on: Vec<String>,
+    /// The statement of a `sql` task. `${run.date}`, `${run.id}` and
+    /// `${params.<name>}` are expanded when the task runs, not in the resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 100000))]
+    pub sql: Option<String>,
+    /// Warehouse that runs a `sql` task; absent means the default warehouse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warehouse: Option<String>,
+    /// Task-specific parameters of the other kinds (model path, gate threshold, …).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config: BTreeMap<String, String>,
 }
@@ -378,7 +397,41 @@ pub enum PipelineEngine {
     Spark,
 }
 
-/// A transform pipeline: an ordered list of steps, run by one engine.
+/// When a pipeline runs by itself.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct PipelineSchedule {
+    /// Five-field cron expression, for example `0 3 * * *`.
+    #[schemars(length(min = 9, max = 100))]
+    pub cron: String,
+    /// IANA time zone name, for example `Europe/Berlin`. Absent means UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+/// Retry policy applied to every task.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct PipelineRetries {
+    /// Extra attempts after the first failure.
+    #[schemars(range(min = 0, max = 10))]
+    pub attempts: i32,
+    /// Wait between attempts, for example `5m`. Absent means one minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff: Option<String>,
+}
+
+/// What happens when a run is due while the previous one is still running.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+pub enum PipelineConcurrency {
+    /// Start the new run next to the old one.
+    Allow,
+    /// Skip the new run.
+    #[default]
+    Forbid,
+    /// Stop the old run and start the new one.
+    Replace,
+}
+
+/// A pipeline: tasks with dependencies, an optional schedule, run by one engine.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
     group = "stardelt.io",
@@ -387,17 +440,100 @@ pub enum PipelineEngine {
     namespaced,
     status = "PipelineStatus",
     shortname = "pipe",
-    doc = "A transform pipeline: ordered sql/python/dbt/quality steps on one engine."
+    doc = "A pipeline: tasks with dependencies and an optional schedule, run on one engine."
 )]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.tasks.all(t, self.tasks.exists_one(u, u.name == t.name))",
+        "message": "task names must be unique"
+    },
+    {
+        "rule": "self.tasks.all(t, !has(t.dependsOn) || t.dependsOn.all(d, d != t.name && self.tasks.exists(u, u.name == d)))",
+        "message": "dependsOn must name other tasks of this pipeline"
+    },
+    {
+        "rule": "self.tasks.all(t, t.kind != 'sql' || has(t.sql))",
+        "message": "a sql task needs a sql statement"
+    }
+]))]
 pub struct PipelineSpec {
-    /// Steps in apply order; must not be empty.
-    #[schemars(length(min = 1))]
-    pub steps: Vec<PipelineStep>,
-    /// Optional cron schedule; a pipeline without a schedule is run on demand.
+    /// Tasks of the pipeline; at least one, at most 30.
+    #[schemars(length(min = 1, max = 30))]
+    pub tasks: Vec<PipelineTask>,
+    /// Optional schedule; a pipeline without one runs on demand only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<String>,
+    pub schedule: Option<PipelineSchedule>,
+    /// Service principal the tasks run as. Absent means the platform's default pipeline principal.
+    #[serde(default, rename = "runAs", skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
+    /// Values for `${params.<name>}` in task statements.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<PipelineRetries>,
+    /// Longest a whole run may take, for example `2h`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    #[serde(default)]
+    pub concurrency: PipelineConcurrency,
     #[serde(default)]
     pub engine: PipelineEngine,
+}
+
+impl PipelineSpec {
+    /// The rules the schema's CEL validations also enforce, plus the one they cannot
+    /// express (no dependency cycles), in one place for the controller and the tests.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut names = std::collections::BTreeSet::new();
+        for task in &self.tasks {
+            if !names.insert(task.name.as_str()) {
+                return Err(format!("task name `{}` is used twice", task.name));
+            }
+            if task.kind == TaskKind::Sql && task.sql.is_none() {
+                return Err(format!("sql task `{}` needs a sql statement", task.name));
+            }
+        }
+        for task in &self.tasks {
+            for dep in &task.depends_on {
+                if dep == &task.name || !names.contains(dep.as_str()) {
+                    return Err(format!(
+                        "task `{}` depends on `{dep}`, which is not another task of this pipeline",
+                        task.name
+                    ));
+                }
+            }
+        }
+        // Kahn's algorithm: whatever cannot be ordered lies on or behind a cycle.
+        let mut waiting: std::collections::BTreeMap<&str, usize> = self
+            .tasks
+            .iter()
+            .map(|t| (t.name.as_str(), t.depends_on.len()))
+            .collect();
+        let mut ready: Vec<&str> = waiting
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(name, _)| *name)
+            .collect();
+        let mut done = 0;
+        while let Some(name) = ready.pop() {
+            done += 1;
+            for task in self
+                .tasks
+                .iter()
+                .filter(|t| t.depends_on.iter().any(|d| d == name))
+            {
+                let n = waiting.get_mut(task.name.as_str()).expect("known task");
+                *n -= 1;
+                if *n == 0 {
+                    ready.push(task.name.as_str());
+                }
+            }
+        }
+        if done != self.tasks.len() {
+            return Err("the tasks depend on each other in a circle".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Last-known run of a pipeline. Intentionally minimal: the authoritative history
@@ -596,6 +732,30 @@ mod tests {
         assert!(err.is_err(), "unknown domains must not silently default");
     }
 
+    fn task(name: &str, kind: TaskKind, depends_on: &[&str]) -> PipelineTask {
+        PipelineTask {
+            name: name.into(),
+            kind,
+            depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
+            sql: (kind == TaskKind::Sql).then(|| "SELECT 1".to_string()),
+            warehouse: None,
+            config: BTreeMap::new(),
+        }
+    }
+
+    fn spec_of(tasks: Vec<PipelineTask>) -> PipelineSpec {
+        PipelineSpec {
+            tasks,
+            schedule: None,
+            run_as: None,
+            params: BTreeMap::new(),
+            retries: None,
+            timeout: None,
+            concurrency: PipelineConcurrency::default(),
+            engine: PipelineEngine::default(),
+        }
+    }
+
     #[test]
     fn pipeline_defaults_to_airflow_unless_stated() {
         let p: Pipeline = serde_json::from_value(serde_json::json!({
@@ -603,41 +763,97 @@ mod tests {
             "kind": "Pipeline",
             "metadata": { "name": "daily", "namespace": "stardelt" },
             "spec": {
-                "steps": [
-                    { "name": "load", "kind": "sql" },
-                    { "name": "assert", "kind": "quality", "config": { "gate": "warn" } }
+                "tasks": [
+                    { "name": "load", "kind": "sql", "sql": "SELECT 1" },
+                    { "name": "assert", "kind": "quality", "dependsOn": ["load"], "config": { "gate": "warn" } }
                 ]
             }
         }))
         .expect("deserialize Pipeline");
         assert_eq!(p.spec.engine, PipelineEngine::Airflow);
         assert_eq!(p.spec.schedule, None);
-        assert_eq!(p.spec.steps.len(), 2);
-        assert_eq!(p.spec.steps[0].kind, StepKind::Sql);
-        assert!(p.spec.steps[0].config.is_empty());
-        assert_eq!(p.spec.steps[1].kind, StepKind::Quality);
+        assert_eq!(p.spec.concurrency, PipelineConcurrency::Forbid);
+        assert_eq!(p.spec.tasks.len(), 2);
+        assert_eq!(p.spec.tasks[0].kind, TaskKind::Sql);
+        assert!(p.spec.tasks[0].config.is_empty() && p.spec.tasks[0].depends_on.is_empty());
+        assert_eq!(p.spec.tasks[1].kind, TaskKind::Quality);
+        assert_eq!(p.spec.tasks[1].depends_on, ["load"]);
         assert_eq!(
-            p.spec.steps[1].config.get("gate").map(String::as_str),
+            p.spec.tasks[1].config.get("gate").map(String::as_str),
             Some("warn")
         );
+        assert_eq!(p.spec.validate(), Ok(()));
     }
 
     #[test]
-    fn pipeline_explicit_spark_spec_round_trips() {
+    fn pipeline_full_spec_round_trips() {
         let spec = serde_json::json!({
-            "steps": [
-                { "name": "build", "kind": "dbt", "config": { "selector": "tag:nightly" } },
-                { "name": "enrich", "kind": "python" }
+            "tasks": [
+                { "name": "load", "kind": "sql", "sql": "INSERT INTO t SELECT 1", "warehouse": "default" },
+                { "name": "build", "kind": "dbt", "dependsOn": ["load"], "config": { "selector": "tag:nightly" } }
             ],
-            "schedule": "0 3 * * *",
+            "schedule": { "cron": "0 3 * * *", "timezone": "Europe/Berlin" },
+            "runAs": "pipeline-analytics",
+            "params": { "days": "1" },
+            "retries": { "attempts": 2, "backoff": "5m" },
+            "timeout": "2h",
+            "concurrency": "Replace",
             "engine": "spark"
         });
         let parsed: PipelineSpec =
             serde_json::from_value(spec.clone()).expect("deserialize PipelineSpec");
         assert_eq!(parsed.engine, PipelineEngine::Spark);
-        assert_eq!(parsed.steps[0].kind, StepKind::Dbt);
-        assert_eq!(parsed.steps[1].kind, StepKind::Python);
+        assert_eq!(parsed.concurrency, PipelineConcurrency::Replace);
+        assert_eq!(parsed.run_as.as_deref(), Some("pipeline-analytics"));
+        assert_eq!(parsed.tasks[1].kind, TaskKind::Dbt);
         assert_eq!(serde_json::to_value(&parsed).expect("serialize"), spec);
+    }
+
+    #[test]
+    fn validate_accepts_a_diamond_and_rejects_the_broken_shapes() {
+        let diamond = spec_of(vec![
+            task("a", TaskKind::Sql, &[]),
+            task("b", TaskKind::Sql, &["a"]),
+            task("c", TaskKind::Sql, &["a"]),
+            task("d", TaskKind::Quality, &["b", "c"]),
+        ]);
+        assert_eq!(diamond.validate(), Ok(()));
+
+        let twice = spec_of(vec![
+            task("a", TaskKind::Sql, &[]),
+            task("a", TaskKind::Sql, &[]),
+        ]);
+        assert!(twice.validate().unwrap_err().contains("used twice"));
+
+        let unknown = spec_of(vec![task("a", TaskKind::Sql, &["ghost"])]);
+        assert!(unknown.validate().unwrap_err().contains("ghost"));
+
+        let itself = spec_of(vec![task("a", TaskKind::Sql, &["a"])]);
+        assert!(itself.validate().is_err());
+
+        let circle = spec_of(vec![
+            task("a", TaskKind::Sql, &["c"]),
+            task("b", TaskKind::Sql, &["a"]),
+            task("c", TaskKind::Sql, &["b"]),
+        ]);
+        assert!(circle.validate().unwrap_err().contains("circle"));
+
+        let mut no_sql = task("a", TaskKind::Sql, &[]);
+        no_sql.sql = None;
+        assert!(
+            spec_of(vec![no_sql])
+                .validate()
+                .unwrap_err()
+                .contains("needs a sql")
+        );
+    }
+
+    #[test]
+    fn the_generated_schema_carries_the_cel_rules() {
+        let crd = serde_json::to_string(&Pipeline::crd()).expect("serialize CRD");
+        assert!(crd.contains("x-kubernetes-validations"));
+        assert!(crd.contains("task names must be unique"));
+        assert!(crd.contains("a sql task needs a sql statement"));
     }
 
     #[test]

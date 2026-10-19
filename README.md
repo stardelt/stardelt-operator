@@ -135,13 +135,22 @@ metadata:
   namespace: stardelt
 spec:
   engine: airflow        # airflow (default) → airflow | spark → spark-operator
-  schedule: "0 3 * * *"  # optional; without it the pipeline runs on demand
-  steps:
+  schedule:              # optional; without it the pipeline runs on demand
+    cron: "0 3 * * *"
+    timezone: Europe/Berlin
+  runAs: pipeline-analytics   # service principal the tasks run as (optional)
+  retries: { attempts: 2, backoff: 5m }
+  tasks:
+    - name: load
+      kind: sql          # sql | python | dbt | quality (dbt also pulls in dbt-core)
+      sql: INSERT INTO warehouse.analytics.trips SELECT * FROM warehouse.raw.trips
     - name: build
-      kind: dbt          # sql | python | dbt | quality (also pulls in dbt-core)
+      kind: dbt
+      dependsOn: [load]  # a task starts when these have succeeded; no circles
       config: { selector: "tag:nightly" }
     - name: assert
       kind: quality
+      dependsOn: [build]
       config: { gate: "warn" }
 ```
 

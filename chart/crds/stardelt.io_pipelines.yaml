@@ -15,11 +15,19 @@ spec:
   - name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: 'A transform pipeline: ordered sql/python/dbt/quality steps on one engine.'
+        description: 'A pipeline: tasks with dependencies and an optional schedule, run on one engine.'
         properties:
           spec:
-            description: 'A transform pipeline: an ordered list of steps, run by one engine.'
+            description: 'A pipeline: tasks with dependencies, an optional schedule, run by one engine.'
             properties:
+              concurrency:
+                default: Forbid
+                description: What happens when a run is due while the previous one is still running.
+                enum:
+                - Allow
+                - Forbid
+                - Replace
+                type: string
               engine:
                 default: airflow
                 description: Engine that orchestrates (and for `spark`, executes) the pipeline.
@@ -27,24 +35,70 @@ spec:
                 - airflow
                 - spark
                 type: string
-              schedule:
-                description: Optional cron schedule; a pipeline without a schedule is run on demand.
+              params:
+                additionalProperties:
+                  type: string
+                description: Values for `${params.<name>}` in task statements.
+                type: object
+              retries:
+                description: Retry policy applied to every task.
+                nullable: true
+                properties:
+                  attempts:
+                    description: Extra attempts after the first failure.
+                    format: int32
+                    maximum: 10.0
+                    minimum: 0.0
+                    type: integer
+                  backoff:
+                    description: Wait between attempts, for example `5m`. Absent means one minute.
+                    nullable: true
+                    type: string
+                required:
+                - attempts
+                type: object
+              runAs:
+                description: Service principal the tasks run as. Absent means the platform's default pipeline principal.
                 nullable: true
                 type: string
-              steps:
-                description: Steps in apply order; must not be empty.
+              schedule:
+                description: Optional schedule; a pipeline without one runs on demand only.
+                nullable: true
+                properties:
+                  cron:
+                    description: Five-field cron expression, for example `0 3 * * *`.
+                    maxLength: 100
+                    minLength: 9
+                    type: string
+                  timezone:
+                    description: IANA time zone name, for example `Europe/Berlin`. Absent means UTC.
+                    nullable: true
+                    type: string
+                required:
+                - cron
+                type: object
+              tasks:
+                description: Tasks of the pipeline; at least one, at most 30.
                 items:
-                  description: One step of a `Pipeline`. Steps run in declaration order.
+                  description: One task of a `Pipeline`. A task starts when every task in `dependsOn` has succeeded.
                   properties:
                     config:
                       additionalProperties:
                         type: string
-                      description: Step-specific parameters (model path, SQL file, gate threshold, …).
+                      description: Task-specific parameters of the other kinds (model path, gate threshold, …).
                       type: object
+                    dependsOn:
+                      description: Names of the tasks that must succeed first.
+                      items:
+                        type: string
+                      maxItems: 8
+                      type: array
                     kind:
                       description: |-
-                        What a pipeline step does — the step contract behind `Pipeline`
-                        (master spec §5, plugs 6, 7 and 12).
+                        What a pipeline task does — the task contract behind `Pipeline`
+                        (master spec §5, plugs 6, 7 and 12). `sql` is the first kind the platform
+                        runs (scheduled jobs phase J0); the others are accepted so manifests can be
+                        written ahead of their runtimes.
                       enum:
                       - sql
                       - python
@@ -52,16 +106,44 @@ spec:
                       - quality
                       type: string
                     name:
+                      description: Unique within the pipeline; becomes the task id in the engine.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+                      type: string
+                    sql:
+                      description: |-
+                        The statement of a `sql` task. `${run.date}`, `${run.id}` and
+                        `${params.<name>}` are expanded when the task runs, not in the resource.
+                      maxLength: 100000
+                      minLength: 1
+                      nullable: true
+                      type: string
+                    warehouse:
+                      description: Warehouse that runs a `sql` task; absent means the default warehouse.
+                      nullable: true
                       type: string
                   required:
                   - kind
                   - name
                   type: object
+                maxItems: 30
                 minItems: 1
                 type: array
+              timeout:
+                description: Longest a whole run may take, for example `2h`.
+                nullable: true
+                type: string
             required:
-            - steps
+            - tasks
             type: object
+            x-kubernetes-validations:
+            - message: task names must be unique
+              rule: self.tasks.all(t, self.tasks.exists_one(u, u.name == t.name))
+            - message: dependsOn must name other tasks of this pipeline
+              rule: self.tasks.all(t, !has(t.dependsOn) || t.dependsOn.all(d, d != t.name && self.tasks.exists(u, u.name == d)))
+            - message: a sql task needs a sql statement
+              rule: self.tasks.all(t, t.kind != 'sql' || has(t.sql))
           status:
             nullable: true
             properties:
