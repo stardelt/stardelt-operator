@@ -1,0 +1,74 @@
+hub:
+  config:
+    GenericOAuthenticator:
+      admin_groups:
+      - stardelt-admins
+      allowed_groups:
+      - stardelt-admins
+      - stardelt-users
+      auth_state_groups_key: oauth_user.groups
+      auto_login: true
+      client_id: jupyterhub
+      login_service: Keycloak
+      manage_groups: true
+      scope:
+      - openid
+      - profile
+      - email
+      username_claim: preferred_username
+    JupyterHub:
+      authenticator_class: generic-oauth
+  extraConfig: {}
+  extraEnv:
+    STARDELT_OIDC_CLIENT_SECRET:
+      valueFrom:
+        secretKeyRef:
+          key: jupyterhub
+          name: stardelt-oidc-clients
+          optional: true
+    STARDELT_OIDC_ISSUER_URL:
+      valueFrom:
+        configMapKeyRef:
+          key: issuerUrl
+          name: stardelt-identity
+          optional: true
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 50m
+      memory: 256Mi
+proxy:
+  chp:
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 50m
+        memory: 128Mi
+  service:
+    type: ClusterIP
+  traefik:
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+      requests:
+        cpu: 50m
+        memory: 128Mi
+singleuser:
+  cpu:
+    guarantee: 0.1
+    limit: 1
+  defaultUrl: /lab
+  image:
+    name: quay.io/jupyter/scipy-notebook
+    tag: 2024-10-07
+  memory:
+    guarantee: 256M
+    limit: 1G
+  startTimeout: 300
+  storage:
+    type: none

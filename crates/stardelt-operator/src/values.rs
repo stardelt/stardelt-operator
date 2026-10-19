@@ -145,65 +145,17 @@ pub fn golden_values(component: &str) -> Value {
         // stardelt-platform/helm-values/jupyterhub.yaml: the hub reads the identity
         // contract (ConfigMap stardelt-identity, Secret stardelt-oidc-clients) of
         // its own namespace. There is no shared-password login.
-        "jupyterhub" => json_obj(&[
-            (
-                "hub",
-                serde_json::json!({
-                    "config": {
-                        "JupyterHub": { "authenticator_class": "generic-oauth" },
-                        "GenericOAuthenticator": {
-                            "client_id": "jupyterhub",
-                            "login_service": "Keycloak",
-                            "auto_login": true,
-                            "username_claim": "preferred_username",
-                            "scope": ["openid", "profile", "email"],
-                            "manage_groups": true,
-                            "auth_state_groups_key": "oauth_user.groups",
-                            "allowed_groups": ["stardelt-admins", "stardelt-users"],
-                            "admin_groups": ["stardelt-admins"]
-                        }
-                    },
-                    "extraEnv": {
-                        "STARDELT_OIDC_ISSUER_URL": { "valueFrom": { "configMapKeyRef": { "name": "stardelt-identity", "key": "issuerUrl", "optional": true } } },
-                        "STARDELT_OIDC_CLIENT_SECRET": { "valueFrom": { "secretKeyRef": { "name": "stardelt-oidc-clients", "key": "jupyterhub", "optional": true } } }
-                    },
-                    "extraConfig": { "10-oidc": include_str!("jupyterhub_oidc.py") },
-                    "resources": {
-                        "requests": { "cpu": "50m", "memory": "256Mi" },
-                        "limits": { "cpu": "500m", "memory": "512Mi" }
-                    }
-                }),
-            ),
-            (
-                "proxy",
-                serde_json::json!({
-                    "service": { "type": "ClusterIP" },
-                    "chp": {
-                        "resources": {
-                            "requests": { "cpu": "50m", "memory": "128Mi" },
-                            "limits": { "cpu": "500m", "memory": "256Mi" }
-                        }
-                    },
-                    "traefik": {
-                        "resources": {
-                            "requests": { "cpu": "50m", "memory": "128Mi" },
-                            "limits": { "cpu": "500m", "memory": "256Mi" }
-                        }
-                    }
-                }),
-            ),
-            (
-                "singleuser",
-                serde_json::json!({
-                    "image": { "name": "quay.io/jupyter/scipy-notebook", "tag": "2024-10-07" },
-                    "defaultUrl": "/lab",
-                    "startTimeout": 300,
-                    "memory": { "limit": "1G", "guarantee": "256M" },
-                    "cpu": { "limit": 1, "guarantee": 0.1 },
-                    "storage": { "type": "none" }
-                }),
-            ),
-        ]),
+        //
+        // The curated values live in `values/jupyterhub.yaml` (wave 4, #101); the
+        // only code-built part is the OIDC snippet, which the file deliberately
+        // omits and this arm injects.
+        "jupyterhub" => {
+            let mut values: Value = serde_yaml::from_str(include_str!("../values/jupyterhub.yaml"))
+                .expect("values/jupyterhub.yaml is not valid YAML");
+            values["hub"]["extraConfig"]["10-oidc"] =
+                Value::String(include_str!("jupyterhub_oidc.py").into());
+            values
+        }
         // The data must outlive the pod: emptyDir/hostPath wipe on restart and
         // orphan the Iceberg metadata pointing at the files. The S3 endpoint is
         // what the catalog and engines talk to, so it is on by default.
@@ -522,6 +474,38 @@ mod tests {
             hub["extraEnv"]["STARDELT_OIDC_CLIENT_SECRET"]["valueFrom"]["secretKeyRef"]["name"],
             serde_json::json!("stardelt-oidc-clients")
         );
+    }
+
+    #[test]
+    fn jupyterhub_golden_values_come_from_the_yaml_file() {
+        let file: Value = serde_yaml::from_str(include_str!("../values/jupyterhub.yaml"))
+            .expect("values/jupyterhub.yaml is valid YAML");
+        assert!(file.is_object(), "the values file is a mapping");
+        assert!(
+            file["hub"]["extraConfig"].get("10-oidc").is_none(),
+            "the OIDC snippet is injected in code, not stored in the file"
+        );
+
+        let oidc = include_str!("jupyterhub_oidc.py");
+        let golden = golden_values("jupyterhub");
+        assert_eq!(
+            golden["hub"]["extraConfig"]["10-oidc"],
+            Value::String(oidc.into())
+        );
+
+        // The file is the whole of the curation: everything the operator applies
+        // is the file plus the one injected snippet.
+        let mut expected = file;
+        expected["hub"]["extraConfig"]["10-oidc"] = Value::String(oidc.into());
+        assert_eq!(golden, expected);
+    }
+
+    #[test]
+    fn jupyterhub_golden_values_round_trip_through_yaml() {
+        let values = golden_values("jupyterhub");
+        let document = serde_yaml::to_string(&values).expect("golden values serialize as YAML");
+        let parsed: Value = serde_yaml::from_str(&document).expect("serialized values parse back");
+        assert_eq!(parsed, values);
     }
 
     #[test]
