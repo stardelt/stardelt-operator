@@ -52,7 +52,9 @@ pub fn issuer_url(spec: &PlatformInstanceSpec) -> Result<Option<String>, Identit
     }
 }
 
-fn base_domain(spec: &PlatformInstanceSpec) -> Result<&str, IdentityError> {
+/// The base domain of the instance, or the reason it cannot be used. `keycloak.rs` renders the
+/// realm hosts and `KC_HOSTNAME` from the same value.
+pub(crate) fn base_domain(spec: &PlatformInstanceSpec) -> Result<&str, IdentityError> {
     spec.base_domain
         .as_deref()
         .ok_or_else(|| IdentityError("identity needs baseDomain".into()))
