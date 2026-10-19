@@ -9,7 +9,7 @@ use k8s_openapi::{
     api::{
         batch::v1::{Job, JobSpec},
         core::v1::{
-            Capabilities, Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec,
+            Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec,
             SeccompProfile, Secret, SecretKeySelector, SecurityContext,
         },
     },
@@ -30,6 +30,10 @@ pub const CATALOG_CLUSTER: &str = "lakekeeper-pg";
 pub const DEFAULT_BUCKET: &str = "lakehouse";
 /// Bootstrap script (accept terms, create the warehouse, refresh its credential).
 pub const BOOTSTRAP_SCRIPT: &str = include_str!("lakekeeper_bootstrap.sh");
+
+/// Name of the Iceberg warehouse in the catalog and of the Trino catalog in front of it.
+/// `lakekeeper_bootstrap.sh` and `values.rs` (`WAREHOUSE_CATALOG`) hard-code the same word.
+pub const WAREHOUSE: &str = "warehouse";
 
 /// A generated S3 key pair.
 #[derive(Clone, PartialEq, Eq)]
@@ -136,6 +140,59 @@ pub fn catalog_cluster(lakehouse: &str, namespace: &str, profile: Profile) -> Dy
                 "limits": {"cpu": "1", "memory": "512Mi"},
             },
         }}),
+    }
+}
+
+/// Where the object store of a Lakehouse is, as recorded in Secret `stardelt-s3-creds`
+/// (written by the operator for `seaweedfs`, by the user for `byoS3`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3Location {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+}
+
+/// Name of the discovery ConfigMap of a Lakehouse.
+pub fn discovery_config_map_name(lakehouse: &str) -> String {
+    format!("{lakehouse}-discovery")
+}
+
+/// `<lakehouse>-discovery`: the connection contract of a Lakehouse. Consumers (notebooks,
+/// jobs, dashboards, external tools) read these keys instead of hard-coding hostnames.
+/// The URLs are fully qualified, so they resolve from any namespace. No credentials:
+/// those stay in Secret `stardelt-s3-creds`.
+pub fn discovery_config_map(
+    lakehouse: &str,
+    namespace: &str,
+    s3: &S3Location,
+    owner: OwnerReference,
+) -> ConfigMap {
+    let mut metadata = meta(
+        &discovery_config_map_name(lakehouse),
+        namespace,
+        lakehouse,
+        "discovery",
+    );
+    metadata.owner_references = Some(vec![owner]);
+    ConfigMap {
+        metadata,
+        data: string_data(&[
+            ("lakehouse", lakehouse.to_string()),
+            (
+                "catalogUri",
+                format!("http://lakekeeper.{namespace}.svc.cluster.local:8181/catalog"),
+            ),
+            ("warehouse", WAREHOUSE.to_string()),
+            ("s3Endpoint", s3.endpoint.clone()),
+            ("s3Bucket", s3.bucket.clone()),
+            ("s3Region", s3.region.clone()),
+            (
+                "trinoUrl",
+                format!("http://trino.{namespace}.svc.cluster.local:8080"),
+            ),
+            ("trinoCatalog", WAREHOUSE.to_string()),
+        ]),
+        ..Default::default()
     }
 }
 
@@ -315,5 +372,61 @@ mod tests {
         );
         assert!(c.args.as_ref().unwrap()[0].contains("storage-credential"));
         assert_eq!(job.metadata.owner_references.unwrap()[0].name, "main");
+    }
+
+    fn location() -> S3Location {
+        S3Location {
+            endpoint: "http://seaweedfs-s3.data.svc.cluster.local:8333".into(),
+            bucket: "lakehouse".into(),
+            region: "us-east-1".into(),
+        }
+    }
+
+    #[test]
+    fn discovery_config_map_publishes_the_connection_keys() {
+        let owner = OwnerReference {
+            name: "main".into(),
+            ..Default::default()
+        };
+        let cm = discovery_config_map("main", "data", &location(), owner);
+        assert_eq!(cm.metadata.name.as_deref(), Some("main-discovery"));
+        assert_eq!(cm.metadata.namespace.as_deref(), Some("data"));
+        let labels = cm.metadata.labels.as_ref().unwrap();
+        assert_eq!(labels["stardelt.io/lakehouse"], "main");
+        assert_eq!(labels["stardelt.io/component"], "discovery");
+        assert_eq!(cm.metadata.owner_references.unwrap()[0].name, "main");
+        let data = cm.data.unwrap();
+        let expected = [
+            ("lakehouse", "main"),
+            (
+                "catalogUri",
+                "http://lakekeeper.data.svc.cluster.local:8181/catalog",
+            ),
+            ("warehouse", "warehouse"),
+            (
+                "s3Endpoint",
+                "http://seaweedfs-s3.data.svc.cluster.local:8333",
+            ),
+            ("s3Bucket", "lakehouse"),
+            ("s3Region", "us-east-1"),
+            ("trinoUrl", "http://trino.data.svc.cluster.local:8080"),
+            ("trinoCatalog", "warehouse"),
+        ];
+        assert_eq!(data.len(), expected.len(), "unexpected keys: {data:?}");
+        for (key, value) in expected {
+            assert_eq!(data[key], value, "key {key}");
+        }
+    }
+
+    #[test]
+    fn discovery_config_map_holds_no_credential() {
+        let cm = discovery_config_map("main", "data", &location(), OwnerReference::default());
+        for key in cm.data.unwrap().keys() {
+            let key = key.to_lowercase();
+            assert!(
+                !key.contains("secret") && !key.contains("accesskey"),
+                "{key}"
+            );
+        }
     }
 }
