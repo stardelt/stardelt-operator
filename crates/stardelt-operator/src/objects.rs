@@ -90,6 +90,14 @@ pub fn cnpg_cluster_resource() -> ApiResource {
     )
 }
 
+/// The CloudNative-PG ScheduledBackup resource (`scheduledbackups.postgresql.cnpg.io/v1`).
+pub fn cnpg_scheduled_backup_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("postgresql.cnpg.io", "v1", "ScheduledBackup"),
+        "scheduledbackups",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,6 +116,15 @@ mod tests {
         assert_eq!(
             (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
             ("postgresql.cnpg.io", "v1", "clusters")
+        );
+    }
+
+    #[test]
+    fn scheduled_backup_resource_points_at_cnpg() {
+        let r = cnpg_scheduled_backup_resource();
+        assert_eq!(
+            (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
+            ("postgresql.cnpg.io", "v1", "scheduledbackups")
         );
     }
 

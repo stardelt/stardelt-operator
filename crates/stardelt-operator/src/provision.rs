@@ -15,11 +15,15 @@ use crate::{
     controller::Context,
     crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
     identity,
-    objects::{apply, apply_dynamic, cnpg_cluster_resource, owner_reference},
+    objects::{
+        apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
+        owner_reference,
+    },
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, S3_CONFIG_SECRET, S3_SECRET, S3Keys, S3Location,
         bootstrap_job, bootstrap_job_name, catalog_cluster, discovery_config_map,
-        discovery_config_map_name, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
+        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, s3_creds_secret,
+        s3_endpoint, seaweedfs_config_secret,
     },
 };
 
@@ -296,6 +300,68 @@ pub async fn ensure_discovery(
     }
 }
 
+/// The CloudNative-PG `Cluster` of Keycloak plus its daily base backup, for
+/// `identity.mode: platform`. `None` in the other modes: without Keycloak there is no
+/// identity database to keep. A missing CNPG operator is reported like
+/// [`ensure_catalog_database`] does.
+pub async fn ensure_keycloak_pg(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "keycloak-pg";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let cluster = keycloak_pg_cluster(namespace);
+    let applied = match apply_dynamic(
+        &ctx.client,
+        namespace,
+        &cnpg_cluster_resource(),
+        &cluster,
+        spec.dry_run,
+    )
+    .await
+    {
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            return Some(status(
+                NAME,
+                false,
+                "CloudNative-PG is not installed: create a PlatformInstance first",
+            ));
+        }
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+        Ok(applied) => applied,
+    };
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): Cluster {}", cluster.name_any()),
+        ));
+    }
+    if let Err(e) = apply_dynamic(
+        &ctx.client,
+        namespace,
+        &cnpg_scheduled_backup_resource(),
+        &keycloak_pg_backup(namespace),
+        false,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if cluster_ready(&applied) {
+        Some(status(NAME, true, "database ready"))
+    } else {
+        Some(status(
+            NAME,
+            false,
+            "waiting for the database to become Ready",
+        ))
+    }
+}
+
 /// Publish the identity contract (ConfigMap `stardelt-identity`, decision D20) in the platform
 /// namespace. `None` when sign-in is off: nothing is planned, nothing is applied, and an
 /// existing ConfigMap written by the chart or the scripts is left alone.
@@ -424,6 +490,93 @@ mod tests {
             "spec": { "dryRun": false }
         }))
         .expect("deserialize Lakehouse")
+    }
+
+    fn platform(mode: &str, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "baseDomain": "example.com",
+                "dryRun": dry_run,
+                "identity": { "mode": mode },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
+    #[tokio::test]
+    async fn keycloak_pg_exists_only_for_mode_platform() {
+        for mode in ["none", "external"] {
+            let (client, requests) = mock_client(true);
+            assert!(
+                ensure_keycloak_pg(&context(client), &platform(mode, false))
+                    .await
+                    .is_none(),
+                "{mode}"
+            );
+            assert!(
+                requests.lock().expect("requests poisoned").is_empty(),
+                "{mode} must not touch the cluster"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keycloak_pg_dry_run_plans_only_the_cluster() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_keycloak_pg(&context(client), &platform("platform", true))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Cluster keycloak-pg")
+        );
+        let requests = requests.lock().expect("requests poisoned");
+        let paths: Vec<_> = requests
+            .iter()
+            .filter(|(method, _, _)| method == "PATCH")
+            .map(|(_, path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            ["/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/keycloak-pg"]
+        );
+    }
+
+    #[tokio::test]
+    async fn keycloak_pg_applies_the_cluster_then_the_backup() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_keycloak_pg(&context(client), &platform("platform", false))
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "keycloak-pg");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for the database to become Ready")
+        );
+        let requests = requests.lock().expect("requests poisoned");
+        let patches: Vec<_> = requests
+            .iter()
+            .filter(|(method, _, _)| method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 2, "cluster, then the schedule");
+        assert_eq!(
+            patches[0].1,
+            "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/keycloak-pg"
+        );
+        assert_eq!(
+            patches[1].1,
+            "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/scheduledbackups/keycloak-pg-daily"
+        );
+        let backup: serde_json::Value = serde_json::from_str(&patches[1].2).expect("JSON body");
+        assert_eq!(backup["kind"], "ScheduledBackup");
+        assert_eq!(backup["spec"]["cluster"]["name"], "keycloak-pg");
     }
 
     #[tokio::test]
