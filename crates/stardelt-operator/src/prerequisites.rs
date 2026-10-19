@@ -32,7 +32,7 @@ pub const DEFAULT_BUCKET: &str = "lakehouse";
 pub const BOOTSTRAP_SCRIPT: &str = include_str!("lakekeeper_bootstrap.sh");
 
 /// Name of the Iceberg warehouse in the catalog and of the Trino catalog in front of it.
-/// `lakekeeper_bootstrap.sh` and `values.rs` (`WAREHOUSE_CATALOG`) hard-code the same word.
+/// `lakekeeper_bootstrap.sh` and `values/trino.yaml` hard-code the same word.
 pub const WAREHOUSE: &str = "warehouse";
 
 /// A generated S3 key pair.
