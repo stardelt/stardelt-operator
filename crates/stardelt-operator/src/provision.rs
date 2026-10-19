@@ -5,8 +5,9 @@
 use k8s_openapi::{
     ByteString,
     api::{
+        apps::v1::Deployment,
         batch::v1::Job,
-        core::v1::{ConfigMap, Secret},
+        core::v1::{ConfigMap, Secret, Service},
     },
 };
 use kube::{Api, ResourceExt, core::DynamicObject};
@@ -14,7 +15,7 @@ use kube::{Api, ResourceExt, core::DynamicObject};
 use crate::{
     controller::Context,
     crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
-    identity,
+    identity, keycloak,
     objects::{
         apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
         owner_reference,
@@ -362,6 +363,92 @@ pub async fn ensure_keycloak_pg(
     }
 }
 
+/// Secrets the Keycloak Deployment reads. `keycloak-pg-app` is created by CloudNative-PG,
+/// `keycloak-admin`, `stardelt-realm-admin` and `stardelt-oidc-clients` by the platform's
+/// identity bootstrap (wave 2c-iii creates them from the operator). Without them Keycloak
+/// crashes on boot, so the workload waits instead of applying.
+pub const KEYCLOAK_SECRETS: [&str; 4] = [
+    "keycloak-pg-app",
+    "keycloak-admin",
+    "stardelt-realm-admin",
+    "stardelt-oidc-clients",
+];
+
+/// The Keycloak workload (realm and environment ConfigMaps, Service, Deployment) for
+/// `identity.mode: platform`. `None` in the other modes: without Keycloak nothing serves the
+/// realm. Nothing is applied until every Secret the Deployment reads exists.
+pub async fn ensure_keycloak(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "keycloak";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut missing = Vec::new();
+    for name in KEYCLOAK_SECRETS {
+        match secrets.get_opt(name).await {
+            Ok(Some(_)) => {}
+            Ok(None) => missing.push(name),
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        }
+    }
+    if !missing.is_empty() {
+        return Some(status(
+            NAME,
+            false,
+            format!("waiting for identity secrets: {}", missing.join(", ")),
+        ));
+    }
+    let realm = match keycloak::realm_config_map(spec) {
+        Ok(realm) => realm,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    let env = match keycloak::env_config_map(spec) {
+        Ok(env) => env,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    let deployment = keycloak::deployment(namespace);
+    for config_map in [&realm, &env] {
+        if let Err(e) = apply::<ConfigMap>(&ctx.client, namespace, config_map, spec.dry_run).await {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+    let service = keycloak::service(namespace);
+    if let Err(e) = apply::<Service>(&ctx.client, namespace, &service, spec.dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    let applied = match apply::<Deployment>(&ctx.client, namespace, &deployment, spec.dry_run).await
+    {
+        Ok(applied) => applied,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): Deployment {}", keycloak::NAME),
+        ));
+    }
+    if applied
+        .status
+        .as_ref()
+        .and_then(|s| s.available_replicas)
+        .unwrap_or(0)
+        >= 1
+    {
+        Some(status(NAME, true, "running"))
+    } else {
+        Some(status(
+            NAME,
+            false,
+            "waiting for the Deployment to become ready",
+        ))
+    }
+}
+
 /// Publish the identity contract (ConfigMap `stardelt-identity`, decision D20) in the platform
 /// namespace. `None` when sign-in is off: nothing is planned, nothing is applied, and an
 /// existing ConfigMap written by the chart or the scripts is left alone.
@@ -639,6 +726,179 @@ mod tests {
                 .iter()
                 .all(|(method, _, _)| method == "GET"),
             "nothing may be applied without the Secret"
+        );
+    }
+
+    /// A kube client for the Keycloak workload: `GET secrets/<name>` answers 404 for the names
+    /// in `missing` and a Secret otherwise; a PATCH echoes the applied object, adding
+    /// `status.availableReplicas` to the Deployment when `available_replicas` is set. Every
+    /// request is recorded.
+    fn keycloak_client(
+        missing: &[&str],
+        available_replicas: Option<i32>,
+    ) -> (kube::Client, Recorded) {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let missing: Vec<String> = missing.iter().map(|name| name.to_string()).collect();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let missing = missing.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                let body = String::from_utf8_lossy(&body).to_string();
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    body.clone(),
+                ));
+                let (status, document) = if method == "PATCH" {
+                    match (available_replicas, path.contains("/deployments/")) {
+                        (Some(replicas), true) => {
+                            let mut applied: serde_json::Value =
+                                serde_json::from_str(&body).expect("the applied Deployment");
+                            applied["status"] =
+                                serde_json::json!({ "availableReplicas": replicas });
+                            (200, applied.to_string())
+                        }
+                        _ => (200, body),
+                    }
+                } else if missing.iter().any(|name| path.ends_with(name.as_str())) {
+                    (
+                        404,
+                        r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#.to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        r#"{"apiVersion":"v1","kind":"Secret","metadata":{"name":"present"}}"#
+                            .to_string(),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(document.into_bytes()))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (kube::Client::new(service, "stardelt"), requests)
+    }
+
+    /// The paths of the server-side applies a request log holds, in order.
+    fn applied_paths(requests: &Recorded) -> Vec<String> {
+        requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|(method, _, _)| method == "PATCH")
+            .map(|(_, path, _)| path.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_keycloak_workload_exists_only_for_mode_platform() {
+        for mode in ["none", "external"] {
+            let (client, requests) = keycloak_client(&[], None);
+            assert!(
+                ensure_keycloak(&context(client), &platform(mode, false))
+                    .await
+                    .is_none(),
+                "{mode}"
+            );
+            assert!(
+                requests.lock().expect("requests poisoned").is_empty(),
+                "{mode} must not touch the cluster"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keycloak_waits_for_the_identity_secrets_and_applies_nothing() {
+        let (client, requests) =
+            keycloak_client(&["stardelt-realm-admin", "stardelt-oidc-clients"], None);
+        let status = ensure_keycloak(&context(client), &platform("platform", false))
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "keycloak");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for identity secrets: stardelt-realm-admin, stardelt-oidc-clients")
+        );
+        assert!(
+            applied_paths(&requests).is_empty(),
+            "no ConfigMap, Service or Deployment may be applied without the Secrets"
+        );
+    }
+
+    #[tokio::test]
+    async fn keycloak_dry_run_plans_the_config_maps_the_service_and_the_deployment() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_keycloak(&context(client), &platform("platform", true))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Deployment keycloak")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                "/api/v1/namespaces/stardelt/configmaps/keycloak-realm",
+                "/api/v1/namespaces/stardelt/configmaps/keycloak-env",
+                "/api/v1/namespaces/stardelt/services/keycloak",
+                "/apis/apps/v1/namespaces/stardelt/deployments/keycloak",
+            ]
+            .map(str::to_string)
+        );
+        // A server-side apply carries the type, so the API server validates a real object.
+        let requests = requests.lock().expect("requests poisoned");
+        let deployment = requests
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/deployments/keycloak"))
+            .expect("the Deployment");
+        let body: serde_json::Value = serde_json::from_str(&deployment.2).expect("JSON body");
+        assert_eq!(body["kind"], "Deployment");
+        assert_eq!(
+            body["spec"]["template"]["spec"]["containers"][0]["image"],
+            "quay.io/keycloak/keycloak:26.8.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn keycloak_applies_the_workload_and_reports_it_running() {
+        let (client, requests) = keycloak_client(&[], Some(1));
+        let status = ensure_keycloak(&context(client), &platform("platform", false))
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("running"));
+        assert_eq!(
+            applied_paths(&requests).len(),
+            4,
+            "two ConfigMaps, the Service, then the Deployment"
+        );
+    }
+
+    #[tokio::test]
+    async fn keycloak_waits_for_its_deployment_to_become_ready() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let status = ensure_keycloak(&context(client), &platform("platform", false))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for the Deployment to become ready")
         );
     }
 }
