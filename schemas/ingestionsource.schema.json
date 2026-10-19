@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "An ingestion source: one contract with three domain defaults (saas, enterprise, cdc).",
+  "properties": {
+    "spec": {
+      "description": "An ingestion source: one contract, three domain defaults.\n\nThe source itself is deliberately opaque to the operator. `source` carries the\nconnector's own key/value parameters (host, port, database, topics, tables, …)\nand is read by the plug (SeaTunnel / NiFi / Debezium), not by the reconciler —\nthat keeps the CRD stable while connectors evolve.",
+      "properties": {
+        "domain": {
+          "default": "saas",
+          "description": "Ingestion domain — the deliberate three-way split of the ingestion contract\n(master spec §5, plugs 8–10). One contract, three defaults.",
+          "enum": [
+            "saas",
+            "enterprise",
+            "cdc"
+          ],
+          "type": "string"
+        },
+        "schedule": {
+          "description": "Optional cron schedule; when unset the source follows its domain default\n(continuous for cdc, otherwise the connector's own cadence).",
+          "nullable": true,
+          "type": "string"
+        },
+        "source": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Connector-specific parameters, passed through to the plug verbatim.",
+          "type": "object"
+        },
+        "target": {
+          "description": "Destination table, e.g. `warehouse.raw.events`. Ingestion lands in Iceberg\nthrough the REST catalog — never in a side channel.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "type": "object"
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "IngestionSource",
+  "type": "object"
+}
