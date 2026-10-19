@@ -9,7 +9,7 @@ use kube::CustomResourceExt;
 
 use stardelt_operator::crd::{
     Catalog, Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance, ServicePrincipal,
-    Volume,
+    SqlWarehouse, Volume,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -79,6 +79,15 @@ fn main() -> anyhow::Result<()> {
     let catalog_crd = Catalog::crd();
     write(dir, "stardelt.io_catalogs.yaml", &catalog_crd)?;
     write_schema(schema_dir, "catalog.schema.json", "Catalog", &catalog_crd)?;
+
+    let warehouse_crd = SqlWarehouse::crd();
+    write(dir, "stardelt.io_sqlwarehouses.yaml", &warehouse_crd)?;
+    write_schema(
+        schema_dir,
+        "sqlwarehouse.schema.json",
+        "SqlWarehouse",
+        &warehouse_crd,
+    )?;
 
     println!(
         "wrote CRDs to {} and schemas to {}",

@@ -441,6 +441,33 @@ spec:
   managedAccess: false          # true: only platform administrators can grant on this catalog
 ```
 
+## SqlWarehouse
+
+A `SqlWarehouse` is a compute class for SQL inside the engine of a `Lakehouse`: a size (`xs`, `small`, `medium`, `large`),
+optional caps and the groups that may send queries into it. A class is a name for four numbers (queries running, queries
+queued, memory share, scheduling), because the engine has resource groups and not separate clusters; the size does not
+promise hardware. Exactly one warehouse per `Lakehouse` is the default. Today the resource is validated and nothing
+reconciles it yet.
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: SqlWarehouse
+metadata:
+  name: big
+  namespace: stardelt
+spec:
+  lakehouseRef: { name: default }
+  size: large                  # xs | small (default) | medium | large
+  concurrency:                 # optional overrides of the class
+    running: 4
+    queued: 20
+    memoryShare: 40%
+    scheduling: weighted_fair  # fifo | fair | weighted | weighted_fair
+  grants:
+    - { group: stardelt-analytics }
+  default: false
+```
+
 ## Links
 
 - [stardelt.io/roadmap](https://stardelt.io/roadmap)
