@@ -1,0 +1,44 @@
+# The slim numbers of `stardelt-platform/helm-values/slim/trino.yaml`
+# (platform#54, operator#73), laid over the golden Trino values:
+#   600MB per node + 450MB headroom = 1050MB <= 1500m heap, ~450MB for the engine.
+# `additionalJVMConfig` is a list, so it replaces the golden one: the heap-dump
+# flag is restated here. `resources` merge key by key.
+server:
+  workers: 1
+  config:
+    query:
+      maxMemory: 600MB
+coordinator:
+  jvm:
+    maxHeapSize: 1500m
+  additionalJVMConfig:
+  - -Xms512m
+  - -XX:HeapDumpPath=/dumps
+  config:
+    query:
+      maxMemoryPerNode: 600MB
+    memory:
+      heapHeadroomPerNode: 450MB
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1800Mi
+    limits:
+      memory: 2200Mi
+worker:
+  jvm:
+    maxHeapSize: 1500m
+  additionalJVMConfig:
+  - -Xms512m
+  - -XX:HeapDumpPath=/dumps
+  config:
+    query:
+      maxMemoryPerNode: 600MB
+    memory:
+      heapHeadroomPerNode: 450MB
+  resources:
+    requests:
+      cpu: 250m
+      memory: 1800Mi
+    limits:
+      memory: 2200Mi

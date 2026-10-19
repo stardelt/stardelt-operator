@@ -1,0 +1,38 @@
+# The data must outlive the pod: emptyDir/hostPath wipe on restart and
+# orphan the Iceberg metadata pointing at the files. The S3 endpoint is
+# what the catalog and engines talk to, so it is on by default.
+# The chart's swap/migration hook ships a cluster-scoped ClusterRole
+# (`seaweedfs-rw-cr`). Cluster-scoped means one per cluster, so leaving
+# it on makes the second lakehouse in a cluster fail to install — and
+# several lakehouses per cluster is the point of this CRD. Off here for
+# the same reason the platform chart sets it off.
+global:
+  seaweedfs:
+    createClusterRole: false
+master:
+  data:
+    type: persistentVolumeClaim
+volume:
+  dataDirs:
+  - name: data
+    type: persistentVolumeClaim
+    # Volume slots. The chart's default (0 → auto-configure, 7 on Linux) is a trap
+    # on a small install: once the slots are used up, the master cannot create a
+    # volume for a *new* collection, and writes to a new bucket block forever —
+    # the client sees a hang, the master log says "failed to find writable volumes
+    # … Not enough data nodes found", and buckets created earlier keep working.
+    maxVolumes: 100
+filer:
+  data:
+    type: persistentVolumeClaim
+# The S3 identities come from Secret `seaweedfs-s3-config`, written by the
+# operator from the same key pair as `stardelt-s3-creds`; no key in values.
+s3:
+  enabled: true
+  enableAuth: true
+  existingConfigSecret: seaweedfs-s3-config
+  createBuckets:
+  - name: lakehouse
+    anonymousRead: false
+  - name: backups
+    anonymousRead: false

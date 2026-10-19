@@ -1,0 +1,153 @@
+# Trino sits behind ingress-nginx, which sets X-Forwarded-For; without
+# this it answers 406 "Server configuration does not allow processing
+# of the X-Forwarded-For header".
+#
+# The service names in the catalog are the namespace-local short names
+# of the releases `planner.rs::plan_lakehouse` installs for the
+# Lakehouse: `lakekeeper` is its catalog release, and `seaweedfs-s3` is
+# the S3 service of its `seaweedfs` release. They must not be FQDNs —
+# a Lakehouse may live in any namespace.
+additionalConfigProperties:
+- http-server.process-forwarded=true
+env:
+- name: S3_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: stardelt-s3-creds
+      key: access-key
+- name: S3_SECRET_KEY
+  valueFrom:
+    secretKeyRef:
+      name: stardelt-s3-creds
+      key: secret-key
+# TODO(polaris): under `spec.catalog.implementation: polaris` this
+# URI is wrong; Polaris has no adapter yet, so the Lakekeeper URI
+# stays until one lands.
+# The `warehouse` Trino catalog, verbatim from
+# `stardelt-platform/chart/values.yaml` (`trino.catalogs.warehouse`).
+#
+# Trino substitutes ${ENV:S3_ACCESS_KEY} / ${ENV:S3_SECRET_KEY} from the
+# process environment, which the `env` block above feeds from the
+# `stardelt-s3-creds` Secret. That Secret and the `warehouse` Iceberg
+# warehouse are install-time prerequisites; the operator creates neither.
+catalogs:
+  warehouse: |
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.uri=http://lakekeeper:8181/catalog
+    iceberg.rest-catalog.warehouse=warehouse
+    iceberg.rest-catalog.vended-credentials-enabled=false
+    fs.native-s3.enabled=true
+    s3.endpoint=http://seaweedfs-s3:8333
+    s3.region=us-east-1
+    s3.path-style-access=true
+    s3.aws-access-key=${ENV:S3_ACCESS_KEY}
+    s3.aws-secret-key=${ENV:S3_SECRET_KEY}
+    # Single-replica SeaweedFS volume server can't sustain Trino's default
+    # parallel HTTP range requests (broken pipe / connection reset). Throttle
+    # both connection pool and the Iceberg metadata enumeration threads.
+    s3.max-connections=16
+    iceberg.split-manager-threads=4
+    iceberg.metadata.parallelism=2
+    # Worker-local file-system cache for object-store reads (platform#134,
+    # Trino 480: `fs.cache.*` per catalog; there is no cache-manager setting
+    # in 480). Measured on the dev cluster 2026-10-19 against a 38M-row /
+    # 0.66 GB full scan of nyc_taxi.yellow_trips: repeat scans drop from
+    # 154 S3 GETs + 660 MB to 1 GET + 0 MB, wall time 1.5-1.9s -> 1.2-1.7s.
+    # The win is S3 offload (the single-replica SeaweedFS volume server is
+    # the bottleneck the throttles above protect), not latency — Parquet
+    # decode dominates on one node. Best-effort local cache only: a pod
+    # restart or scale-to-zero (M-02) discards it with the emptyDir, and the
+    # next scan repopulates (cold scan is slower: 5.1s vs 3.2s uncached).
+    fs.cache.enabled=true
+    fs.cache.directories=/var/trino/cache
+    fs.cache.max-sizes=10GB
+    fs.cache.ttl=7d
+# Query memory guards (stardelt-platform#54, operator#73): the per-node limit
+# plus the heap headroom must stay well below the JVM heap, so one oversized
+# join fails with EXCEEDED_LOCAL_MEMORY_LIMIT instead of OOM-killing the worker.
+# 800MB + 600MB headroom = 1400MB <= 2G heap. The `demo` profile restates the
+# slim numbers in `profile_values`.
+#
+# `coordinatorExtraConfig` is coordinator-only on purpose: the chart renders
+# `additionalConfigProperties` into the worker ConfigMap too, and a worker
+# rejects keys it does not bind. It is a string, so a CR that sets it replaces
+# both lines (Helm replaces strings, it does not merge them).
+server:
+  config:
+    query:
+      maxMemory: 800MB
+  coordinatorExtraConfig: |
+    query.max-execution-time=10m
+    query.max-run-time=15m
+# The `coordinator:` / `worker:` block of the Trino golden values (the platform BASE,
+# `stardelt-platform/helm-values/trino.yaml`). Both roles get the same block.
+#
+# The three lists (`additionalJVMConfig`, `additionalVolumes`, `additionalVolumeMounts`)
+# are replaced, not merged, by a profile or CR that sets them: an override must restate
+# the whole list. `-XX:HeapDumpPath` complements `+HeapDumpOnOutOfMemoryError`, which the
+# chart already enables; it sends the dump to the 2Gi `trino-dumps` emptyDir so a dump
+# never fills the node.
+#
+# Coordinator and workers get the same block: the file-system cache volume
+# (stardelt-platform#134; the `fs.cache.*` catalog props point at
+# /var/trino/cache and without the mount the coordinator CrashLoops), a bounded
+# heap-dump volume, the 2G heap and the kubelet limits that hold it.
+coordinator:
+  jvm:
+    maxHeapSize: 2G
+  config:
+    query:
+      maxMemoryPerNode: 800MB
+    memory:
+      heapHeadroomPerNode: 600MB
+  additionalJVMConfig:
+  - -Xms1G
+  - -XX:HeapDumpPath=/dumps
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2300Mi
+    limits:
+      memory: 3000Mi
+  additionalVolumes:
+  - name: trino-fscache
+    emptyDir:
+      sizeLimit: 12Gi
+  - name: trino-dumps
+    emptyDir:
+      sizeLimit: 2Gi
+  additionalVolumeMounts:
+  - name: trino-fscache
+    mountPath: /var/trino/cache
+  - name: trino-dumps
+    mountPath: /dumps
+worker:
+  jvm:
+    maxHeapSize: 2G
+  config:
+    query:
+      maxMemoryPerNode: 800MB
+    memory:
+      heapHeadroomPerNode: 600MB
+  additionalJVMConfig:
+  - -Xms1G
+  - -XX:HeapDumpPath=/dumps
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2300Mi
+    limits:
+      memory: 3000Mi
+  additionalVolumes:
+  - name: trino-fscache
+    emptyDir:
+      sizeLimit: 12Gi
+  - name: trino-dumps
+    emptyDir:
+      sizeLimit: 2Gi
+  additionalVolumeMounts:
+  - name: trino-fscache
+    mountPath: /var/trino/cache
+  - name: trino-dumps
+    mountPath: /dumps
