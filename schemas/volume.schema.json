@@ -1,0 +1,198 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A governed folder of files in the object store with an owner group and grants.",
+  "properties": {
+    "spec": {
+      "description": "A governed folder of files in the object store with an owner group and grants.",
+      "properties": {
+        "catalog": {
+          "description": "The catalog (Lakehouse) this volume belongs to; the owner group is inherited.",
+          "maxLength": 40,
+          "minLength": 1,
+          "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$",
+          "type": "string"
+        },
+        "grants": {
+          "default": [],
+          "items": {
+            "description": "One group's rights on a volume. Subjects are groups, never users.",
+            "properties": {
+              "group": {
+                "description": "The Keycloak group whose members hold these verbs.",
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                "type": "string"
+              },
+              "verbs": {
+                "description": "At least one verb; each verb at most once.",
+                "items": {
+                  "description": "What a grant lets a group do: `read` a file or list a folder, `write` upload, change or\ndelete one, `manage` change the grants and delete the volume.",
+                  "enum": [
+                    "read",
+                    "write",
+                    "manage"
+                  ],
+                  "type": "string"
+                },
+                "maxItems": 3,
+                "minItems": 1,
+                "type": "array"
+              }
+            },
+            "required": [
+              "group",
+              "verbs"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "purpose": {
+          "default": "data",
+          "description": "What a volume holds. A `libraries` volume is code that every reader executes, so it\nrestricts `write` to groups that also manage it (decision D28, internal note\n`design/volumes.md` §5).",
+          "enum": [
+            "data",
+            "libraries"
+          ],
+          "type": "string"
+        },
+        "storage": {
+          "description": "Where a volume's files live: exactly one of platform-managed storage or an external\nprefix. Files live in the volume bucket, never in the table bucket (D28).",
+          "properties": {
+            "external": {
+              "description": "A prefix in the customer's own bucket, reached through an `s3` connection.",
+              "nullable": true,
+              "properties": {
+                "connection": {
+                  "description": "Name of the `s3` connection that holds the endpoint, bucket and credentials.",
+                  "maxLength": 40,
+                  "minLength": 1,
+                  "pattern": "^[a-z]([-a-z0-9]*[a-z0-9])?$",
+                  "type": "string"
+                },
+                "prefix": {
+                  "description": "Key prefix inside the bucket; absent means the prefix the connection already scopes.",
+                  "maxLength": 512,
+                  "nullable": true,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "connection"
+              ],
+              "type": "object"
+            },
+            "managed": {
+              "description": "Storage the platform owns: the volume gets `volumes/<catalog>/<name>/` in the platform\nobject store. `managed: {}` selects it.",
+              "nullable": true,
+              "type": "object"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "catalog",
+        "storage"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "storage must be either managed or external, not both and not neither",
+          "rule": "has(self.storage.managed) != has(self.storage.external)"
+        },
+        {
+          "message": "an external prefix must not contain .. or //",
+          "rule": "!has(self.storage.external) || !has(self.storage.external.prefix) || (!self.storage.external.prefix.contains('..') && !self.storage.external.prefix.contains('//'))"
+        },
+        {
+          "message": "each group may appear once in grants",
+          "rule": "self.grants.all(g, self.grants.exists_one(h, h.group == g.group))"
+        },
+        {
+          "message": "a verb may appear once per grant",
+          "rule": "self.grants.all(g, g.verbs.all(v, g.verbs.exists_one(w, w == v)))"
+        },
+        {
+          "message": "on a libraries volume only a group that also manages it may write",
+          "rule": "self.purpose != 'libraries' || self.grants.all(g, !('write' in g.verbs) || ('manage' in g.verbs))"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "objects": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "prefix": {
+          "description": "The object-store prefix the volume maps to.",
+          "nullable": true,
+          "type": "string"
+        },
+        "ready": {
+          "default": false,
+          "description": "True when the prefix exists and its grants apply; filled by a later controller.",
+          "type": "boolean"
+        },
+        "sizeBytes": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "Volume",
+  "type": "object"
+}

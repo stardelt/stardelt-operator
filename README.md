@@ -20,6 +20,7 @@ watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
 | `IngestionSource` | namespaced | ingestion into Iceberg — one contract, three domains (`saas` / `enterprise` / `cdc`) |
 | `Pipeline` | namespaced | ordered `sql` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
 | `Connection` | namespaced | a typed connection to an outside system: settings in the resource, credentials in the secret store (types: `postgresql`, `mysql`, `sqlserver`, `oracle`, `rest-api`, `s3`, `kafka`, `sftp`, `generic`); the resource is validated, nothing reconciles it yet |
+| `Volume` | namespaced | a governed folder of files in the object store with an owner group and grants (`read` / `write` / `manage`), on managed or external storage; the resource is validated, nothing reconciles it yet |
 
 `StreamApp` and the ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see
 the master spec §5).
@@ -198,11 +199,37 @@ and `token` or `clientId` and `clientSecret`; `s3`: `config.bucket`, `accessKeyI
 `config.host`, `user` and `password` or `privateKey`; `kafka`: `config.bootstrapServers`). The API server enforces the
 rules at admission; `ConnectionSpec::validate` repeats them for the controller.
 
+A `Volume` is a governed folder of files beside the tables. `storage.managed: {}` puts it at
+`volumes/<catalog>/<name>/` in the platform object store; `storage.external` names an `s3` connection and a prefix in
+the customer's bucket instead. Grants are for groups, never users:
+
+```yaml
+apiVersion: stardelt.io/v1alpha1
+kind: Volume
+metadata:
+  name: raw-landing
+  namespace: stardelt
+spec:
+  catalog: analytics            # the Lakehouse this volume belongs to (owner group is inherited)
+  purpose: data                 # data (default) | libraries
+  storage:
+    managed: {}                 # or external: { connection: raw-s3, prefix: landing/ }
+  grants:
+    - { group: analysts,  verbs: [read] }
+    - { group: engineers, verbs: [read, write] }
+```
+
+A `purpose: libraries` volume is code in every reader's notebook, so only a group that also holds `manage` may hold
+`write` there. The API server enforces that and the rest of the shape at admission (exactly one storage kind, a prefix
+without `..` or `//`, one grant per group, one of each verb); `VolumeSpec::validate` repeats the rules for the
+controller. `VolumeSpec::derived_prefix` is the path the gateway will use.
+
 ## Editor support
 
 `cargo run --bin crdgen` also writes JSON Schemas for every CRD into `schemas/`
 (`platforminstance.schema.json`, `lakehouse.schema.json`,
-`ingestionsource.schema.json`, `pipeline.schema.json`, `connection.schema.json`). Add
+`ingestionsource.schema.json`, `pipeline.schema.json`, `connection.schema.json`,
+`volume.schema.json`). Add
 
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/stardelt/stardelt-operator/main/schemas/pipeline.schema.json
