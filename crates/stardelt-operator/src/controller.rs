@@ -24,8 +24,8 @@ use serde_json::json;
 
 use crate::crd::Profile;
 use crate::crd::{
-    ComponentStatus, ComponentValues, Condition, Lakehouse, LakehouseStatus, PlatformInstance,
-    PlatformInstanceStatus, StorageImpl, ValuesSource,
+    ComponentStatus, ComponentValues, Condition, DeletionPolicy, Lakehouse, LakehouseStatus,
+    PlatformInstance, PlatformInstanceStatus, StorageImpl, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
@@ -503,9 +503,156 @@ async fn patch_lakehouse_status(
     Ok(())
 }
 
+/// Finalizer that keeps a `Lakehouse` around until its releases are uninstalled
+/// (wave 3a-ii, decision D18).
+const LAKEHOUSE_FINALIZER: &str = "stardelt.io/lakehouse-deletion";
+
+fn lakehouse_api(ctx: &Context, lh: &Lakehouse) -> Api<Lakehouse> {
+    match lh.namespace() {
+        Some(ns) => Api::namespaced(ctx.client.clone(), &ns),
+        None => Api::all(ctx.client.clone()),
+    }
+}
+
+/// Replace `metadata.finalizers` with exactly `finalizers` (a merge patch
+/// replaces the whole list, so it never appends a duplicate).
+async fn patch_lakehouse_finalizers(
+    ctx: &Context,
+    lh: &Lakehouse,
+    finalizers: Vec<String>,
+) -> Result<(), kube::Error> {
+    lakehouse_api(ctx, lh)
+        .patch(
+            &lh.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "metadata": { "finalizers": finalizers } })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Add the deletion finalizer when it is missing; a resource that already
+/// carries it is not patched again.
+async fn ensure_lakehouse_finalizer(ctx: &Context, lh: &Lakehouse) -> Result<(), kube::Error> {
+    if lh.finalizers().iter().any(|f| f == LAKEHOUSE_FINALIZER) {
+        return Ok(());
+    }
+    let mut finalizers = lh.finalizers().to_vec();
+    finalizers.push(LAKEHOUSE_FINALIZER.to_string());
+    patch_lakehouse_finalizers(ctx, lh, finalizers).await
+}
+
+/// Remove the deletion finalizer so the API server can finish the deletion.
+async fn remove_lakehouse_finalizer(ctx: &Context, lh: &Lakehouse) -> Result<(), kube::Error> {
+    if !lh.finalizers().iter().any(|f| f == LAKEHOUSE_FINALIZER) {
+        return Ok(());
+    }
+    let finalizers: Vec<String> = lh
+        .finalizers()
+        .iter()
+        .filter(|f| *f != LAKEHOUSE_FINALIZER)
+        .cloned()
+        .collect();
+    patch_lakehouse_finalizers(ctx, lh, finalizers).await
+}
+
+/// Deletion path of a `Lakehouse` (wave 3a-ii). The finalizer keeps the resource
+/// visible until this returns, so it is called before any planning or status.
+///
+/// `Retain` (the default) uninstalls the releases this operator owns in the
+/// reverse of the apply order — query, catalog, storage — and leaves every
+/// data-bearing object alone: the catalog CNPG `Cluster` (its deletion would take
+/// its PVC with it), the S3 Secrets and the StatefulSet PVCs. The discovery
+/// ConfigMap disappears through its ownerReference once the finalizer is removed.
+async fn delete_lakehouse(lh: &Lakehouse, ctx: &Context) -> Result<Action, kube::Error> {
+    let name = lh.name_any();
+    let namespace = lh.namespace().unwrap_or_else(|| "default".into());
+
+    if lh.spec.deletion_policy == DeletionPolicy::Delete {
+        // 3a-iii deletes the data. Refusing is safer than silently retaining data
+        // the user asked to delete, so the finalizer stays.
+        tracing::warn!(
+            lakehouse = %name,
+            "deletionPolicy Delete is not implemented yet; keeping the data (wave 3a-iii)"
+        );
+        return Ok(Action::requeue(Duration::from_secs(300)));
+    }
+
+    if lh.spec.dry_run {
+        tracing::info!(
+            lakehouse = %name,
+            "dry-run Lakehouse deleted; nothing was applied to the cluster"
+        );
+        remove_lakehouse_finalizer(ctx, lh).await?;
+        return Ok(Action::await_change());
+    }
+
+    for component in plan_lakehouse(&lh.spec).iter().rev() {
+        let Some(chart) = component.chart else {
+            // No adapter, so this operator never installed it.
+            continue;
+        };
+        let release = HelmRelease {
+            name: component.name.to_string(),
+            chart: chart.to_string(),
+            repo: chart_repo(chart).map(str::to_string),
+            version: chart_version(chart).map(str::to_string),
+            namespace: namespace.clone(),
+            dry_run: false,
+            set: Default::default(),
+            values: None,
+        };
+        // Never uninstall a release this operator did not create. A history that
+        // cannot be read is not treated as foreign: `helm uninstall
+        // --ignore-not-found` deals with a release that does not exist.
+        let foreign = !lh.spec.adopt
+            && matches!(
+                ctx.helm.run(release.history_args(), None).await,
+                Ok(history) if !is_owned(&history)
+            );
+        if foreign {
+            tracing::info!(
+                lakehouse = %name,
+                component = component.name,
+                "release is not owned by this operator; leaving it alone"
+            );
+            continue;
+        }
+        if let Err(e) = ctx.helm.run(release.uninstall_args(), None).await {
+            // Keep the finalizer; the next reconcile retries the whole reverse
+            // order. `--ignore-not-found` makes the already-removed ones no-ops.
+            tracing::warn!(
+                lakehouse = %name,
+                component = component.name,
+                error = %e,
+                "uninstall failed; keeping the finalizer"
+            );
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        tracing::info!(
+            lakehouse = %name,
+            component = component.name,
+            "release uninstalled"
+        );
+    }
+
+    remove_lakehouse_finalizer(ctx, lh).await?;
+    tracing::info!(
+        lakehouse = %name,
+        "releases uninstalled; data retained (deletionPolicy Retain)"
+    );
+    Ok(Action::await_change())
+}
+
 async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
     let name = lh.name_any();
     let namespace = lh.namespace().unwrap_or_else(|| "default".into());
+
+    // Deletion first (wave 3a-ii): while the finalizer holds the object, its
+    // releases are uninstalled in reverse apply order and no status is written.
+    if lh.metadata.deletion_timestamp.is_some() {
+        return delete_lakehouse(&lh, &ctx).await;
+    }
 
     // v1alpha1 supports exactly one Lakehouse per namespace (decision D18):
     // release names are stable, so a second resource would Helm-upgrade the same
@@ -552,6 +699,12 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         tracing::info!(lakehouse = %name, %namespace, older = %peer, "blocked: one Lakehouse per namespace in v1alpha1");
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
+
+    // From here the resource owns the namespace's releases, so it must not
+    // disappear before they are uninstalled (wave 3a-ii). A Blocked resource
+    // never applied anything and stays without the finalizer: deleting it must
+    // not uninstall the releases of the resource that owns the namespace.
+    ensure_lakehouse_finalizer(&ctx, &lh).await?;
 
     let plan = plan_lakehouse(&lh.spec);
     let overrides = OverridesContext {
@@ -1100,6 +1253,7 @@ mod tests {
     }
 
     /// One request recorded by [`status_mock_client`].
+    #[derive(Debug)]
     struct RecordedRequest {
         method: String,
         path: String,
@@ -1209,6 +1363,69 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&patch.body).expect("patch body is JSON");
         body["status"].clone()
+    }
+
+    /// Every PATCH body recorded, oldest first.
+    fn patch_bodies(requests: &Arc<Mutex<Vec<RecordedRequest>>>) -> Vec<serde_json::Value> {
+        requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|r| r.method == "PATCH")
+            .map(|r| serde_json::from_str(&r.body).expect("patch body is JSON"))
+            .collect()
+    }
+
+    /// The `metadata.finalizers` lists of every finalizer patch, in order.
+    fn patched_finalizers(requests: &Arc<Mutex<Vec<RecordedRequest>>>) -> Vec<Vec<String>> {
+        patch_bodies(requests)
+            .iter()
+            .filter_map(|body| body["metadata"]["finalizers"].as_array())
+            .map(|list| {
+                list.iter()
+                    .map(|item| item.as_str().expect("a finalizer is a string").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The release names of every `helm uninstall`, in call order.
+    fn uninstalled(helm: &RecordingRunner) -> Vec<String> {
+        helm.calls
+            .lock()
+            .expect("calls poisoned")
+            .iter()
+            .filter(|call| call.args.first().map(String::as_str) == Some("uninstall"))
+            .map(|call| call.args[1].clone())
+            .collect()
+    }
+
+    /// A `Lakehouse` the API server is deleting: it carries the operator's
+    /// finalizer and no longer accepts spec changes.
+    fn deleting_lakehouse(spec: serde_json::Value) -> Lakehouse {
+        serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": {
+                "name": "main",
+                "namespace": "stardelt",
+                "generation": 2,
+                "deletionTimestamp": "2026-01-02T00:00:00Z",
+                "finalizers": [LAKEHOUSE_FINALIZER]
+            },
+            "spec": spec
+        }))
+        .expect("deserialize Lakehouse")
+    }
+
+    /// A helm double whose releases carry the owner marker.
+    fn owned_helm() -> Arc<RecordingRunner> {
+        let helm = Arc::new(RecordingRunner::default());
+        helm.reply(
+            "history",
+            format!(r#"[{{"revision":1,"description":"{OWNER_MARKER}"}}]"#),
+        );
+        helm
     }
 
     #[tokio::test]
@@ -1369,6 +1586,233 @@ mod tests {
         assert!(
             !helm.calls.lock().expect("calls poisoned").is_empty(),
             "the oldest Lakehouse still plans its releases"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_finalizer_is_added_once_before_planning() {
+        let (client, requests) =
+            status_mock_client(json!([lakehouse_item("main", "2026-01-01T00:00:00Z")]));
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt", "generation": 1 },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![vec![LAKEHOUSE_FINALIZER.to_string()]],
+            "the finalizer is added exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_present_finalizer_is_not_patched_again() {
+        let (client, requests) =
+            status_mock_client(json!([lakehouse_item("main", "2026-01-01T00:00:00Z")]));
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": {
+                "name": "main",
+                "namespace": "stardelt",
+                "generation": 1,
+                "finalizers": [LAKEHOUSE_FINALIZER]
+            },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        assert!(
+            patched_finalizers(&requests).is_empty(),
+            "a Lakehouse that already carries the finalizer is not patched again"
+        );
+    }
+
+    #[tokio::test]
+    async fn retain_deletion_uninstalls_owned_releases_in_reverse_order() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(json!({ "dryRun": false }))),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            uninstalled(&helm),
+            vec![
+                "trino".to_string(),
+                "lakekeeper".to_string(),
+                "seaweedfs".to_string()
+            ],
+            "deletion runs the plan in reverse: query, catalog, storage"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "the finalizer is removed after the last release"
+        );
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            !requests.iter().any(|r| r.method == "DELETE"),
+            "Retain deletes nothing: {requests:?}"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r.path.contains("clusters") || r.path.contains("persistentvolumeclaims")),
+            "the catalog Cluster and the PVCs stay: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_deletion_makes_no_helm_calls_and_removes_the_finalizer() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        // The default dryRun is true: nothing was ever applied to the cluster.
+        let action = reconcile_lakehouse(Arc::new(deleting_lakehouse(json!({}))), ctx)
+            .await
+            .expect("delete Lakehouse");
+
+        assert_eq!(action, Action::await_change());
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a dry-run resource never touched the cluster"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "the finalizer is removed without uninstalling anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_release_is_never_uninstalled() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = Arc::new(RecordingRunner::default());
+        helm.reply(
+            "history",
+            r#"[{"revision":1,"description":"Install complete"}]"#,
+        );
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(json!({ "dryRun": false }))),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(action, Action::await_change());
+        assert!(
+            uninstalled(&helm).is_empty(),
+            "a release without the owner marker is left alone"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "the finalizer is still removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uninstall_error_keeps_the_finalizer() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        helm.fail("uninstall", "helm uninstall failed: boom");
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(json!({ "dryRun": false }))),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(
+            action,
+            Action::requeue(Duration::from_secs(30)),
+            "a failed uninstall is retried"
+        );
+        assert_eq!(
+            uninstalled(&helm),
+            vec!["trino".to_string()],
+            "the reverse order stops at the first failure"
+        );
+        assert!(
+            patched_finalizers(&requests).is_empty(),
+            "the finalizer stays until every release is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_policy_delete_is_refused_and_keeps_the_finalizer() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        let action = reconcile_lakehouse(
+            Arc::new(deleting_lakehouse(
+                json!({ "dryRun": false, "deletionPolicy": "Delete" }),
+            )),
+            ctx,
+        )
+        .await
+        .expect("delete Lakehouse");
+
+        assert_eq!(
+            action,
+            Action::requeue(Duration::from_secs(300)),
+            "Delete waits for 3a-iii"
+        );
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "nothing is uninstalled while Delete is unimplemented"
+        );
+        assert!(
+            patched_finalizers(&requests).is_empty(),
+            "the finalizer stays so the data is never silently retained"
         );
     }
 

@@ -119,6 +119,22 @@ impl HelmRelease {
         format!("{:016x}", h.finish())
     }
 
+    /// `helm uninstall` for this release: not found is fine, and the chart's
+    /// resources are waited for so the finalizer does not remove itself while
+    /// pods still terminate.
+    pub fn uninstall_args(&self) -> Vec<String> {
+        vec![
+            "uninstall".into(),
+            self.name.clone(),
+            "--namespace".into(),
+            self.namespace.clone(),
+            "--ignore-not-found".into(),
+            "--wait".into(),
+            "--timeout".into(),
+            "120s".into(),
+        ]
+    }
+
     /// `helm status -o json` — tells whether the release currently is `deployed`
     /// (as opposed to `failed`, `pending`, …).
     pub fn status_args(&self) -> Vec<String> {
@@ -209,6 +225,7 @@ pub mod testing {
     pub struct RecordingRunner {
         pub calls: Mutex<Vec<HelmCall>>,
         pub replies: Mutex<HashMap<String, String>>,
+        pub failures: Mutex<HashMap<String, String>>,
     }
 
     impl RecordingRunner {
@@ -218,6 +235,14 @@ pub mod testing {
                 .lock()
                 .expect("replies poisoned")
                 .insert(verb.into(), output.into());
+        }
+
+        /// Make every call to `helm <verb>` fail with `message`.
+        pub fn fail(&self, verb: &str, message: impl Into<String>) {
+            self.failures
+                .lock()
+                .expect("failures poisoned")
+                .insert(verb.into(), message.into());
         }
     }
 
@@ -232,6 +257,15 @@ pub mod testing {
                 .lock()
                 .expect("calls poisoned")
                 .push(HelmCall { args, stdin });
+            let failure = self
+                .failures
+                .lock()
+                .expect("failures poisoned")
+                .get(&verb)
+                .cloned();
+            if let Some(message) = failure {
+                return Box::pin(async move { Err(anyhow::anyhow!("{message}")) });
+            }
             let output = self
                 .replies
                 .lock()
@@ -341,6 +375,23 @@ mod tests {
                 "stardelt",
                 "-o",
                 "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn uninstall_ignores_a_missing_release_and_waits() {
+        assert_eq!(
+            release(false).uninstall_args(),
+            vec![
+                "uninstall",
+                "seaweedfs",
+                "--namespace",
+                "stardelt",
+                "--ignore-not-found",
+                "--wait",
+                "--timeout",
+                "120s",
             ]
         );
     }
