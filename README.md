@@ -81,6 +81,25 @@ ephemeral per-user storage, sign-in through the platform IdP: the hub reads the 
 contract (ConfigMap `stardelt-identity`, Secret `stardelt-oidc-clients`) from its namespace;
 install it with stardelt-platform's `make install-identity` first, or nobody can sign in.
 
+### Identity registration checklist
+
+With `identity.mode: external` the operator creates nothing in the customer's provider: the
+clients are registered by hand. `identity-checklist` prints exactly what to register, per
+client, from the same host functions the platform-mode realm uses, so the two cannot disagree:
+
+```sh
+cargo run -q -- identity-checklist examples/platforminstance-external-entra.yaml
+cargo run -q -- identity-checklist examples/platforminstance-external-entra.yaml --format json
+```
+
+Each block is one app registration: its kind (confidential, public with PKCE, or a service
+client), the redirect URIs with the instance's real hosts, the audience its tokens must carry,
+and the provider-specific notes — for `entra` the API app's `accessTokenAcceptedVersion`, the
+exposed scope, the app roles, the delegated permissions and (for the group sync) the admin
+consent; for any other `oidc` provider the group claim. Only clients listed in
+`spec.identity.clients` appear, so the output is the complete list for that instance. An
+invalid file, or one that is not `external`, exits 1 and prints the reason on stderr.
+
 ### Plug selection
 
 The plug matrix is expressed directly in the resource. Defaults are Lakekeeper + SeaweedFS +
@@ -272,6 +291,8 @@ it watches CRDs and applies upstream Helm releases via the `helm` binary in its 
   the golden chart pins (`chart_version`).
 - `src/values.rs` — pure functions: the golden per-component values, parsing of external
   documents, and the merge order.
+- `src/identity_checklist.rs` — pure functions: what to register in an external provider, per
+  client (the `identity-checklist` command).
 - `src/helm.rs` — the Helm adapter (trait + command runner; recording runner for tests).
 - `src/controller.rs` — reconciles `PlatformInstance` → its cluster-scoped plan and `Lakehouse`
   → its component plan.

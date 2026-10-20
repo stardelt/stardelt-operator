@@ -153,18 +153,18 @@ pub fn identity_secret(desired: &IdentitySecret, namespace: &str) -> Result<Secr
 /// The Realm import of this instance, or the reason it cannot be rendered.
 fn realm_json(spec: &PlatformInstanceSpec) -> Result<String, IdentityError> {
     let domain = identity::base_domain(spec)?;
+    let hosts = identity::hosts(domain);
     let mut realm = REALM_TEMPLATE.to_string();
-    // Nova answers on the base domain (`stardelt.appHost` with an empty subdomain).
     for (placeholder, host) in [
-        ("__BASE_DOMAIN__", domain.to_string()),
-        ("__NOVA_HOST__", domain.to_string()),
-        ("__TRINO_HOST__", format!("trino.{domain}")),
-        ("__LAKEKEEPER_HOST__", format!("lakekeeper.{domain}")),
-        ("__SUPERSET_HOST__", format!("superset.{domain}")),
-        ("__AIRFLOW_HOST__", format!("airflow.{domain}")),
-        ("__JUPYTER_HOST__", format!("jupyter.{domain}")),
+        ("__BASE_DOMAIN__", &hosts.nova),
+        ("__NOVA_HOST__", &hosts.nova),
+        ("__TRINO_HOST__", &hosts.trino),
+        ("__LAKEKEEPER_HOST__", &hosts.lakekeeper),
+        ("__SUPERSET_HOST__", &hosts.superset),
+        ("__AIRFLOW_HOST__", &hosts.airflow),
+        ("__JUPYTER_HOST__", &hosts.jupyter),
     ] {
-        realm = realm.replace(placeholder, &host);
+        realm = realm.replace(placeholder, host);
     }
     Ok(realm)
 }
