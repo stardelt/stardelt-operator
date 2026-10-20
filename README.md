@@ -373,20 +373,10 @@ Notes:
 - Overrides keyed by a component that is not in the plan (e.g. `polaris` while the catalog
   is Lakekeeper) are ignored, with a warning in the operator log.
 
-### End-to-end test
+### Tests
 
-`tests/e2e/lakehouse.sh` creates a kind cluster, builds the operator image from the checkout, installs
-the operator chart, applies one `PlatformInstance` and one `Lakehouse` (both `profile: demo`,
-`dryRun: false`), waits for `status.phase: Ready`, and then creates, reads and drops an Iceberg table
-through Trino. It needs docker, kind, kubectl and helm, about 12 GB of free memory and up to 30
-minutes:
-
-```sh
-bash tests/e2e/lakehouse.sh      # prints "e2e OK" on success; always deletes the cluster
-```
-
-The workflow `.github/workflows/e2e.yml` runs it nightly and on demand (not on pull requests) and
-uploads the failure diagnostics as an artifact.
+Unit and schema tests run in CI. Integration is checked on a real cluster (the dev cluster); a
+Lakehouse or PlatformInstance cannot be exercised on laptop-size clusters.
 
 ### Safety: `dryRun`
 
