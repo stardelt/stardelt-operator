@@ -24,6 +24,14 @@
           ],
           "type": "string"
         },
+        "ownerGroup": {
+          "description": "The group that owns the pipeline: its members see it, run it and pause it in Nova. Optional so\nthat existing pipelines keep working; a pipeline without an owner is visible to administrators only.",
+          "maxLength": 64,
+          "minLength": 1,
+          "nullable": true,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
         "params": {
           "additionalProperties": {
             "type": "string"
@@ -54,7 +62,7 @@
           "type": "object"
         },
         "runAs": {
-          "description": "Service principal the tasks run as. Absent means the platform's default pipeline principal.",
+          "description": "Service principal the tasks run as. Absent means the platform's default pipeline principal.\nBy convention the principal of the owner group, named `pipeline-<ownerGroup>`; Nova's Schedule\nwrites that name.",
           "nullable": true,
           "type": "string"
         },

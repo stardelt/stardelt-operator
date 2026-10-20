@@ -215,6 +215,7 @@ mod tests {
             tasks,
             schedule: None,
             run_as: None,
+            owner_group: None,
             params: BTreeMap::new(),
             retries: None,
             timeout: None,

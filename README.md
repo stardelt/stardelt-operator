@@ -188,6 +188,7 @@ spec:
   schedule:              # optional; without it the pipeline runs on demand
     cron: "0 3 * * *"
     timezone: Europe/Berlin
+  ownerGroup: analytics        # the group whose members see it and run it (optional)
   runAs: pipeline-analytics   # service principal the tasks run as (optional)
   retries: { attempts: 2, backoff: 5m }
   tasks:
