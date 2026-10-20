@@ -151,17 +151,82 @@ pub enum IdentityMode {
     External,
 }
 
-fn default_group_claim() -> String {
-    "groups".into()
-}
-
 fn default_admin_group() -> String {
     "stardelt-admins".into()
+}
+
+/// Which kind of provider an `external` instance talks to; it changes claims, audiences and provider names.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentityProvider {
+    /// Any OIDC provider.
+    #[default]
+    Oidc,
+    /// Microsoft Entra ID: roles as groups, `oid` as the user id, one API audience, v2 tokens.
+    Entra,
+}
+
+/// A Secret in the platform namespace and the key that holds a client's secret.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ClientSecretRef {
+    #[schemars(
+        length(min = 1, max = 253),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+    )]
+    pub name: String,
+    #[serde(default = "default_client_secret_key")]
+    #[schemars(length(min = 1, max = 253))]
+    pub key: String,
+}
+
+fn default_client_secret_key() -> String {
+    "client-secret".into()
+}
+
+/// One app registration made by the customer in their provider.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct IdentityClient {
+    #[serde(rename = "clientId")]
+    #[schemars(length(min = 1, max = 256), regex(pattern = r"^\S+$"))]
+    pub client_id: String,
+    /// Required for every client except the public `lakekeeper` one. Never the value itself.
+    #[serde(
+        default,
+        rename = "clientSecretRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub client_secret_ref: Option<ClientSecretRef>,
 }
 
 /// Identity settings of a platform instance; the operator publishes them to the components as
 /// the ConfigMap `stardelt-identity` (see [`crate::identity::contract`]).
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.mode == 'external' || (self.provider == 'oidc' && !has(self.apiAudience) && (!has(self.clients) || size(self.clients) == 0))",
+        "message": "platform mode creates its own clients: leave provider, apiAudience and clients out"
+    },
+    {
+        "rule": "self.mode != 'external' || has(self.issuerUrl)",
+        "message": "external mode needs issuerUrl"
+    },
+    {
+        "rule": "self.mode != 'external' || has(self.apiAudience)",
+        "message": "external mode needs apiAudience"
+    },
+    {
+        "rule": "self.mode != 'external' || (has(self.clients) && 'nova' in self.clients)",
+        "message": "external mode needs a nova client"
+    },
+    {
+        "rule": "!has(self.clients) || self.clients.all(k, k in ['nova','trino','lakekeeper','superset','airflow','jupyterhub','trino-group-sync'])",
+        "message": "client names are nova, trino, lakekeeper, superset, airflow, jupyterhub and trino-group-sync"
+    },
+    {
+        "rule": "!has(self.clients) || self.clients.all(k, k == 'lakekeeper' || has(self.clients[k].clientSecretRef))",
+        "message": "every client except lakekeeper needs a clientSecretRef"
+    }
+]))]
 pub struct IdentitySpec {
     #[serde(default)]
     pub mode: IdentityMode,
@@ -169,12 +234,41 @@ pub struct IdentitySpec {
     /// from `baseDomain` and must be left out.
     #[serde(default, rename = "issuerUrl", skip_serializing_if = "Option::is_none")]
     pub issuer_url: Option<String>,
-    /// Name of the token claim that carries group (or role) names.
-    #[serde(default = "default_group_claim", rename = "groupClaim")]
-    pub group_claim: String,
+    /// `external` only: which kind of provider this instance talks to.
+    #[serde(default)]
+    pub provider: IdentityProvider,
+    /// `external` only: the audience the engine and the catalog accept.
+    #[serde(
+        default,
+        rename = "apiAudience",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(min = 1, max = 256), regex(pattern = r"^\S+$"))]
+    pub api_audience: Option<String>,
+    /// `external` only: the app registrations the customer made, one entry per client.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub clients: BTreeMap<String, IdentityClient>,
+    /// Name of the token claim that carries group (or role) names. Defaults to `roles` for
+    /// `entra` and `groups` otherwise.
+    #[serde(
+        default,
+        rename = "groupClaim",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group_claim: Option<String>,
     /// Members of this group are platform administrators.
     #[serde(default = "default_admin_group", rename = "adminGroup")]
     pub admin_group: String,
+}
+
+impl IdentitySpec {
+    /// The group claim to read: the configured one, else `roles` for Entra and `groups` otherwise.
+    pub fn effective_group_claim(&self) -> &str {
+        self.group_claim.as_deref().unwrap_or(match self.provider {
+            IdentityProvider::Entra => "roles",
+            IdentityProvider::Oidc => "groups",
+        })
+    }
 }
 
 impl Default for IdentitySpec {
@@ -182,7 +276,10 @@ impl Default for IdentitySpec {
         Self {
             mode: IdentityMode::None,
             issuer_url: None,
-            group_claim: default_group_claim(),
+            provider: IdentityProvider::Oidc,
+            api_audience: None,
+            clients: BTreeMap::new(),
+            group_claim: None,
             admin_group: default_admin_group(),
         }
     }
@@ -2861,6 +2958,16 @@ mod tests {
             }));
             assert!(w.spec.validate("big").is_err(), "{running}/{queued}");
         }
+    }
+
+    #[test]
+    fn the_example_manifest_deserialises_and_validates() {
+        let yaml = include_str!("../../../examples/platforminstance-external-entra.yaml");
+        let instance: PlatformInstance =
+            serde_yaml::from_str(yaml).expect("the documentation example parses");
+        assert_eq!(instance.spec.identity.mode, IdentityMode::External);
+        assert_eq!(instance.spec.identity.provider, IdentityProvider::Entra);
+        crate::identity::validate(&instance.spec).expect("the documentation example validates");
     }
 
     #[test]

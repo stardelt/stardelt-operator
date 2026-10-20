@@ -21,8 +21,8 @@
         "identity": {
           "default": {
             "adminGroup": "stardelt-admins",
-            "groupClaim": "groups",
-            "mode": "none"
+            "mode": "none",
+            "provider": "oidc"
           },
           "description": "How users sign in; see [`IdentitySpec`].",
           "properties": {
@@ -31,9 +31,58 @@
               "description": "Members of this group are platform administrators.",
               "type": "string"
             },
+            "apiAudience": {
+              "description": "`external` only: the audience the engine and the catalog accept.",
+              "maxLength": 256,
+              "minLength": 1,
+              "nullable": true,
+              "pattern": "^\\S+$",
+              "type": "string"
+            },
+            "clients": {
+              "additionalProperties": {
+                "description": "One app registration made by the customer in their provider.",
+                "properties": {
+                  "clientId": {
+                    "maxLength": 256,
+                    "minLength": 1,
+                    "pattern": "^\\S+$",
+                    "type": "string"
+                  },
+                  "clientSecretRef": {
+                    "description": "Required for every client except the public `lakekeeper` one. Never the value itself.",
+                    "nullable": true,
+                    "properties": {
+                      "key": {
+                        "default": "client-secret",
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "name": {
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "clientId"
+                ],
+                "type": "object"
+              },
+              "description": "`external` only: the app registrations the customer made, one entry per client.",
+              "type": "object"
+            },
             "groupClaim": {
-              "default": "groups",
-              "description": "Name of the token claim that carries group (or role) names.",
+              "description": "Name of the token claim that carries group (or role) names. Defaults to `roles` for\n`entra` and `groups` otherwise.",
+              "nullable": true,
               "type": "string"
             },
             "issuerUrl": {
@@ -50,9 +99,44 @@
                 "external"
               ],
               "type": "string"
+            },
+            "provider": {
+              "default": "oidc",
+              "description": "`external` only: which kind of provider this instance talks to.",
+              "enum": [
+                "oidc",
+                "entra"
+              ],
+              "type": "string"
             }
           },
-          "type": "object"
+          "type": "object",
+          "x-kubernetes-validations": [
+            {
+              "message": "platform mode creates its own clients: leave provider, apiAudience and clients out",
+              "rule": "self.mode == 'external' || (self.provider == 'oidc' && !has(self.apiAudience) && (!has(self.clients) || size(self.clients) == 0))"
+            },
+            {
+              "message": "external mode needs issuerUrl",
+              "rule": "self.mode != 'external' || has(self.issuerUrl)"
+            },
+            {
+              "message": "external mode needs apiAudience",
+              "rule": "self.mode != 'external' || has(self.apiAudience)"
+            },
+            {
+              "message": "external mode needs a nova client",
+              "rule": "self.mode != 'external' || (has(self.clients) && 'nova' in self.clients)"
+            },
+            {
+              "message": "client names are nova, trino, lakekeeper, superset, airflow, jupyterhub and trino-group-sync",
+              "rule": "!has(self.clients) || self.clients.all(k, k in ['nova','trino','lakekeeper','superset','airflow','jupyterhub','trino-group-sync'])"
+            },
+            {
+              "message": "every client except lakekeeper needs a clientSecretRef",
+              "rule": "!has(self.clients) || self.clients.all(k, k == 'lakekeeper' || has(self.clients[k].clientSecretRef))"
+            }
+          ]
         },
         "namespace": {
           "default": "stardelt",
