@@ -3,6 +3,7 @@
 //! Watches the stardelt CRDs and reconciles them into real resources:
 //! - `PlatformInstance` → platform-level prerequisites (CNPG operator), once
 //! - `Lakehouse` → its namespace-scoped plan (storage + catalog)
+//! - `Connection` → an External Secrets sync (see [`crate::connection`])
 //!
 //! Applies go through Helm. Both resources default to `dryRun: true`, so a new
 //! resource plans first and changes nothing until explicitly flipped.
@@ -22,10 +23,11 @@ use kube::{
 };
 use serde_json::json;
 
+use crate::connection::reconcile_connection;
 use crate::crd::Profile;
 use crate::crd::{
-    ComponentStatus, ComponentValues, Condition, DeletionPolicy, Lakehouse, LakehouseStatus,
-    PlatformInstance, PlatformInstanceStatus, StorageImpl, ValuesSource,
+    ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, Lakehouse,
+    LakehouseStatus, PlatformInstance, PlatformInstanceStatus, StorageImpl, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::objects::cnpg_cluster_resource;
@@ -60,12 +62,19 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .run(reconcile_platform, error_policy, ctx.clone());
 
-    tracing::info!("stardelt-operator watching PlatformInstance and Lakehouse");
-    futures::pin_mut!(lakehouses, platforms);
+    let connections = Controller::new(
+        Api::<Connection>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .run(reconcile_connection, error_policy, ctx.clone());
+
+    tracing::info!("stardelt-operator watching PlatformInstance, Lakehouse and Connection");
+    futures::pin_mut!(lakehouses, platforms, connections);
     loop {
         tokio::select! {
             _ = lakehouses.next() => {}
             _ = platforms.next() => {}
+            _ = connections.next() => {}
         }
     }
 }
