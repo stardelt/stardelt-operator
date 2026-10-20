@@ -9,7 +9,9 @@ comes up from a small set of YAML files.
 **Pre-alpha.** The CRD types, the reconcile *planner* and a controller skeleton are in place
 and unit-tested. Applying the upstream charts (the per-plug adapters) is the next milestone —
 today the controller computes the component plan and writes a truthful status. The controller
-watches `PlatformInstance`, `Lakehouse`, `IngestionSource` and `Pipeline`.
+watches `PlatformInstance`, `Lakehouse`, `IngestionSource`, `Pipeline`, `Connection` and
+`ServicePrincipal` (phase 1: it validates the principal and checks its credentials Secret; it does
+not call the identity provider).
 
 ## CRDs
 

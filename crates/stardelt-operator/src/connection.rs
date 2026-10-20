@@ -175,7 +175,7 @@ pub fn sync_state(external_secret: &Value) -> SyncState {
 }
 
 /// The `Ready` condition, keeping the previous transition time while the status is unchanged.
-fn ready_condition(
+pub(crate) fn ready_condition(
     ready: bool,
     reason: &str,
     message: Option<String>,

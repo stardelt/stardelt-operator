@@ -14,5 +14,6 @@ pub mod keycloak;
 pub mod objects;
 pub mod planner;
 pub mod prerequisites;
+pub mod principal;
 pub mod provision;
 pub mod values;
