@@ -544,6 +544,9 @@ pub struct IngestionSourceStatus {
 pub enum TaskKind {
     /// SQL statement, run through the query engine as the run-as principal.
     Sql,
+    /// Published Jupyter notebook, run with papermill as the run-as principal.
+    /// The source is pinned by the object version in `config.objectVersion`.
+    Notebook,
     /// Python transform.
     Python,
     /// dbt-core model run.
@@ -552,8 +555,44 @@ pub enum TaskKind {
     Quality,
 }
 
+/// Schema for a task's `config` map. The bounds are not cosmetic: Kubernetes'
+/// CEL cost estimator refuses unbounded maps and strings used by the `notebook`
+/// rules at admission. 32 keys covers every kind's parameters, and 4096
+/// characters is the `notebook` params limit the ticket sets.
+fn task_config_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
+    serde_json::json!({
+        "type": "object",
+        "maxProperties": 32,
+        "additionalProperties": {
+            "type": "string",
+            "maxLength": 4096
+        }
+    })
+    .try_into()
+    .expect("the schema literal above is valid JSON Schema")
+}
+
 /// One task of a `Pipeline`. A task starts when every task in `dependsOn` has succeeded.
+///
+/// A `notebook` task names its source in `config`: `notebook` is the `.ipynb`
+/// file name and `objectVersion` the immutable published version; `params` is a
+/// JSON object string that papermill passes to the notebook. Nothing else is
+/// accepted, so a typo cannot silently become a default.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": r"self.kind != 'notebook' || (has(self.config) && 'notebook' in self.config && self.config['notebook'].matches('^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}\\.ipynb$') && 'objectVersion' in self.config && self.config['objectVersion'].matches('^\\S{1,128}$'))",
+        "message": "a notebook task needs config.notebook (a .ipynb file name) and config.objectVersion (the published version)"
+    },
+    {
+        "rule": r"self.kind != 'notebook' || !has(self.config) || self.config.all(k, k in ['notebook', 'objectVersion', 'params'])",
+        "message": "notebook tasks accept only notebook, objectVersion and params"
+    },
+    {
+        "rule": r"self.kind != 'notebook' || !has(self.config) || !('params' in self.config) || self.config['params'].size() <= 4096",
+        "message": "notebook params must be a JSON object string of at most 4096 characters"
+    }
+]))]
 pub struct PipelineTask {
     /// Unique within the pipeline; becomes the task id in the engine.
     #[schemars(
@@ -576,6 +615,7 @@ pub struct PipelineTask {
     pub warehouse: Option<String>,
     /// Task-specific parameters of the other kinds (model path, gate threshold, …).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[schemars(schema_with = "task_config_schema")]
     pub config: BTreeMap<String, String>,
 }
 
@@ -687,6 +727,71 @@ pub struct PipelineSpec {
     pub engine: PipelineEngine,
 }
 
+/// The `config` keys a `notebook` task accepts. The CEL rule spells the same list.
+const NOTEBOOK_CONFIG_KEYS: [&str; 3] = ["notebook", "objectVersion", "params"];
+
+/// Most parameters one notebook task may pass to papermill.
+const MAX_NOTEBOOK_PARAMS: usize = 32;
+
+/// A notebook file name: 1 to 128 characters from `[A-Za-z0-9._ -]`, starting
+/// with a letter or digit and ending in `.ipynb`. The task's CEL rule spells the
+/// same regular expression for admission.
+fn notebook_file_ok(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".ipynb") else {
+        return false;
+    };
+    let bytes = stem.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b' ' | b'-'))
+}
+
+/// A published object version: 1 to 128 characters, none of them whitespace.
+fn object_version_ok(version: &str) -> bool {
+    let count = version.chars().count();
+    (1..=128).contains(&count) && !version.chars().any(char::is_whitespace)
+}
+
+/// The `notebook` rules of [`PipelineSpec::validate`], with the same sentences as
+/// the CEL messages (spike #268: a notebook is pinned by an immutable object
+/// version, never by a branch or tag).
+fn validate_notebook_task(task: &PipelineTask) -> Result<(), String> {
+    let needs = "a notebook task needs config.notebook (a .ipynb file name) and config.objectVersion (the published version)";
+    let file_ok = task
+        .config
+        .get("notebook")
+        .is_some_and(|name| notebook_file_ok(name));
+    let version_ok = task
+        .config
+        .get("objectVersion")
+        .is_some_and(|version| object_version_ok(version));
+    if !file_ok || !version_ok {
+        return Err(needs.to_string());
+    }
+    if let Some(key) = task
+        .config
+        .keys()
+        .find(|key| !NOTEBOOK_CONFIG_KEYS.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "notebook tasks accept only notebook, objectVersion and params (found `{key}`)"
+        ));
+    }
+    if let Some(params) = task.config.get("params") {
+        let invalid =
+            "notebook params must be a JSON object string of string values, at most 32 keys";
+        let parsed: BTreeMap<String, String> =
+            serde_json::from_str(params).map_err(|_| invalid.to_string())?;
+        if parsed.len() > MAX_NOTEBOOK_PARAMS {
+            return Err(invalid.to_string());
+        }
+    }
+    Ok(())
+}
+
 impl PipelineSpec {
     /// The rules the schema's CEL validations also enforce, plus the one they cannot
     /// express (no dependency cycles), in one place for the controller and the tests.
@@ -703,6 +808,9 @@ impl PipelineSpec {
             }
             if task.kind == TaskKind::Sql && task.sql.is_none() {
                 return Err(format!("sql task `{}` needs a sql statement", task.name));
+            }
+            if task.kind == TaskKind::Notebook {
+                validate_notebook_task(task)?;
             }
         }
         for task in &self.tasks {
@@ -2149,6 +2257,180 @@ mod tests {
         }
     }
 
+    fn notebook_task(file: &str, version: &str) -> PipelineTask {
+        let mut t = task("report", TaskKind::Notebook, &[]);
+        t.config.insert("notebook".into(), file.into());
+        t.config.insert("objectVersion".into(), version.into());
+        t
+    }
+
+    const NOTEBOOK_NEEDS: &str = "a notebook task needs config.notebook (a .ipynb file name) and config.objectVersion (the published version)";
+
+    #[test]
+    fn notebook_task_needs_file_and_version() {
+        let missing = task("report", TaskKind::Notebook, &[]);
+        assert_eq!(
+            spec_of(vec![missing]).validate().unwrap_err(),
+            NOTEBOOK_NEEDS
+        );
+
+        let mut no_version = notebook_task("daily report.ipynb", "v1");
+        no_version.config.remove("objectVersion");
+        assert_eq!(
+            spec_of(vec![no_version]).validate().unwrap_err(),
+            NOTEBOOK_NEEDS
+        );
+
+        let mut no_file = notebook_task("daily report.ipynb", "v1");
+        no_file.config.remove("notebook");
+        assert_eq!(
+            spec_of(vec![no_file]).validate().unwrap_err(),
+            NOTEBOOK_NEEDS
+        );
+
+        assert_eq!(
+            spec_of(vec![notebook_task("daily report.ipynb", "v1")]).validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn notebook_file_must_be_ipynb() {
+        for bad in [
+            "report.py",
+            "report.ipynb ",
+            "/report.ipynb",
+            ".ipynb",
+            "réport.ipynb",
+            &format!("{}.ipynb", "a".repeat(129)),
+        ] {
+            let spec = spec_of(vec![notebook_task(bad, "v1")]);
+            assert_eq!(spec.validate().unwrap_err(), NOTEBOOK_NEEDS, "{bad:?}");
+        }
+        for good in [
+            "report.ipynb",
+            "daily report.ipynb",
+            "team.report-2_final.ipynb",
+            &format!("{}.ipynb", "a".repeat(128)),
+        ] {
+            assert_eq!(
+                spec_of(vec![notebook_task(good, "v1")]).validate(),
+                Ok(()),
+                "{good:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn notebook_object_version_must_be_pinned() {
+        for bad in ["", " ", "v1 2", "v1\n2", &format!("v{}", "a".repeat(128))] {
+            let spec = spec_of(vec![notebook_task("report.ipynb", bad)]);
+            assert_eq!(spec.validate().unwrap_err(), NOTEBOOK_NEEDS, "{bad:?}");
+        }
+        let longest = format!("v{}", "a".repeat(127));
+        assert_eq!(longest.chars().count(), 128);
+        assert_eq!(
+            spec_of(vec![notebook_task("report.ipynb", &longest)]).validate(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn notebook_refuses_unknown_config_keys() {
+        let mut t = notebook_task("report.ipynb", "v1");
+        t.config
+            .insert("repo".into(), "github.com/example/reports".into());
+        let err = spec_of(vec![t]).validate().unwrap_err();
+        assert!(
+            err.contains("notebook tasks accept only notebook, objectVersion and params"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn notebook_params_must_be_a_string_object() {
+        fn with_params(params: &str) -> Result<(), String> {
+            let mut t = notebook_task("report.ipynb", "v1");
+            t.config.insert("params".into(), params.into());
+            spec_of(vec![t]).validate()
+        }
+
+        assert_eq!(with_params("{}"), Ok(()));
+        assert_eq!(with_params(r#"{"days": "1", "region": "eu"}"#), Ok(()));
+        for bad in [
+            "1",
+            "[]",
+            "not json",
+            r#"{"days": 1}"#,
+            r#"{"days": null}"#,
+            r#"{"nested": {"a": "b"}}"#,
+        ] {
+            let err = with_params(bad).unwrap_err();
+            assert!(
+                err.contains("notebook params must be a JSON object string"),
+                "{bad:?}: {err}"
+            );
+        }
+
+        let params = |n: usize| -> String {
+            let map: BTreeMap<String, String> =
+                (0..n).map(|i| (format!("p{i}"), "x".to_string())).collect();
+            serde_json::to_string(&map).expect("serialize params")
+        };
+        assert_eq!(with_params(&params(32)), Ok(()));
+        assert!(
+            with_params(&params(33))
+                .unwrap_err()
+                .contains("at most 32 keys")
+        );
+    }
+
+    #[test]
+    fn sql_tasks_unchanged() {
+        // Other kinds keep their free-form config: `params` is a notebook rule only.
+        let mut sql = task("load", TaskKind::Sql, &[]);
+        sql.config.insert("gate".into(), "warn".into());
+        sql.config.insert("anything".into(), "not json".into());
+        assert_eq!(spec_of(vec![sql]).validate(), Ok(()));
+
+        let mut no_sql = task("load", TaskKind::Sql, &[]);
+        no_sql.sql = None;
+        assert!(
+            spec_of(vec![no_sql])
+                .validate()
+                .unwrap_err()
+                .contains("needs a sql statement")
+        );
+    }
+
+    #[test]
+    fn example_manifest_validates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/pipeline-notebook.yaml");
+        let text = std::fs::read_to_string(&path).expect("read examples/pipeline-notebook.yaml");
+        let pipeline: Pipeline =
+            serde_yaml::from_str(&text).expect("deserialize the example Pipeline");
+        assert_eq!(
+            pipeline.spec.validate(),
+            Ok(()),
+            "the example must pass the Rust rules"
+        );
+        let notebook = pipeline
+            .spec
+            .tasks
+            .iter()
+            .find(|task| task.kind == TaskKind::Notebook)
+            .expect("the example has a notebook task");
+        assert!(notebook.config.contains_key("objectVersion"));
+        let params = notebook
+            .config
+            .get("params")
+            .expect("params in the example");
+        let parsed: BTreeMap<String, String> =
+            serde_json::from_str(params).expect("params is a JSON object of strings");
+        assert!(!parsed.is_empty());
+    }
+
     #[test]
     fn existing_pipeline_manifests_still_deserialise() {
         fn yaml_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -2227,6 +2509,8 @@ mod tests {
         assert!(crd.contains("x-kubernetes-validations"));
         assert!(crd.contains("task names must be unique"));
         assert!(crd.contains("a sql task needs a sql statement"));
+        assert!(crd.contains("a notebook task needs config.notebook"));
+        assert!(crd.contains("notebook tasks accept only notebook, objectVersion and params"));
     }
 
     #[test]

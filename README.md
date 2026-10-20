@@ -20,7 +20,7 @@ not call the identity provider).
 | `PlatformInstance` | cluster | which pillars + profile are installed |
 | `Lakehouse` | namespaced | a managed catalog + storage (+ query) unit on object storage |
 | `IngestionSource` | namespaced | ingestion into Iceberg — one contract, three domains (`saas` / `enterprise` / `cdc`) |
-| `Pipeline` | namespaced | ordered `sql` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
+| `Pipeline` | namespaced | ordered `sql` / `notebook` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
 | `Connection` | namespaced | a typed connection to an outside system: settings in the resource, credentials in the secret store (types: `postgresql`, `mysql`, `sqlserver`, `oracle`, `rest-api`, `s3`, `kafka`, `sftp`, `generic`); validated at admission and synced into the Secret `conn-<name>` through External Secrets |
 | `Volume` | namespaced | a governed folder of files in the object store with an owner group and grants (`read` / `write` / `manage`), on managed or external storage; the resource is validated, nothing reconciles it yet |
 
@@ -193,7 +193,7 @@ spec:
   retries: { attempts: 2, backoff: 5m }
   tasks:
     - name: load
-      kind: sql          # sql | python | dbt | quality (dbt also pulls in dbt-core)
+      kind: sql          # sql | notebook | python | dbt | quality (dbt also pulls in dbt-core)
       sql: INSERT INTO warehouse.analytics.trips SELECT * FROM warehouse.raw.trips
     - name: build
       kind: dbt
@@ -204,6 +204,11 @@ spec:
       dependsOn: [build]
       config: { gate: "warn" }
 ```
+
+A `notebook` task is governed like `sql`: it runs with papermill on the notebook image as the run-as
+principal. Its source is pinned by `config.notebook` (a `.ipynb` file name) and `config.objectVersion`
+(the immutable published object version — never a branch or tag); `config.params` is a JSON object
+string of string values, passed to the notebook. See `examples/pipeline-notebook.yaml`.
 
 A `Connection` never holds a secret value. `scope: group` is managed and used by the members of `ownerGroup`;
 `scope: managed` is written by administrators, readable by nobody, and used only by platform-run code for the
