@@ -11,7 +11,13 @@ metadata:
   name: stardelt-operator
 rules:
   - apiGroups: ["stardelt.io"]
-    resources: ["platforminstances", "lakehouses", "ingestionsources", "pipelines", "connections"]
+    resources:
+      - "platforminstances"
+      - "lakehouses"
+      - "ingestionsources"
+      - "pipelines"
+      - "connections"
+      - "serviceprincipals"
     verbs: ["get", "list", "watch"]
   - apiGroups: ["stardelt.io"]
     resources:
@@ -20,6 +26,7 @@ rules:
       - "ingestionsources/status"
       - "pipelines/status"
       - "connections/status"
+      - "serviceprincipals/status"
     verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["events"]
@@ -43,6 +50,32 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: stardelt-operator
+subjects:
+  - kind: ServiceAccount
+    name: stardelt-operator
+    namespace: {{ .Release.Namespace }}
+---
+# The ServicePrincipal controller reads the credentials Secret of each principal. That right is
+# namespaced on purpose: reading every Secret in the cluster is more than the check needs.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: stardelt-operator-principals
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: stardelt-operator-principals
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: stardelt-operator-principals
 subjects:
   - kind: ServiceAccount
     name: stardelt-operator

@@ -4,6 +4,7 @@
 //! - `PlatformInstance` → platform-level prerequisites (CNPG operator), once
 //! - `Lakehouse` → its namespace-scoped plan (storage + catalog)
 //! - `Connection` → an External Secrets sync (see [`crate::connection`])
+//! - `ServicePrincipal` → validation and its credentials Secret check (see [`crate::principal`])
 //!
 //! Applies go through Helm. Both resources default to `dryRun: true`, so a new
 //! resource plans first and changes nothing until explicitly flipped.
@@ -27,12 +28,14 @@ use crate::connection::reconcile_connection;
 use crate::crd::Profile;
 use crate::crd::{
     ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, Lakehouse,
-    LakehouseStatus, PlatformInstance, PlatformInstanceStatus, StorageImpl, ValuesSource,
+    LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal, StorageImpl,
+    ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::objects::cnpg_cluster_resource;
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::prerequisites::CATALOG_CLUSTER;
+use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_keycloak, ensure_keycloak_pg, ensure_s3_secrets,
@@ -68,13 +71,22 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .run(reconcile_connection, error_policy, ctx.clone());
 
-    tracing::info!("stardelt-operator watching PlatformInstance, Lakehouse and Connection");
-    futures::pin_mut!(lakehouses, platforms, connections);
+    let principals = Controller::new(
+        Api::<ServicePrincipal>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .run(reconcile_principal, error_policy, ctx.clone());
+
+    tracing::info!(
+        "stardelt-operator watching PlatformInstance, Lakehouse, Connection and ServicePrincipal"
+    );
+    futures::pin_mut!(lakehouses, platforms, connections, principals);
     loop {
         tokio::select! {
             _ = lakehouses.next() => {}
             _ = platforms.next() => {}
             _ = connections.next() => {}
+            _ = principals.next() => {}
         }
     }
 }
