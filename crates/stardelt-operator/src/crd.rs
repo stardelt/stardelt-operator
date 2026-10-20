@@ -656,7 +656,21 @@ pub struct PipelineSpec {
     /// Optional schedule; a pipeline without one runs on demand only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<PipelineSchedule>,
+    /// The group that owns the pipeline: its members see it, run it and pause it in Nova. Optional so
+    /// that existing pipelines keep working; a pipeline without an owner is visible to administrators only.
+    #[serde(
+        default,
+        rename = "ownerGroup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub owner_group: Option<String>,
     /// Service principal the tasks run as. Absent means the platform's default pipeline principal.
+    /// By convention the principal of the owner group, named `pipeline-<ownerGroup>`; Nova's Schedule
+    /// writes that name.
     #[serde(default, rename = "runAs", skip_serializing_if = "Option::is_none")]
     pub run_as: Option<String>,
     /// Values for `${params.<name>}` in task statements.
@@ -677,6 +691,11 @@ impl PipelineSpec {
     /// The rules the schema's CEL validations also enforce, plus the one they cannot
     /// express (no dependency cycles), in one place for the controller and the tests.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(group) = &self.owner_group
+            && !group_name_ok(group)
+        {
+            return Err("ownerGroup must be a valid group name".to_string());
+        }
         let mut names = std::collections::BTreeSet::new();
         for task in &self.tasks {
             if !names.insert(task.name.as_str()) {
@@ -1317,6 +1336,18 @@ pub struct ExistingSecretRef {
     pub name: String,
 }
 
+/// A group name as Keycloak and the platform's resources spell it: 1 to 64 characters, starting
+/// with a letter or digit, then letters, digits, dot, underscore or dash.
+pub(crate) fn group_name_ok(group: &str) -> bool {
+    let bytes = group.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 64
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 /// A non-human identity for jobs, maintenance and collectors (decisions D20 and D21, internal note
 /// `design/scheduled-jobs.md`). With the platform identity provider the operator creates a client
 /// with a service account and the audiences below and writes its credentials to the Secret
@@ -1381,14 +1412,7 @@ impl ServicePrincipalSpec {
                 "service principal name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
             ));
         }
-        let group = self.owner_group.as_bytes();
-        if group.is_empty()
-            || group.len() > 64
-            || !group[0].is_ascii_alphanumeric()
-            || !group
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-        {
+        if !group_name_ok(&self.owner_group) {
             return Err("ownerGroup must be a valid group name".to_string());
         }
         let unique: std::collections::BTreeSet<_> =
@@ -2033,6 +2057,7 @@ mod tests {
             tasks,
             schedule: None,
             run_as: None,
+            owner_group: None,
             params: BTreeMap::new(),
             retries: None,
             timeout: None,
@@ -2092,6 +2117,69 @@ mod tests {
         assert_eq!(parsed.run_as.as_deref(), Some("pipeline-analytics"));
         assert_eq!(parsed.tasks[1].kind, TaskKind::Dbt);
         assert_eq!(serde_json::to_value(&parsed).expect("serialize"), spec);
+    }
+
+    #[test]
+    fn pipeline_owner_group_is_optional() {
+        let p: Pipeline = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Pipeline",
+            "metadata": { "name": "daily", "namespace": "stardelt" },
+            "spec": { "tasks": [ { "name": "load", "kind": "sql", "sql": "SELECT 1" } ] }
+        }))
+        .expect("deserialize Pipeline");
+        assert_eq!(p.spec.owner_group, None);
+        assert_eq!(p.spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn pipeline_owner_group_must_be_a_group_name() {
+        let mut spec = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        for bad in ["bad group!", "", &"a".repeat(65)] {
+            spec.owner_group = Some(bad.to_string());
+            assert_eq!(
+                spec.validate().unwrap_err(),
+                "ownerGroup must be a valid group name",
+                "{bad:?}"
+            );
+        }
+        for good in ["analytics", "data-eng.eu"] {
+            spec.owner_group = Some(good.to_string());
+            assert_eq!(spec.validate(), Ok(()), "{good}");
+        }
+    }
+
+    #[test]
+    fn existing_pipeline_manifests_still_deserialise() {
+        fn yaml_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read examples/") {
+                let path = entry.expect("read examples/ entry").path();
+                if path.is_dir() {
+                    yaml_files(&path, out);
+                } else if matches!(
+                    path.extension().and_then(std::ffi::OsStr::to_str),
+                    Some("yaml" | "yml")
+                ) {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut files = Vec::new();
+        yaml_files(&root, &mut files);
+        for path in files {
+            let text = std::fs::read_to_string(&path).expect("read example");
+            for document in serde_yaml::Deserializer::from_str(&text) {
+                let value = serde_yaml::Value::deserialize(document)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                if value.get("kind").and_then(serde_yaml::Value::as_str) != Some("Pipeline") {
+                    continue;
+                }
+                serde_yaml::from_value::<Pipeline>(value)
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            }
+        }
     }
 
     #[test]
