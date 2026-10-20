@@ -1,15 +1,24 @@
 use std::time::Duration;
 
-use stardelt_operator::crd::Profile;
+use anyhow::Context as _;
+use stardelt_operator::crd::{PlatformInstanceSpec, Profile};
+use stardelt_operator::identity_checklist;
 use stardelt_operator::values::effective_values;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
-    // `values` is a pure CLI: print what the controller would hand to Helm and
-    // exit, before the tracing setup or the tokio runtime exists.
+    // `values` and `identity-checklist` are pure CLIs: print what the controller would hand to
+    // Helm (or register in the provider) and exit, before the tracing setup or the tokio
+    // runtime exists.
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("values") {
-        return values_command(args.collect());
+    match args.next().as_deref() {
+        Some("values") => return values_command(args.collect()),
+        Some("identity-checklist") => return identity_checklist_command(args.collect()),
+        Some("--help" | "-h") => {
+            print_usage();
+            return Ok(());
+        }
+        _ => {}
     }
     run_controller()
 }
@@ -39,6 +48,57 @@ fn values_command(args: Vec<String>) -> anyhow::Result<()> {
 fn usage() -> ! {
     eprintln!("usage: stardelt-operator values <component> <demo|full|airgap>");
     std::process::exit(2)
+}
+
+/// `stardelt-operator identity-checklist <platforminstance.yaml> [--format json]`.
+///
+/// Reads a `PlatformInstance` document (only its `spec` matters) and prints what to register in
+/// the external provider, per client. A file that cannot be read, parsed or turned into a
+/// checklist exits 1 with the reason on stderr; a CLI misuse exits 2.
+fn identity_checklist_command(args: Vec<String>) -> anyhow::Result<()> {
+    let (path, json) = match args.as_slice() {
+        [path] => (path.as_str(), false),
+        [path, flag, format] if flag == "--format" && format == "json" => (path.as_str(), true),
+        _ => checklist_usage(),
+    };
+
+    #[derive(serde::Deserialize)]
+    struct InstanceDocument {
+        spec: PlatformInstanceSpec,
+    }
+
+    let document = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read the PlatformInstance file {path}"))?;
+    let document: InstanceDocument = serde_yaml::from_str(&document)
+        .with_context(|| format!("{path} is not a PlatformInstance with a spec"))?;
+
+    let entries = match identity_checklist::checklist(&document.spec) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        print!("{}", identity_checklist::render(&entries));
+    }
+    Ok(())
+}
+
+/// A checklist CLI misuse: print its usage line on stderr and exit 2.
+fn checklist_usage() -> ! {
+    eprintln!(
+        "usage: stardelt-operator identity-checklist <platforminstance.yaml> [--format json]"
+    );
+    std::process::exit(2)
+}
+
+/// `stardelt-operator --help`.
+fn print_usage() {
+    println!("usage: stardelt-operator values <component> <demo|full|airgap>");
+    println!("       stardelt-operator identity-checklist <platforminstance.yaml> [--format json]");
 }
 
 #[tokio::main]

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+# `cargo run` starts the operator, not `crdgen`; the CLIs are `cargo run -q -- <command>`.
+default-run = "stardelt-operator"
 
 [dependencies]
 tokio.workspace = true

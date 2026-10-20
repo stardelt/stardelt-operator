@@ -25,3 +25,6 @@ spec:
       trino:      { clientId: 33333333-3333-4333-8333-333333333333, clientSecretRef: { name: idp-trino } }
       lakekeeper: { clientId: 44444444-4444-4444-8444-444444444444 }  # public (PKCE), no secret
       superset:   { clientId: 55555555-5555-4555-8555-555555555555, clientSecretRef: { name: idp-superset, key: client-secret } }
+      airflow:    { clientId: 66666666-6666-4666-8666-666666666666, clientSecretRef: { name: idp-airflow } }
+      jupyterhub: { clientId: 77777777-7777-4777-8777-777777777777, clientSecretRef: { name: idp-jupyterhub } }
+      # trino-group-sync is a service client; add it only when Trino reads groups from the provider.

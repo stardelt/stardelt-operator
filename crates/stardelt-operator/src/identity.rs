@@ -11,8 +11,9 @@ use kube::api::ObjectMeta;
 
 use crate::crd::{IdentityMode, IdentityProvider, PlatformInstanceSpec};
 
-/// The client names an `external` instance may use (the app registrations of D31).
-const CLIENT_NAMES: [&str; 7] = [
+/// The client names an `external` instance may use (the app registrations of D31), in the
+/// order the checklist prints them.
+pub(crate) const CLIENT_NAMES: [&str; 7] = [
     "nova",
     "trino",
     "lakekeeper",
@@ -132,6 +133,30 @@ pub(crate) fn base_domain(spec: &PlatformInstanceSpec) -> Result<&str, IdentityE
     spec.base_domain
         .as_deref()
         .ok_or_else(|| IdentityError("identity needs baseDomain".into()))
+}
+
+/// The application hosts of one instance: Nova answers on the base domain, every other
+/// application on a subdomain. The platform-mode realm and the external-mode checklist both
+/// build their redirect URIs from these, so the two cannot disagree.
+pub(crate) struct Hosts {
+    pub(crate) nova: String,
+    pub(crate) trino: String,
+    pub(crate) lakekeeper: String,
+    pub(crate) superset: String,
+    pub(crate) airflow: String,
+    pub(crate) jupyter: String,
+}
+
+/// The hosts one instance is served under. The single place the subdomain pattern lives.
+pub(crate) fn hosts(domain: &str) -> Hosts {
+    Hosts {
+        nova: domain.to_string(),
+        trino: format!("trino.{domain}"),
+        lakekeeper: format!("lakekeeper.{domain}"),
+        superset: format!("superset.{domain}"),
+        airflow: format!("airflow.{domain}"),
+        jupyter: format!("jupyter.{domain}"),
+    }
 }
 
 /// The data of ConfigMap `stardelt-identity`, or `None` when sign-in is off (no ConfigMap exists

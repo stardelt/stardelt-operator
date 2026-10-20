@@ -10,6 +10,7 @@ pub mod controller;
 pub mod crd;
 pub mod helm;
 pub mod identity;
+pub mod identity_checklist;
 pub mod keycloak;
 pub mod objects;
 pub mod planner;
