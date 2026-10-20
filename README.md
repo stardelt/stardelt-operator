@@ -50,11 +50,23 @@ spec:
   baseDomain: data.example.com      # Nova answers here, every other application on a subdomain
   identity:                         # where users sign in (decision D20)
     mode: external                  # none (default) | platform (Keycloak at id.<baseDomain>) | external
+    provider: oidc                  # external only: oidc (default) | entra
     issuerUrl: https://login.microsoftonline.com/<tenant-id>/v2.0   # external only, https
-    groupClaim: groups              # default
+    apiAudience: <api-app-client-id> # external only: the audience engine and catalog accept
+    clients:                        # external only: app registrations the customer made
+      nova: { clientId: <id>, clientSecretRef: { name: idp-nova } }
+      lakekeeper: { clientId: <id> } # public, no secret
+    groupClaim: groups              # optional: groups, roles for entra
     adminGroup: stardelt-admins     # default
   dryRun: true                      # plan first; flip to apply
 ```
+
+A complete Entra instance is in
+[`examples/platforminstance-external-entra.yaml`](examples/platforminstance-external-entra.yaml):
+all ids are fake, and nothing in it is a secret value — `clientSecretRef` names a Secret in the
+platform namespace. For `external`, `issuerUrl`, `apiAudience` and a `nova` client are required;
+client names are limited to the platform's known clients, and every client except the public
+`lakekeeper` one needs a `clientSecretRef`.
 
 `identity` and `baseDomain` are validated by the API server (an `external` provider needs an
 `https://` issuer, `platform` derives it and refuses one, both need `baseDomain`). `contract()`
