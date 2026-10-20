@@ -92,12 +92,20 @@ spec:
               tasks:
                 description: Tasks of the pipeline; at least one, at most 30.
                 items:
-                  description: One task of a `Pipeline`. A task starts when every task in `dependsOn` has succeeded.
+                  description: |-
+                    One task of a `Pipeline`. A task starts when every task in `dependsOn` has succeeded.
+
+                    A `notebook` task names its source in `config`: `notebook` is the `.ipynb`
+                    file name and `objectVersion` the immutable published version; `params` is a
+                    JSON object string that papermill passes to the notebook. Nothing else is
+                    accepted, so a typo cannot silently become a default.
                   properties:
                     config:
                       additionalProperties:
+                        maxLength: 4096
                         type: string
                       description: Task-specific parameters of the other kinds (model path, gate threshold, …).
+                      maxProperties: 32
                       type: object
                     dependsOn:
                       description: Names of the tasks that must succeed first.
@@ -113,6 +121,7 @@ spec:
                         written ahead of their runtimes.
                       enum:
                       - sql
+                      - notebook
                       - python
                       - dbt
                       - quality
@@ -139,6 +148,13 @@ spec:
                   - kind
                   - name
                   type: object
+                  x-kubernetes-validations:
+                  - message: a notebook task needs config.notebook (a .ipynb file name) and config.objectVersion (the published version)
+                    rule: self.kind != 'notebook' || (has(self.config) && 'notebook' in self.config && self.config['notebook'].matches('^[A-Za-z0-9][A-Za-z0-9._ -]{0,127}\\.ipynb$') && 'objectVersion' in self.config && self.config['objectVersion'].matches('^\\S{1,128}$'))
+                  - message: notebook tasks accept only notebook, objectVersion and params
+                    rule: self.kind != 'notebook' || !has(self.config) || self.config.all(k, k in ['notebook', 'objectVersion', 'params'])
+                  - message: notebook params must be a JSON object string of at most 4096 characters
+                    rule: self.kind != 'notebook' || !has(self.config) || !('params' in self.config) || self.config['params'].size() <= 4096
                 maxItems: 30
                 minItems: 1
                 type: array

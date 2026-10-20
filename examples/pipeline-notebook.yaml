@@ -1,0 +1,31 @@
+# A scheduled notebook (J2). The source is a published object version:
+# `objectVersion` is immutable, so a later publish never changes what this
+# schedule runs (decision 8; spike stardelt-platform#268). Never point a
+# schedule at a branch or tag. `config.params` is a JSON object string of
+# string values; papermill passes it to the notebook when the task runs.
+apiVersion: stardelt.io/v1alpha1
+kind: Pipeline
+metadata:
+  name: daily-sales
+  namespace: stardelt
+spec:
+  ownerGroup: analytics
+  runAs: pipeline-analytics
+  schedule:
+    cron: "0 3 * * *"
+    timezone: Europe/Berlin
+  params:
+    days: "1"
+  tasks:
+    - name: prepare
+      kind: sql
+      sql: |
+        CREATE TABLE IF NOT EXISTS warehouse.analytics.sales_daily
+        AS SELECT * FROM warehouse.raw.sales WHERE 1 = 0
+    - name: report
+      kind: notebook
+      dependsOn: [prepare]
+      config:
+        notebook: sales_daily.ipynb
+        objectVersion: 6f1a0c9e-3b7d-4a52-9f00-2d8c1b7e4a10
+        params: '{"days": "1", "region": "eu"}'
