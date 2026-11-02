@@ -38,8 +38,8 @@ use crate::prerequisites::CATALOG_CLUSTER;
 use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
-    ensure_identity_secrets, ensure_keycloak, ensure_keycloak_pg, ensure_nova, ensure_nova_pg,
-    ensure_nova_session, ensure_s3_secrets,
+    ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg, ensure_nova,
+    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -939,6 +939,10 @@ async fn reconcile_platform(
     }
     if let Some(nova) = ensure_nova(&ctx, &instance.spec).await {
         outcome.components.push(nova);
+    }
+    // The Ingress objects come last: they route to the Services above.
+    if let Some(ingress) = ensure_ingress(&ctx, &instance.spec).await {
+        outcome.components.push(ingress);
     }
     let phase = phase(instance.spec.dry_run, &outcome);
 

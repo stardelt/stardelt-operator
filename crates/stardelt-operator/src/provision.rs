@@ -10,6 +10,7 @@ use k8s_openapi::{
         apps::v1::Deployment,
         batch::v1::Job,
         core::v1::{ConfigMap, Secret, Service, ServiceAccount},
+        networking::v1::Ingress,
         rbac::v1::{Role, RoleBinding},
     },
 };
@@ -22,7 +23,7 @@ use kube::{
 use crate::{
     controller::Context,
     crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
-    identity, keycloak, nova,
+    identity, ingress, keycloak, nova,
     objects::{
         apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
         owner_reference,
@@ -706,6 +707,46 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
             "waiting for the Deployment to become ready",
         ))
     }
+}
+
+/// The Ingress objects of the applications (`spec.ingress`): Nova on the base domain, and with
+/// `identity.mode: platform` the identity provider on `id.<base domain>`. `None` unless
+/// `spec.ingress.enabled`. Nova's Ingress is left out without the `lakehouse` pillar, because
+/// Nova is not installed then. An Ingress has no readiness of its own: it is reported ready once
+/// it is applied.
+pub async fn ensure_ingress(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<ComponentStatus> {
+    const NAME: &str = "ingress";
+    if !spec.ingress.enabled {
+        return None;
+    }
+    let mut objects = Vec::new();
+    if spec.pillars.lakehouse {
+        objects.extend(ingress::nova(spec));
+    }
+    objects.extend(ingress::keycloak(spec));
+    if objects.is_empty() {
+        return Some(status(
+            NAME,
+            false,
+            "nothing to publish: ingress needs baseDomain and an application that has a host",
+        ));
+    }
+    let namespace = &spec.namespace;
+    let mut names = Vec::new();
+    for object in &objects {
+        if let Err(e) = apply::<Ingress>(&ctx.client, namespace, object, spec.dry_run).await {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        names.push(object.name_any());
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): Ingress {}", names.join(", ")),
+        ));
+    }
+    Some(status(NAME, true, format!("applied: {}", names.join(", "))))
 }
 
 /// Publish the identity contract (ConfigMap `stardelt-identity`, decision D20) in the platform
@@ -1731,5 +1772,130 @@ mod tests {
             .find(|var| var["name"] == "NOVA_BASE_DOMAIN")
             .expect("NOVA_BASE_DOMAIN");
         assert_eq!(domain["value"], "example.com");
+    }
+
+    /// A platform spec with ingress switched on, the given identity mode and lakehouse pillar.
+    fn platform_with_ingress(mode: &str, lakehouse: bool, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "baseDomain": "example.com",
+                "dryRun": dry_run,
+                "identity": { "mode": mode },
+                "pillars": { "lakehouse": lakehouse },
+                "ingress": { "enabled": true, "className": "traefik" },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
+    const INGRESSES: &str = "/apis/networking.k8s.io/v1/namespaces/stardelt/ingresses";
+
+    #[tokio::test]
+    async fn ingress_exists_only_when_it_is_enabled() {
+        let (client, requests) = keycloak_client(&[], None);
+        assert!(
+            ensure_ingress(&context(client), &platform("platform", false))
+                .await
+                .is_none()
+        );
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingress_dry_run_plans_nova_and_the_identity_provider() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_ingress("platform", true, true),
+        )
+        .await
+        .expect("a status");
+        assert_eq!(status.name, "ingress");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Ingress nova, keycloak")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            [format!("{INGRESSES}/nova"), format!("{INGRESSES}/keycloak")]
+        );
+    }
+
+    #[tokio::test]
+    async fn ingress_applies_the_objects_with_the_hosts_and_the_class() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_ingress("platform", true, false),
+        )
+        .await
+        .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("applied: nova, keycloak"));
+        let requests = requests.lock().expect("requests poisoned");
+        let body = |name: &str| -> serde_json::Value {
+            let found = requests
+                .iter()
+                .find(|(method, path, _)| {
+                    method == "PATCH" && path.ends_with(&format!("/ingresses/{name}"))
+                })
+                .expect("an applied Ingress");
+            serde_json::from_str(&found.2).expect("JSON body")
+        };
+        let nova = body("nova");
+        assert_eq!(nova["kind"], "Ingress");
+        assert_eq!(nova["spec"]["ingressClassName"], "traefik");
+        assert_eq!(nova["spec"]["rules"][0]["host"], "example.com");
+        let keycloak = body("keycloak");
+        assert_eq!(keycloak["spec"]["rules"][0]["host"], "id.example.com");
+    }
+
+    #[tokio::test]
+    async fn without_the_lakehouse_pillar_nova_gets_no_ingress() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_ingress("platform", false, false),
+        )
+        .await
+        .expect("a status");
+        assert_eq!(status.message.as_deref(), Some("applied: keycloak"));
+        assert_eq!(applied_paths(&requests), [format!("{INGRESSES}/keycloak")]);
+    }
+
+    #[tokio::test]
+    async fn without_platform_identity_only_nova_gets_an_ingress() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_ingress("none", true, false),
+        )
+        .await
+        .expect("a status");
+        assert_eq!(status.message.as_deref(), Some("applied: nova"));
+        assert_eq!(applied_paths(&requests), [format!("{INGRESSES}/nova")]);
+    }
+
+    #[tokio::test]
+    async fn ingress_with_nothing_to_publish_says_so_and_applies_nothing() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_ingress("none", false, false),
+        )
+        .await
+        .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("nothing to publish: ingress needs baseDomain and an application that has a host")
+        );
+        assert!(applied_paths(&requests).is_empty());
     }
 }
