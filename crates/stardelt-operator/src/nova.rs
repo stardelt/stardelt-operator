@@ -49,6 +49,7 @@ pub const SESSION: IdentitySecret = IdentitySecret {
     name: SESSION_SECRET,
     fixed: &[],
     generated: &["session"],
+    fernet: &[],
 };
 /// Secret that CloudNative-PG generates for the state store; its `uri` key is a complete URL.
 pub const DATABASE_SECRET: &str = "nova-pg-app";

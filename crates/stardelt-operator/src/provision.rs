@@ -480,6 +480,12 @@ async fn ensure_generated_secrets(
         for key in missing {
             let value = match desired.fixed.iter().find(|(name, _)| *name == key.as_str()) {
                 Some((_, value)) => (*value).to_string(),
+                None if desired.fernet.contains(&key.as_str()) => {
+                    match keycloak::generate_fernet_key() {
+                        Ok(value) => value,
+                        Err(e) => return status(name, false, e.to_string()),
+                    }
+                }
                 None => match keycloak::generate_secret() {
                     Ok(value) => value,
                     Err(e) => return status(name, false, e.to_string()),
@@ -1263,8 +1269,14 @@ mod tests {
                     match patch.get("stringData").and_then(|value| value.as_object()) {
                         Some(string_data) => {
                             let data = object["data"].as_object_mut().expect("data");
+                            // The API server stores `stringData` base64-encoded under `data`.
                             for (key, value) in string_data {
-                                data.insert(key.clone(), value.clone());
+                                data.insert(
+                                    key.clone(),
+                                    serde_json::Value::String(standard_base64(
+                                        value.as_str().unwrap_or_default().as_bytes(),
+                                    )),
+                                );
                             }
                         }
                         None => *object = patch,
@@ -1281,6 +1293,28 @@ mod tests {
             }
         });
         (kube::Client::new(service, "stardelt"), store, recorder)
+    }
+
+    /// Standard base64 (RFC 4648 section 4) with padding, as the API server stores a Secret value.
+    fn standard_base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let group = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for position in 0..4 {
+                if position <= chunk.len() {
+                    out.push(char::from(
+                        ALPHABET[((group >> (18 - 6 * position)) & 63) as usize],
+                    ));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
     }
 
     /// How many writes a request log holds.
@@ -1897,5 +1931,68 @@ mod tests {
             Some("nothing to publish: ingress needs baseDomain and an application that has a host")
         );
         assert!(applied_paths(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_airflow_secrets_are_created_once_and_the_fernet_key_has_its_format() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("none", false);
+        let status =
+            ensure_generated_secrets(&ctx, &spec, "airflow-secrets", &crate::airflow::SECRETS)
+                .await;
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.name, "airflow-secrets");
+        assert_eq!(status.message.as_deref(), Some("ready: created 5 / kept 0"));
+        assert_eq!(patch_count(&requests), 5);
+        let fernet = applied_secret(&requests, "airflow-fernet-key");
+        let value = fernet["data"]["fernet-key"].as_str().expect("a key");
+        // 44 characters of url-safe base64, stored base64 again: 60 characters, one padding sign.
+        assert_eq!(value.len(), 60);
+        assert!(value.ends_with('='));
+        let webserver = applied_secret(&requests, "airflow-webserver-key");
+        assert_base64_of_48_bytes(
+            webserver["data"]["webserver-secret-key"]
+                .as_str()
+                .expect("a key"),
+        );
+        assert_base64_of_48_bytes(webserver["data"]["api-secret-key"].as_str().expect("a key"));
+        let nova_api = applied_secret(&requests, "airflow-nova-api");
+        assert_eq!(
+            nova_api["data"]["username"], "bm92YS1hcGk=",
+            "base64 of nova-api"
+        );
+
+        // A second reconcile reads the stored Secrets and rewrites nothing.
+        let before = store.lock().expect("store poisoned").clone();
+        let again =
+            ensure_generated_secrets(&ctx, &spec, "airflow-secrets", &crate::airflow::SECRETS)
+                .await;
+        assert_eq!(again.message.as_deref(), Some("ready: created 0 / kept 5"));
+        assert_eq!(patch_count(&requests), 5, "a reconcile may not write");
+        assert_eq!(*store.lock().expect("store poisoned"), before);
+    }
+
+    #[tokio::test]
+    async fn an_airflow_secret_that_lacks_its_fernet_key_gets_one_and_keeps_its_other_keys() {
+        let initial = BTreeMap::from([(
+            "airflow-fernet-key".to_string(),
+            secret_object("airflow-fernet-key", &[("other", "b2xk")]),
+        )]);
+        let (client, store, _requests) = identity_client(initial);
+        let status = ensure_generated_secrets(
+            &context(client),
+            &platform("none", false),
+            "airflow-secrets",
+            &crate::airflow::SECRETS[..1],
+        )
+        .await;
+        assert!(status.ready, "{status:?}");
+        let store = store.lock().expect("store poisoned");
+        let data = store["airflow-fernet-key"]["data"]
+            .as_object()
+            .expect("data");
+        assert_eq!(data["other"], "b2xk", "an existing key is untouched");
+        assert_eq!(data["fernet-key"].as_str().expect("a key").len(), 60);
     }
 }
