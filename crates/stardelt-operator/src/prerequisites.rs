@@ -160,6 +160,26 @@ pub fn catalog_cluster(lakehouse: &str, namespace: &str, profile: Profile) -> Dy
     }
 }
 
+/// The continuous backup of a platform database: WAL and base backups go to the `backups`
+/// bucket of the object store, 14 days kept. CloudNative-PG writes under `<bucket>/<cluster>/`,
+/// so every platform database shares the bucket without colliding.
+fn continuous_backup(namespace: &str) -> serde_json::Value {
+    json!({
+        "retentionPolicy": "14d",
+        "barmanObjectStore": {
+            "destinationPath": "s3://backups/",
+            "endpointURL": s3_endpoint(namespace),
+            "s3Credentials": {
+                "accessKeyId": {"name": S3_SECRET, "key": "access-key"},
+                "secretAccessKey": {"name": S3_SECRET, "key": "secret-key"},
+                "region": {"name": S3_SECRET, "key": "region"},
+            },
+            "wal": {"compression": "gzip", "maxParallel": 2},
+            "data": {"compression": "gzip"},
+        },
+    })
+}
+
 /// The CloudNative-PG `Cluster` that stores Keycloak's state (realms, users, sessions),
 /// for `identity.mode: platform`. Mirrors `manifests/keycloak.yaml` in stardelt-platform.
 pub fn keycloak_pg_cluster(namespace: &str) -> DynamicObject {
@@ -172,20 +192,7 @@ pub fn keycloak_pg_cluster(namespace: &str) -> DynamicObject {
         data: json!({"spec": {
             "instances": 1,
             "storage": {"size": "1Gi"},
-            "backup": {
-                "retentionPolicy": "14d",
-                "barmanObjectStore": {
-                    "destinationPath": "s3://backups/",
-                    "endpointURL": s3_endpoint(namespace),
-                    "s3Credentials": {
-                        "accessKeyId": {"name": S3_SECRET, "key": "access-key"},
-                        "secretAccessKey": {"name": S3_SECRET, "key": "secret-key"},
-                        "region": {"name": S3_SECRET, "key": "region"},
-                    },
-                    "wal": {"compression": "gzip", "maxParallel": 2},
-                    "data": {"compression": "gzip"},
-                },
-            },
+            "backup": continuous_backup(namespace),
             "bootstrap": {"initdb": {"database": "keycloak", "owner": "keycloak"}},
             "resources": {
                 "requests": {"cpu": "50m", "memory": "128Mi"},
@@ -209,6 +216,58 @@ pub fn keycloak_pg_backup(namespace: &str) -> DynamicObject {
             "backupOwnerReference": "self",
             "method": "barmanObjectStore",
             "cluster": {"name": "keycloak-pg"},
+        }}),
+    }
+}
+
+/// CloudNative-PG `Cluster` that stores Nova's state (saved queries, settings, the query log).
+pub const NOVA_CLUSTER: &str = "nova-pg";
+
+/// The CloudNative-PG `Cluster` of Nova: a database of its own, so Nova never shares one with the
+/// catalog or the identity provider. Mirrors `manifests/nova-pg.yaml` in stardelt-platform,
+/// including its three hardening settings: the PostgreSQL image is pinned (an apply must not
+/// track the CloudNative-PG default and start a major upgrade), `max_connections` is 150 (the
+/// default 100 was filled by clients stuck in authentication during an outage) and the startup
+/// probe tolerates a long recovery. CloudNative-PG generates Secret `nova-pg-app`; its `uri` key
+/// is the complete URL that `NOVA_DATABASE_URL` reads.
+pub fn nova_pg_cluster(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "Cluster".into(),
+        }),
+        metadata: platform_meta(NOVA_CLUSTER, namespace, NOVA_CLUSTER),
+        data: json!({"spec": {
+            "instances": 1,
+            "imageName": "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
+            "storage": {"size": "1Gi"},
+            "backup": continuous_backup(namespace),
+            "bootstrap": {"initdb": {"database": "nova", "owner": "nova"}},
+            "resources": {
+                "requests": {"cpu": "50m", "memory": "256Mi"},
+                "limits": {"cpu": "500m", "memory": "2Gi"},
+            },
+            "postgresql": {"parameters": {"max_connections": "150"}},
+            "probes": {"startup": {"failureThreshold": 120}},
+        }}),
+    }
+}
+
+/// The daily base backup of Nova's database, 15 minutes after the identity database
+/// (`0 45 2`) and 30 after the catalog's, as in the platform manifest.
+pub fn nova_pg_backup(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "ScheduledBackup".into(),
+        }),
+        metadata: platform_meta("nova-pg-daily", namespace, NOVA_CLUSTER),
+        data: json!({"spec": {
+            "schedule": "0 0 3 * * *",
+            "immediate": true,
+            "backupOwnerReference": "self",
+            "method": "barmanObjectStore",
+            "cluster": {"name": NOVA_CLUSTER},
         }}),
     }
 }
@@ -484,6 +543,108 @@ mod tests {
                 "platform-scoped objects are not tied to a Lakehouse"
             );
         }
+    }
+
+    #[test]
+    fn nova_pg_cluster_mirrors_the_platform_manifest() {
+        let cluster = nova_pg_cluster("stardelt");
+        assert_eq!(
+            cluster
+                .types
+                .as_ref()
+                .map(|t| (t.api_version.as_str(), t.kind.as_str())),
+            Some(("postgresql.cnpg.io/v1", "Cluster"))
+        );
+        assert_eq!(cluster.metadata.name.as_deref(), Some("nova-pg"));
+        assert_eq!(cluster.metadata.namespace.as_deref(), Some("stardelt"));
+        let spec = &cluster.data["spec"];
+        assert_eq!(spec["instances"], 1);
+        assert_eq!(
+            spec["imageName"],
+            "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie"
+        );
+        assert_eq!(spec["storage"]["size"], "1Gi");
+        assert_eq!(spec["bootstrap"]["initdb"]["database"], "nova");
+        assert_eq!(spec["bootstrap"]["initdb"]["owner"], "nova");
+        assert_eq!(spec["resources"]["requests"]["cpu"], "50m");
+        assert_eq!(spec["resources"]["requests"]["memory"], "256Mi");
+        assert_eq!(spec["resources"]["limits"]["cpu"], "500m");
+        assert_eq!(spec["resources"]["limits"]["memory"], "2Gi");
+        assert_eq!(spec["postgresql"]["parameters"]["max_connections"], "150");
+        assert_eq!(spec["probes"]["startup"]["failureThreshold"], 120);
+        assert_eq!(spec["backup"]["retentionPolicy"], "14d");
+        let store = &spec["backup"]["barmanObjectStore"];
+        assert_eq!(store["destinationPath"], "s3://backups/");
+        assert_eq!(
+            store["endpointURL"],
+            "http://seaweedfs-s3.stardelt.svc.cluster.local:8333"
+        );
+        for (slot, key) in [
+            ("accessKeyId", "access-key"),
+            ("secretAccessKey", "secret-key"),
+            ("region", "region"),
+        ] {
+            assert_eq!(store["s3Credentials"][slot]["name"], "stardelt-s3-creds");
+            assert_eq!(store["s3Credentials"][slot]["key"], key);
+        }
+        assert_eq!(store["wal"]["compression"], "gzip");
+        assert_eq!(store["wal"]["maxParallel"], 2);
+        assert_eq!(store["data"]["compression"], "gzip");
+        // The endpoint follows the platform namespace.
+        assert_eq!(
+            nova_pg_cluster("lab").data["spec"]["backup"]["barmanObjectStore"]["endpointURL"],
+            "http://seaweedfs-s3.lab.svc.cluster.local:8333"
+        );
+    }
+
+    #[test]
+    fn nova_pg_backup_runs_after_the_other_two_databases() {
+        let backup = nova_pg_backup("stardelt");
+        assert_eq!(
+            backup
+                .types
+                .as_ref()
+                .map(|t| (t.api_version.as_str(), t.kind.as_str())),
+            Some(("postgresql.cnpg.io/v1", "ScheduledBackup"))
+        );
+        assert_eq!(backup.metadata.name.as_deref(), Some("nova-pg-daily"));
+        assert_eq!(backup.metadata.namespace.as_deref(), Some("stardelt"));
+        let spec = &backup.data["spec"];
+        assert_eq!(spec["schedule"], "0 0 3 * * *");
+        assert_eq!(spec["immediate"], true);
+        assert_eq!(spec["backupOwnerReference"], "self");
+        assert_eq!(spec["method"], "barmanObjectStore");
+        assert_eq!(spec["cluster"]["name"], "nova-pg");
+    }
+
+    #[test]
+    fn nova_pg_objects_carry_the_platform_labels() {
+        for (object, name) in [
+            (nova_pg_cluster("stardelt"), "nova-pg"),
+            (nova_pg_backup("stardelt"), "nova-pg-daily"),
+        ] {
+            assert_eq!(object.metadata.name.as_deref(), Some(name));
+            let labels = object.metadata.labels.as_ref().expect("labels");
+            assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
+            assert_eq!(labels["stardelt.io/component"], "nova-pg");
+            assert!(
+                !labels.contains_key("stardelt.io/lakehouse"),
+                "platform-scoped objects are not tied to a Lakehouse"
+            );
+        }
+    }
+
+    #[test]
+    fn keycloak_and_nova_databases_share_one_backup_block() {
+        // The keycloak builder shares the backup block with nova-pg: one definition.
+        assert_eq!(
+            keycloak_pg_cluster("stardelt").data["spec"]["backup"],
+            nova_pg_cluster("stardelt").data["spec"]["backup"]
+        );
+        assert_ne!(
+            keycloak_pg_backup("stardelt").data["spec"]["schedule"],
+            nova_pg_backup("stardelt").data["spec"]["schedule"]
+        );
     }
 
     #[test]
