@@ -155,7 +155,37 @@ apiServer:
         # at every login (the same group Nova treats as administrator).
         AUTH_USER_REGISTRATION = True
         AUTH_USER_REGISTRATION_ROLE = "stardelt-member"
-        AUTH_ROLES_MAPPING = {_admin_group: ["Admin"]}
+        # A group role exists only after the sync Job has created it, and a new group must take
+        # effect at the next sign-in, not at a webserver restart. FAB calls items() once per
+        # sign-in; a failed query falls back to the admin entry and never raises.
+        class _AuthRolesMapping(dict):
+            def items(self):
+                try:
+                    from airflow.providers.fab.auth_manager.cli_commands.utils import get_application_builder
+
+                    with get_application_builder() as appbuilder:
+                        sm = appbuilder.sm
+                        roles = sm.get_all_roles() or []
+                        base = dict(super().items()) if dict.__dict__.get("items") else {}
+                        mapping = {}
+                        admin_entry = base.get(_admin_group, ["Admin"])
+                        mapping[_admin_group] = admin_entry
+                        for role in roles:
+                            name = getattr(role, "name", None)
+                            if not name or not name.startswith("stardelt-group-"):
+                                continue
+                            group = name[len("stardelt-group-"):]
+                            if not group:
+                                continue
+                            mapping[group] = ["stardelt-member", name]
+                        return mapping.items()
+                except Exception:
+                    try:
+                        return dict(super().items()).items()
+                    except Exception:
+                        return [(_admin_group, ["Admin"])]
+
+        AUTH_ROLES_MAPPING = _AuthRolesMapping({_admin_group: ["Admin"]})
         AUTH_ROLES_SYNC_AT_LOGIN = True
     else:
         AUTH_TYPE = AUTH_DB
