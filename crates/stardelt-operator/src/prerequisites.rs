@@ -348,6 +348,81 @@ fn secret_env(name: &str, key: &str) -> EnvVar {
     }
 }
 
+/// Bucket for published notebooks (Nova's publish route writes a new object version per publish,
+/// so the bucket must keep versions). SeaweedFS' chart can create a bucket but not switch
+/// versioning on, so [`notebooks_bucket_job`] does both.
+pub const NOTEBOOKS_BUCKET: &str = "notebooks";
+/// Creates [`NOTEBOOKS_BUCKET`] and turns versioning on (idempotent).
+pub const NOTEBOOKS_BUCKET_SCRIPT: &str = include_str!("notebooks_bucket.sh");
+
+/// Name of the notebooks-bucket Job. It changes when the endpoint changes, because a Job spec is
+/// immutable and a new object store needs the bucket again.
+pub fn notebooks_bucket_job_name(endpoint: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    (NOTEBOOKS_BUCKET, endpoint).hash(&mut hasher);
+    format!("notebooks-bucket-{:08x}", hasher.finish() as u32)
+}
+
+/// The Job that creates the versioned notebooks bucket with the AWS CLI, against the object store
+/// of the Lakehouse, with its credentials from Secret `stardelt-s3-creds`. Mirrors
+/// `scripts/create-notebooks-bucket.sh` in stardelt-platform.
+pub fn notebooks_bucket_job(
+    lakehouse: &str,
+    namespace: &str,
+    name: &str,
+    owner: OwnerReference,
+) -> Job {
+    let mut metadata = meta(name, namespace, lakehouse, "notebooks-bucket");
+    metadata.owner_references = Some(vec![owner]);
+    Job {
+        metadata,
+        spec: Some(JobSpec {
+            ttl_seconds_after_finished: Some(600),
+            backoff_limit: Some(4),
+            template: PodTemplateSpec {
+                spec: Some(PodSpec {
+                    restart_policy: Some("OnFailure".into()),
+                    automount_service_account_token: Some(false),
+                    containers: vec![Container {
+                        name: "bucket".into(),
+                        image: Some("amazon/aws-cli:2.17.0".into()),
+                        command: Some(vec!["sh".into(), "-c".into()]),
+                        args: Some(vec![NOTEBOOKS_BUCKET_SCRIPT.to_string()]),
+                        env: Some(vec![
+                            EnvVar {
+                                name: "BUCKET".into(),
+                                value: Some(NOTEBOOKS_BUCKET.into()),
+                                ..Default::default()
+                            },
+                            secret_env("AWS_ACCESS_KEY_ID", "access-key"),
+                            secret_env("AWS_SECRET_ACCESS_KEY", "secret-key"),
+                            secret_env("AWS_ENDPOINT_URL", "endpoint"),
+                            secret_env("AWS_DEFAULT_REGION", "region"),
+                        ]),
+                        security_context: Some(SecurityContext {
+                            allow_privilege_escalation: Some(false),
+                            capabilities: Some(Capabilities {
+                                drop: Some(vec!["ALL".into()]),
+                                add: None,
+                            }),
+                            seccomp_profile: Some(SeccompProfile {
+                                type_: "RuntimeDefault".into(),
+                                localhost_profile: None,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// The Job that bootstraps Lakekeeper and creates or refreshes the `warehouse`.
 pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerReference) -> Job {
     let mut metadata = meta(name, namespace, lakehouse, "lakekeeper-bootstrap");
@@ -687,6 +762,76 @@ mod tests {
         );
         assert!(c.args.as_ref().unwrap()[0].contains("storage-credential"));
         assert_eq!(job.metadata.owner_references.unwrap()[0].name, "main");
+    }
+
+    #[test]
+    fn the_notebooks_bucket_job_creates_and_versions_the_bucket_with_the_s3_secret() {
+        let owner = OwnerReference {
+            name: "main".into(),
+            ..Default::default()
+        };
+        let job = notebooks_bucket_job("main", "data", "notebooks-bucket-1", owner);
+        assert_eq!(job.metadata.namespace.as_deref(), Some("data"));
+        assert_eq!(
+            job.metadata.owner_references.expect("owner")[0].name,
+            "main"
+        );
+        let pod = job.spec.expect("spec").template.spec.expect("pod");
+        assert_eq!(pod.restart_policy.as_deref(), Some("OnFailure"));
+        let c = &pod.containers[0];
+        assert_eq!(c.image.as_deref(), Some("amazon/aws-cli:2.17.0"));
+        let env: Vec<(&str, Option<&str>)> = c
+            .env
+            .as_ref()
+            .expect("env")
+            .iter()
+            .map(|e| {
+                (
+                    e.name.as_str(),
+                    e.value_from
+                        .as_ref()
+                        .and_then(|v| v.secret_key_ref.as_ref())
+                        .map(|s| s.key.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("BUCKET", None),
+                ("AWS_ACCESS_KEY_ID", Some("access-key")),
+                ("AWS_SECRET_ACCESS_KEY", Some("secret-key")),
+                ("AWS_ENDPOINT_URL", Some("endpoint")),
+                ("AWS_DEFAULT_REGION", Some("region")),
+            ]
+        );
+        assert_eq!(
+            c.env.as_ref().expect("env")[0].value.as_deref(),
+            Some("notebooks")
+        );
+        let script = &c.args.as_ref().expect("args")[0];
+        assert!(script.contains("put-bucket-versioning"));
+        assert!(script.contains("Status=Enabled"));
+        assert!(script.contains("head-bucket"), "an existing bucket is kept");
+    }
+
+    #[test]
+    fn the_notebooks_bucket_job_name_follows_the_endpoint() {
+        let a = notebooks_bucket_job_name("http://seaweedfs-s3.data.svc.cluster.local:8333");
+        assert_eq!(
+            a,
+            notebooks_bucket_job_name("http://seaweedfs-s3.data.svc.cluster.local:8333")
+        );
+        assert_ne!(
+            a,
+            notebooks_bucket_job_name("http://seaweedfs-s3.other.svc.cluster.local:8333")
+        );
+        assert!(a.starts_with("notebooks-bucket-"));
+    }
+
+    #[test]
+    fn the_notebooks_bucket_is_the_one_nova_publishes_to() {
+        assert_eq!(NOTEBOOKS_BUCKET, crate::nova::NOTEBOOK_BUCKET);
     }
 
     fn location() -> S3Location {

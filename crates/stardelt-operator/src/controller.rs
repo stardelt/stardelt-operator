@@ -39,7 +39,8 @@ use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_airflow_rbac, ensure_airflow_secrets, ensure_bootstrap, ensure_catalog_database,
     ensure_discovery, ensure_identity, ensure_identity_secrets, ensure_ingress, ensure_keycloak,
-    ensure_keycloak_pg, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
+    ensure_keycloak_pg, ensure_notebooks_bucket, ensure_nova, ensure_nova_pg, ensure_nova_session,
+    ensure_s3_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -848,10 +849,17 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             applied_hash: None,
         }
     };
+    // The versioned bucket Nova publishes notebooks to needs the object store, not the catalog.
+    let notebooks_bucket = if charts_ready || lh.spec.dry_run {
+        ensure_notebooks_bucket(&ctx, &lh, &namespace, previous).await
+    } else {
+        None
+    };
     // The discovery ConfigMap is published last: it advertises a working catalog.
     let discovery = ensure_discovery(&ctx, &lh, &namespace, bootstrap.ready).await;
     let mut components = vec![s3, database];
     components.append(&mut outcome.components);
+    components.extend(notebooks_bucket);
     components.push(bootstrap);
     components.push(discovery);
     outcome.components = components;
@@ -1734,6 +1742,44 @@ mod tests {
             json!("lakekeeper-bootstrap"),
             "discovery is published after the bootstrap"
         );
+    }
+
+    #[tokio::test]
+    async fn lakehouse_status_lists_the_notebooks_bucket_before_the_bootstrap() {
+        let (client, requests) =
+            status_mock_client(json!([lakehouse_item("main", "2026-01-01T00:00:00Z")]));
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt", "generation": 1 },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile Lakehouse");
+
+        let status = patched_status(&requests, "lakehouses");
+        let names: Vec<&str> = status["components"]
+            .as_array()
+            .expect("components")
+            .iter()
+            .map(|c| c["name"].as_str().expect("a name"))
+            .collect();
+        let bucket = names
+            .iter()
+            .position(|n| *n == "notebooks-bucket")
+            .expect("the bucket step");
+        let bootstrap = names
+            .iter()
+            .position(|n| *n == "lakekeeper-bootstrap")
+            .expect("the bootstrap");
+        assert_eq!(bucket + 1, bootstrap, "{names:?}");
     }
 
     #[tokio::test]
