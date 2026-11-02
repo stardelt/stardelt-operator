@@ -28,7 +28,10 @@ spec:
               audiences:
                 default:
                 - trino
-                description: What the principal's tokens are valid for; at least one, `trino` by default.
+                - lakekeeper
+                description: |-
+                  What the principal's tokens are valid for; at least one, both engines by default
+                  (`trino` for SQL, `lakekeeper` for `stardelt.spark()` in a notebook).
                 items:
                   description: What a principal's tokens are valid for (the `aud` claim of its access token).
                   enum:

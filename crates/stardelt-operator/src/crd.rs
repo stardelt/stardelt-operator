@@ -1559,7 +1559,8 @@ pub struct ServicePrincipalSpec {
     pub owner_group: String,
     #[serde(default)]
     pub purpose: PrincipalPurpose,
-    /// What the principal's tokens are valid for; at least one, `trino` by default.
+    /// What the principal's tokens are valid for; at least one, both engines by default
+    /// (`trino` for SQL, `lakekeeper` for `stardelt.spark()` in a notebook).
     #[serde(default = "default_principal_audiences")]
     #[schemars(length(min = 1, max = 2))]
     pub audiences: Vec<PrincipalAudience>,
@@ -1573,7 +1574,11 @@ pub struct ServicePrincipalSpec {
 }
 
 fn default_principal_audiences() -> Vec<PrincipalAudience> {
-    vec![PrincipalAudience::Trino]
+    // Both, because a principal is created before its tasks are known: a SQL task calls Trino,
+    // while `stardelt.spark()` in a notebook calls Lakekeeper's REST catalog. An extra audience is
+    // harmless to the engine that does not use it; a missing `lakekeeper` is an opaque Iceberg
+    // `NotAuthorizedException` after the pod has already started (operator#168).
+    vec![PrincipalAudience::Trino, PrincipalAudience::Lakekeeper]
 }
 
 impl ServicePrincipalSpec {
@@ -3253,7 +3258,11 @@ mod tests {
     fn a_principal_defaults_to_a_pipeline_identity_for_the_engine() {
         let sp = principal(serde_json::json!({ "ownerGroup": "analytics" }));
         assert_eq!(sp.spec.purpose, PrincipalPurpose::Pipeline);
-        assert_eq!(sp.spec.audiences, vec![PrincipalAudience::Trino]);
+        assert_eq!(
+            sp.spec.audiences,
+            vec![PrincipalAudience::Trino, PrincipalAudience::Lakekeeper],
+            "a pipeline principal must reach both engines by default (operator#168)"
+        );
         assert!(sp.spec.existing_secret_ref.is_none());
         assert!(sp.spec.validate("pipeline-analytics").is_ok());
         assert_eq!(
