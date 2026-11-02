@@ -455,7 +455,7 @@ pub fn deployment(namespace: &str) -> Deployment {
             labels: Some(workload_labels()),
             ..meta(NAME, namespace)
         },
-        spec: Some(DeploymentSpec {
+        spec: DeploymentSpec {
             replicas: Some(1),
             strategy: Some(DeploymentStrategy {
                 type_: Some("Recreate".into()),
@@ -493,7 +493,7 @@ pub fn deployment(namespace: &str) -> Deployment {
                 }),
             },
             ..DeploymentSpec::default()
-        }),
+        },
         ..Deployment::default()
     }
 }
@@ -618,7 +618,7 @@ mod tests {
     }
 
     fn pod(deployment: &Deployment) -> (Container, PodSpec) {
-        let spec = deployment.spec.clone().expect("spec");
+        let spec = deployment.spec.clone();
         let pod = spec.template.spec.expect("pod spec");
         (pod.containers[0].clone(), pod)
     }
@@ -633,8 +633,6 @@ mod tests {
             deployment.metadata.labels.as_ref().expect("labels"),
             deployment
                 .spec
-                .as_ref()
-                .unwrap()
                 .template
                 .metadata
                 .as_ref()
@@ -646,7 +644,7 @@ mod tests {
             assert_eq!(labels["app.kubernetes.io/name"], "keycloak");
             assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
         }
-        let spec = deployment.spec.clone().expect("spec");
+        let spec = deployment.spec.clone();
         assert_eq!(spec.replicas, Some(1));
         assert_eq!(
             spec.strategy.and_then(|s| s.type_),

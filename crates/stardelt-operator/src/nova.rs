@@ -382,7 +382,7 @@ pub fn deployment(
             labels: Some(labels.clone()),
             ..meta(NAME, namespace)
         },
-        spec: Some(DeploymentSpec {
+        spec: DeploymentSpec {
             replicas: Some(1),
             selector: LabelSelector {
                 match_labels: Some(name_selector()),
@@ -415,7 +415,7 @@ pub fn deployment(
                 }),
             },
             ..DeploymentSpec::default()
-        }),
+        },
         ..Deployment::default()
     }
 }
@@ -574,13 +574,7 @@ mod tests {
     const IMAGE: &str = "ghcr.io/stardelt/nova:dev@sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
     fn container_of(deployment: &Deployment) -> Container {
-        let pod = deployment
-            .spec
-            .clone()
-            .expect("spec")
-            .template
-            .spec
-            .expect("pod");
+        let pod = deployment.spec.clone().template.spec.expect("pod");
         assert_eq!(pod.containers.len(), 1);
         pod.containers[0].clone()
     }
@@ -601,7 +595,7 @@ mod tests {
         let deployment = deployment("stardelt", IMAGE, None, false);
         assert_eq!(deployment.metadata.name.as_deref(), Some("nova"));
         assert_eq!(deployment.metadata.namespace.as_deref(), Some("stardelt"));
-        let spec = deployment.spec.clone().expect("spec");
+        let spec = deployment.spec.clone();
         assert_eq!(spec.replicas, Some(1));
         let pod = spec.template.spec.expect("pod");
         assert_eq!(pod.service_account_name.as_deref(), Some("nova"));
@@ -626,13 +620,7 @@ mod tests {
     #[test]
     fn the_pod_is_locked_down() {
         let deployment = deployment("stardelt", IMAGE, None, false);
-        let pod = deployment
-            .spec
-            .clone()
-            .expect("spec")
-            .template
-            .spec
-            .expect("pod");
+        let pod = deployment.spec.clone().template.spec.expect("pod");
         let pod_security = pod.security_context.expect("pod security");
         assert_eq!(pod_security.run_as_non_root, Some(true));
         assert_eq!(pod_security.run_as_user, Some(65532));
