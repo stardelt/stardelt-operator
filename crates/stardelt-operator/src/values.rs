@@ -47,6 +47,10 @@ pub fn golden_values(component: &str) -> Value {
         }
         "seaweedfs" => serde_yaml::from_str(include_str!("../values/seaweedfs.yaml"))
             .expect("values/seaweedfs.yaml is not valid YAML"),
+        // The `pipelines` pillar: the platform's helm-values/airflow.yaml with short in-cluster
+        // addresses and no Reloader annotation (see the header of the file).
+        "airflow" => serde_yaml::from_str(include_str!("../values/airflow.yaml"))
+            .expect("values/airflow.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }
@@ -626,5 +630,56 @@ mod tests {
             s["s3"]["createBuckets"][0]["name"],
             serde_json::json!("lakehouse")
         );
+    }
+
+    #[test]
+    fn the_golden_airflow_values_run_tasks_as_pods_and_name_the_operators_secrets() {
+        let values = golden_values("airflow");
+        assert_eq!(values["executor"], "KubernetesExecutor");
+        // The Secret names the chart reads are the ones the operator creates (airflow::SECRETS).
+        let names: Vec<&str> = crate::airflow::SECRETS.iter().map(|s| s.name).collect();
+        for field in [
+            "fernetKeySecretName",
+            "apiSecretKeySecretName",
+            "webserverSecretKeySecretName",
+            "jwtSecretName",
+        ] {
+            let name = values[field].as_str().expect(field);
+            assert!(
+                names.contains(&name),
+                "{field} names {name}, which the operator does not create"
+            );
+        }
+        assert_eq!(values["fernetKeySecretName"], "airflow-fernet-key");
+    }
+
+    #[test]
+    fn the_golden_airflow_values_pin_one_image_in_both_places_and_name_no_namespace() {
+        let text = include_str!("../values/airflow.yaml");
+        let values = golden_values("airflow");
+        let digest = values["images"]["airflow"]["digest"]
+            .as_str()
+            .expect("a digest");
+        assert!(digest.starts_with("sha256:"));
+        let worker = values["env"]
+            .as_array()
+            .expect("env")
+            .iter()
+            .find(|e| e["name"] == "AIRFLOW__KUBERNETES_EXECUTOR__WORKER_CONTAINER_TAG")
+            .expect("the worker tag");
+        assert!(
+            worker["value"].as_str().expect("a tag").ends_with(digest),
+            "scheduler and worker pods must run the same digest"
+        );
+        assert!(
+            !text.contains(".svc.cluster.local"),
+            "the namespace is not written into the values"
+        );
+        assert!(
+            !text.contains("reloader.stakater.com"),
+            "the operator installs no Reloader, so no pod asks it to restart"
+        );
+        assert!(text.contains("http://seaweedfs-s3:8333"));
+        assert!(text.contains("http://lakekeeper:8181/catalog"));
     }
 }

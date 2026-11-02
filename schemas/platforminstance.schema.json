@@ -209,6 +209,7 @@
             "lakehouse": true,
             "ml": false,
             "notebooks": false,
+            "pipelines": false,
             "streaming": false
           },
           "description": "Which pillars a platform instance enables.",
@@ -228,6 +229,11 @@
             "notebooks": {
               "default": false,
               "description": "Multi-user notebooks (JupyterHub). Off by default: a notebook stack is\nheavy, and a cluster that only serves queries should not carry it.",
+              "type": "boolean"
+            },
+            "pipelines": {
+              "default": false,
+              "description": "Scheduled pipelines and jobs (Airflow, run as `KubernetesExecutor`). Off by default: it\nbrings a metadata database and four long-running pods, and a cluster that only serves\nqueries does not need them. Nova's Pipelines page and `stardelt bundle run` need it.",
               "type": "boolean"
             },
             "streaming": {

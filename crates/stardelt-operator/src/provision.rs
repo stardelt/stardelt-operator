@@ -21,6 +21,7 @@ use kube::{
 };
 
 use crate::{
+    airflow,
     controller::Context,
     crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
     identity, ingress, keycloak, nova,
@@ -623,6 +624,61 @@ pub async fn ensure_keycloak(
             "waiting for the Deployment to become ready",
         ))
     }
+}
+
+/// The Airflow Secrets ([`airflow::SECRETS`]), for the `pipelines` pillar. `None` without it. They
+/// are created BEFORE the Airflow release: its pods read them when they start, and the database
+/// migration Job gives up after a few tries if its Secret appears late.
+pub async fn ensure_airflow_secrets(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    if !spec.pillars.pipelines {
+        return None;
+    }
+    Some(ensure_generated_secrets(ctx, spec, "airflow-secrets", &airflow::SECRETS).await)
+}
+
+/// The Role that lets Airflow read the `Pipeline` and `ServicePrincipal` resources, and its
+/// binding to the DAG processor and the worker. `None` without the `pipelines` pillar. The
+/// ServiceAccounts come with the Airflow release; a binding may name one that does not exist yet.
+pub async fn ensure_airflow_rbac(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "airflow-rbac";
+    if !spec.pillars.pipelines {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    if let Err(e) = apply::<Role>(
+        &ctx.client,
+        namespace,
+        &airflow::pipeline_reader_role(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        &ctx.client,
+        namespace,
+        &airflow::pipeline_reader_binding(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): Role and RoleBinding airflow-pipeline-reader",
+        ));
+    }
+    Some(status(NAME, true, "applied: airflow-pipeline-reader"))
 }
 
 /// The build of Nova the operator installs: the one `stardelt-platform` pins in
@@ -1994,5 +2050,78 @@ mod tests {
             .expect("data");
         assert_eq!(data["other"], "b2xk", "an existing key is untouched");
         assert_eq!(data["fernet-key"].as_str().expect("a key").len(), 60);
+    }
+
+    fn platform_with_pipelines(pipelines: bool, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "dryRun": dry_run,
+                "pillars": { "pipelines": pipelines },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
+    #[tokio::test]
+    async fn the_airflow_steps_exist_only_with_the_pipelines_pillar() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform_with_pipelines(false, false);
+        assert!(ensure_airflow_secrets(&ctx, &spec).await.is_none());
+        assert!(ensure_airflow_rbac(&ctx, &spec).await.is_none());
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn airflow_secrets_are_created_for_the_pipelines_pillar() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let status =
+            ensure_airflow_secrets(&context(client), &platform_with_pipelines(true, false))
+                .await
+                .expect("a status");
+        assert_eq!(status.name, "airflow-secrets");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("ready: created 5 / kept 0"));
+        assert_eq!(patch_count(&requests), 5);
+    }
+
+    #[tokio::test]
+    async fn airflow_rbac_applies_the_role_then_its_binding() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_airflow_rbac(&context(client), &platform_with_pipelines(true, false))
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.name, "airflow-rbac");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("applied: airflow-pipeline-reader")
+        );
+        let rbac = "/apis/rbac.authorization.k8s.io/v1/namespaces/stardelt";
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                format!("{rbac}/roles/airflow-pipeline-reader"),
+                format!("{rbac}/rolebindings/airflow-pipeline-reader"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn airflow_rbac_dry_run_says_planned_and_is_not_ready() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let status = ensure_airflow_rbac(&context(client), &platform_with_pipelines(true, true))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Role and RoleBinding airflow-pipeline-reader")
+        );
     }
 }

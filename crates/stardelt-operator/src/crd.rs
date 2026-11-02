@@ -34,6 +34,11 @@ pub struct Pillars {
     /// heavy, and a cluster that only serves queries should not carry it.
     #[serde(default)]
     pub notebooks: bool,
+    /// Scheduled pipelines and jobs (Airflow, run as `KubernetesExecutor`). Off by default: it
+    /// brings a metadata database and four long-running pods, and a cluster that only serves
+    /// queries does not need them. Nova's Pipelines page and `stardelt bundle run` need it.
+    #[serde(default)]
+    pub pipelines: bool,
     #[serde(default)]
     pub streaming: bool,
     #[serde(default)]
@@ -50,6 +55,7 @@ impl Default for Pillars {
             lakehouse: true,
             batch: false,
             notebooks: false,
+            pipelines: false,
             streaming: false,
             ml: false,
         }
@@ -2204,6 +2210,25 @@ mod tests {
         assert!(crd.contains(
             "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)"
         ));
+    }
+
+    #[test]
+    fn the_pipelines_pillar_is_off_by_default_and_read_from_the_spec() {
+        let default: PlatformInstanceSpec = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!default.pillars.pipelines);
+        assert!(
+            default.pillars.lakehouse,
+            "the other defaults are unchanged"
+        );
+        assert!(!default.pillars.notebooks);
+        let on: PlatformInstanceSpec =
+            serde_json::from_value(serde_json::json!({ "pillars": { "pipelines": true } }))
+                .unwrap();
+        assert!(on.pillars.pipelines);
+        assert!(
+            on.pillars.lakehouse,
+            "naming one pillar keeps the lakehouse on"
+        );
     }
 
     #[test]

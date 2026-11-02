@@ -37,9 +37,9 @@ use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, p
 use crate::prerequisites::CATALOG_CLUSTER;
 use crate::principal::reconcile_principal;
 use crate::provision::{
-    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
-    ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg, ensure_nova,
-    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
+    ensure_airflow_rbac, ensure_airflow_secrets, ensure_bootstrap, ensure_catalog_database,
+    ensure_discovery, ensure_identity, ensure_identity_secrets, ensure_ingress, ensure_keycloak,
+    ensure_keycloak_pg, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -901,6 +901,8 @@ async fn reconcile_platform(
         .as_ref()
         .map(|s| s.components.as_slice())
         .unwrap_or(&[]);
+    // Airflow's Secrets come before its release: its pods read them when they start.
+    let airflow_secrets = ensure_airflow_secrets(&ctx, &instance.spec).await;
     let mut outcome = apply_plan(
         &ctx,
         &instance.spec.namespace,
@@ -911,6 +913,12 @@ async fn reconcile_platform(
         previous,
     )
     .await;
+    if let Some(secrets) = airflow_secrets {
+        outcome.components.push(secrets);
+    }
+    if let Some(rbac) = ensure_airflow_rbac(&ctx, &instance.spec).await {
+        outcome.components.push(rbac);
+    }
     // The identity database comes before the contract that points the components at it.
     if let Some(database) = ensure_keycloak_pg(&ctx, &instance.spec).await {
         outcome.components.push(database);

@@ -30,6 +30,12 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
             chart: Some("jupyterhub/jupyterhub"),
         });
     }
+    if spec.pillars.pipelines {
+        plan.push(ComponentPlan {
+            name: "airflow",
+            chart: Some("apache-airflow/airflow"),
+        });
+    }
     plan
 }
 
@@ -142,6 +148,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "lakekeeper/lakekeeper" => Some("0.11.0"),
         "trino/trino" => Some("1.42.2"),
         "jupyterhub/jupyterhub" => Some("4.4.3"),
+        "apache-airflow/airflow" => Some("1.21.0"),
         _ => None,
     }
 }
@@ -155,6 +162,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "lakekeeper/lakekeeper" => Some("https://lakekeeper.github.io/lakekeeper-charts/"),
         "trino/trino" => Some("https://trinodb.github.io/charts"),
         "jupyterhub/jupyterhub" => Some("https://jupyterhub.github.io/helm-chart/"),
+        "apache-airflow/airflow" => Some("https://airflow.apache.org"),
         _ => None,
     }
 }
@@ -256,6 +264,48 @@ mod tests {
     }
 
     #[test]
+    fn pipelines_pillar_adds_airflow_to_the_platform_plan() {
+        let base = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            ingress: Default::default(),
+        };
+        assert!(!base.pillars.pipelines, "pipelines stay opt-in");
+        let plan = plan_platform(&PlatformInstanceSpec {
+            pillars: Pillars {
+                pipelines: true,
+                ..Default::default()
+            },
+            ..base.clone()
+        });
+        assert_eq!(names(&plan), vec!["cnpg", "airflow"]);
+        assert_eq!(plan[1].chart, Some("apache-airflow/airflow"));
+        let both = plan_platform(&PlatformInstanceSpec {
+            pillars: Pillars {
+                notebooks: true,
+                pipelines: true,
+                ..Default::default()
+            },
+            ..base
+        });
+        assert_eq!(names(&both), vec!["cnpg", "jupyterhub", "airflow"]);
+    }
+
+    #[test]
+    fn airflow_is_pinned_at_the_version_and_repo_of_the_platform() {
+        assert_eq!(chart_version("apache-airflow/airflow"), Some("1.21.0"));
+        assert_eq!(
+            chart_repo("apache-airflow/airflow"),
+            Some("https://airflow.apache.org")
+        );
+    }
+
+    #[test]
     fn platform_plan_owns_the_cluster_scoped_cnpg_operator() {
         let pi = PlatformInstanceSpec {
             profile: Default::default(),
@@ -285,6 +335,7 @@ mod tests {
             profile: Default::default(),
             pillars: Pillars {
                 notebooks: true,
+                pipelines: true,
                 ..Default::default()
             },
             dry_run: true,
@@ -310,6 +361,7 @@ mod tests {
             profile: Default::default(),
             pillars: Pillars {
                 notebooks: true,
+                pipelines: true,
                 ..Default::default()
             },
             dry_run: true,
