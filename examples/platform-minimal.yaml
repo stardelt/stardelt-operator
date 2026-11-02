@@ -1,0 +1,40 @@
+# One platform instance and one lakehouse: the two resources that give a fresh cluster the platform.
+# Apply the operator first (its chart installs the CRDs), then this file:
+#
+#   kubectl apply -f examples/platform-minimal.yaml
+#
+# The names are fake (data.example.com, the issuer): replace them. Both resources start as a PLAN
+# (dryRun: true is the default); this file sets dryRun: false, which is the switch that makes the
+# operator change the cluster. Not yet run on a fresh node (stardelt-platform#293).
+#
+# What the operator does with this, in order: installs the CloudNative-PG operator (Helm); then,
+# in the platform namespace, the identity provider with its database, its secrets and its realm
+# (identity.mode: platform), Nova with its database and its session key (the lakehouse pillar is on
+# by default), and the Ingress objects for Nova (data.example.com) and the identity provider
+# (id.data.example.com). The Lakehouse adds the object store, the catalog, the query engine and the
+# connection details the applications read.
+apiVersion: stardelt.io/v1alpha1
+kind: PlatformInstance
+metadata:
+  name: cluster
+spec:
+  profile: demo
+  namespace: stardelt
+  dryRun: false
+  baseDomain: data.example.com       # Nova answers here, every other application on a subdomain
+  identity:
+    mode: platform                   # the platform runs its own identity provider (needs baseDomain)
+  ingress:
+    enabled: true                    # off by default: a cluster without an ingress controller needs none
+    className: traefik               # absent: the cluster default class
+    tls:
+      enabled: true                  # needs cert-manager and the ClusterIssuer named below
+      issuer: letsencrypt
+---
+apiVersion: stardelt.io/v1alpha1
+kind: Lakehouse
+metadata:
+  name: main
+  namespace: stardelt                # the platform namespace above
+spec:
+  dryRun: false

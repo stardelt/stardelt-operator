@@ -2574,6 +2574,52 @@ mod tests {
     }
 
     #[test]
+    fn the_minimal_platform_example_is_what_its_comments_say() {
+        let text = include_str!("../../../examples/platform-minimal.yaml");
+        let mut platform = None;
+        let mut lakehouse = None;
+        for document in serde_yaml::Deserializer::from_str(text) {
+            let value = serde_yaml::Value::deserialize(document).expect("a YAML document");
+            match value.get("kind").and_then(serde_yaml::Value::as_str) {
+                Some("PlatformInstance") => {
+                    platform = Some(
+                        serde_yaml::from_value::<PlatformInstance>(value)
+                            .expect("a PlatformInstance"),
+                    );
+                }
+                Some("Lakehouse") => {
+                    lakehouse =
+                        Some(serde_yaml::from_value::<Lakehouse>(value).expect("a Lakehouse"));
+                }
+                other => panic!("unexpected kind {other:?}"),
+            }
+        }
+        let platform = platform.expect("a PlatformInstance document");
+        let lakehouse = lakehouse.expect("a Lakehouse document");
+        let spec = &platform.spec;
+        assert!(
+            !spec.dry_run,
+            "the example is the switch that changes the cluster"
+        );
+        assert!(spec.pillars.lakehouse, "Nova needs the lakehouse pillar");
+        assert_eq!(spec.identity.mode, IdentityMode::Platform);
+        // The two rules the CRD enforces on the API server, checked here as well.
+        assert!(
+            spec.base_domain.is_some(),
+            "identity and ingress both need baseDomain"
+        );
+        assert!(spec.ingress.enabled);
+        assert_eq!(spec.ingress.class_name.as_deref(), Some("traefik"));
+        assert!(spec.ingress.tls.enabled && spec.ingress.tls.issuer.is_some());
+        assert_eq!(
+            lakehouse.metadata.namespace.as_deref(),
+            Some(spec.namespace.as_str()),
+            "the Lakehouse lives in the platform namespace"
+        );
+        assert!(!lakehouse.spec.dry_run);
+    }
+
+    #[test]
     fn validate_accepts_a_diamond_and_rejects_the_broken_shapes() {
         let diamond = spec_of(vec![
             task("a", TaskKind::Sql, &[]),
