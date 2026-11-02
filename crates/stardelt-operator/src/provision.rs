@@ -32,8 +32,9 @@ use crate::{
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, NOVA_CLUSTER, S3_CONFIG_SECRET, S3_SECRET, S3Keys,
         S3Location, bootstrap_job, bootstrap_job_name, catalog_cluster, discovery_config_map,
-        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, nova_pg_backup,
-        nova_pg_cluster, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
+        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, notebooks_bucket_job,
+        notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, s3_creds_secret, s3_endpoint,
+        seaweedfs_config_secret,
     },
 };
 
@@ -260,6 +261,60 @@ pub async fn ensure_bootstrap(
             }
         }
         Ok(_) => status(NAME, false, "bootstrap Job is running"),
+    }
+}
+
+/// The versioned bucket for published notebooks, created by a Job (the object store's chart can
+/// create a bucket but cannot switch versioning on). `None` with your own object store (`byoS3`):
+/// the buckets there are the administrator's, and the notebooks bucket must be created and
+/// versioned by hand. Remembered like the bootstrap Job: once it has succeeded for an endpoint it
+/// is not applied again.
+pub async fn ensure_notebooks_bucket(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+    previous: &[ComponentStatus],
+) -> Option<ComponentStatus> {
+    const NAME: &str = "notebooks-bucket";
+    if lh.spec.storage.implementation != StorageImpl::Seaweedfs {
+        return None;
+    }
+    if lh.spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    match secrets.get_opt(S3_SECRET).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Some(status(NAME, false, "waiting for Secret stardelt-s3-creds")),
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    }
+    let job_name = notebooks_bucket_job_name(&s3_endpoint(namespace));
+    let done = previous
+        .iter()
+        .any(|p| p.name == NAME && p.ready && p.applied_hash.as_deref() == Some(job_name.as_str()));
+    if done {
+        return Some(ComponentStatus {
+            applied_hash: Some(job_name),
+            ..status(NAME, true, "bucket notebooks is versioned")
+        });
+    }
+    let job = notebooks_bucket_job(&lh.name_any(), namespace, &job_name, owner_reference(lh));
+    match apply::<Job>(&ctx.client, namespace, &job, false).await {
+        Err(e) => Some(status(NAME, false, e.to_string())),
+        Ok(applied)
+            if applied
+                .status
+                .as_ref()
+                .and_then(|s| s.succeeded)
+                .unwrap_or(0)
+                >= 1 =>
+        {
+            Some(ComponentStatus {
+                applied_hash: Some(job_name),
+                ..status(NAME, true, "bucket notebooks is versioned")
+            })
+        }
+        Ok(_) => Some(status(NAME, false, "the bucket Job is running")),
     }
 }
 
@@ -2178,5 +2233,108 @@ mod tests {
         let names: Vec<&str> = env.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(names.contains(&"NOVA_AIRFLOW_URL"), "{names:?}");
         assert!(names.contains(&"NOVA_AIRFLOW_PASSWORD"), "{names:?}");
+    }
+
+    fn lakehouse_with_storage(storage: &str, dry_run: bool) -> Lakehouse {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "data", "uid": "u-1" },
+            "spec": { "dryRun": dry_run, "storage": { "implementation": storage } }
+        }))
+        .expect("deserialize Lakehouse")
+    }
+
+    #[tokio::test]
+    async fn no_notebooks_bucket_is_made_in_an_object_store_of_your_own() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_notebooks_bucket(
+            &context(client),
+            &lakehouse_with_storage("byoS3", false),
+            "data",
+            &[],
+        )
+        .await;
+        assert!(status.is_none());
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_notebooks_bucket_waits_for_the_object_store_secret_and_applies_nothing() {
+        let (client, requests) = mock_client(false);
+        let status = ensure_notebooks_bucket(
+            &context(client),
+            &lakehouse_with_storage("seaweedfs", false),
+            "data",
+            &[],
+        )
+        .await
+        .expect("a status");
+        assert_eq!(status.name, "notebooks-bucket");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for Secret stardelt-s3-creds")
+        );
+        assert_eq!(patch_count(&requests), 0);
+    }
+
+    #[tokio::test]
+    async fn the_notebooks_bucket_job_is_applied_once_the_secret_exists() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_notebooks_bucket(
+            &context(client),
+            &lakehouse_with_storage("seaweedfs", false),
+            "data",
+            &[],
+        )
+        .await
+        .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(status.message.as_deref(), Some("the bucket Job is running"));
+        let name = notebooks_bucket_job_name(&s3_endpoint("data"));
+        assert_eq!(
+            applied_paths(&requests),
+            [format!("/apis/batch/v1/namespaces/data/jobs/{name}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_notebooks_bucket_job_is_remembered_and_not_applied_again() {
+        let name = notebooks_bucket_job_name(&s3_endpoint("data"));
+        let previous = [ComponentStatus {
+            name: "notebooks-bucket".into(),
+            ready: true,
+            message: None,
+            applied_hash: Some(name.clone()),
+        }];
+        let (client, requests) = mock_client(true);
+        let status = ensure_notebooks_bucket(
+            &context(client),
+            &lakehouse_with_storage("seaweedfs", false),
+            "data",
+            &previous,
+        )
+        .await
+        .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.applied_hash.as_deref(), Some(name.as_str()));
+        assert_eq!(patch_count(&requests), 0);
+    }
+
+    #[tokio::test]
+    async fn the_notebooks_bucket_dry_run_plans_and_touches_nothing() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_notebooks_bucket(
+            &context(client),
+            &lakehouse_with_storage("seaweedfs", true),
+            "data",
+            &[],
+        )
+        .await
+        .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
+        assert!(requests.lock().expect("requests poisoned").is_empty());
     }
 }
