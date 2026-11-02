@@ -653,6 +653,24 @@ mod tests {
         assert_eq!(values["fernetKeySecretName"], "airflow-fernet-key");
     }
 
+    /// platform#496: Nova's service identity may trigger and pause DAGs, or the Run/Pause buttons
+    /// answer 403/502 on an operator-managed install.
+    #[test]
+    fn the_golden_airflow_create_user_job_creates_the_nova_service_role() {
+        let text = include_str!("../values/airflow.yaml");
+        for needle in [
+            r#"sm.find_role("nova-service")"#,
+            r#"NOVA_WRITE = (("can_edit", "DAGs"), ("can_create", "DAG Runs"))"#,
+            r#"sm.find_user(username=os.environ["AIRFLOW_NOVA_API_USERNAME"])"#,
+            "sm.update_user(user)",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the create-user Job must contain {needle}"
+            );
+        }
+    }
+
     #[test]
     fn the_golden_airflow_values_pin_one_image_in_both_places_and_name_no_namespace() {
         let text = include_str!("../values/airflow.yaml");
