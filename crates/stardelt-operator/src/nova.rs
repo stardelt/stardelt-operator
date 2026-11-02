@@ -25,7 +25,10 @@ use k8s_openapi::apimachinery::pkg::{
 };
 use kube::api::ObjectMeta;
 
-use crate::prerequisites::{S3_SECRET, WAREHOUSE, s3_endpoint};
+use crate::{
+    keycloak::IdentitySecret,
+    prerequisites::{S3_SECRET, WAREHOUSE, s3_endpoint},
+};
 
 /// Name of the ServiceAccount, the Service, the Deployment and of `app.kubernetes.io/name`.
 pub const NAME: &str = "nova";
@@ -40,6 +43,13 @@ pub const PIPELINES_ROLE: &str = "nova-pipelines";
 pub const IDENTITY_CONFIG_MAP: &str = "stardelt-identity";
 /// Secret that holds the key that signs Nova's session cookies (key `session`).
 pub const SESSION_SECRET: &str = "stardelt-nova-session";
+/// The session key as a generated Secret: one key, created once and never rotated (rotating it
+/// signs everybody out). Nova refuses to start with fewer than 32 bytes; a generated value has 48.
+pub const SESSION: IdentitySecret = IdentitySecret {
+    name: SESSION_SECRET,
+    fixed: &[],
+    generated: &["session"],
+};
 /// Secret that CloudNative-PG generates for the state store; its `uri` key is a complete URL.
 pub const DATABASE_SECRET: &str = "nova-pg-app";
 /// Bucket for published notebooks (the object store versions it).
@@ -435,6 +445,13 @@ mod tests {
             }
         }
         pairs
+    }
+
+    #[test]
+    fn the_session_secret_has_one_generated_key_and_no_fixed_value() {
+        assert_eq!(SESSION.name, "stardelt-nova-session");
+        assert!(SESSION.fixed.is_empty());
+        assert_eq!(SESSION.key_names(), ["session"]);
     }
 
     #[test]

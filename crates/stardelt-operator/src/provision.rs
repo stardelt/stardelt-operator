@@ -21,16 +21,16 @@ use kube::{
 use crate::{
     controller::Context,
     crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
-    identity, keycloak,
+    identity, keycloak, nova,
     objects::{
         apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
         owner_reference,
     },
     prerequisites::{
-        CATALOG_CLUSTER, DEFAULT_BUCKET, S3_CONFIG_SECRET, S3_SECRET, S3Keys, S3Location,
-        bootstrap_job, bootstrap_job_name, catalog_cluster, discovery_config_map,
-        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, s3_creds_secret,
-        s3_endpoint, seaweedfs_config_secret,
+        CATALOG_CLUSTER, DEFAULT_BUCKET, NOVA_CLUSTER, S3_CONFIG_SECRET, S3_SECRET, S3Keys,
+        S3Location, bootstrap_job, bootstrap_job_name, catalog_cluster, discovery_config_map,
+        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, nova_pg_backup,
+        nova_pg_cluster, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
     },
 };
 
@@ -315,12 +315,52 @@ pub async fn ensure_keycloak_pg(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
 ) -> Option<ComponentStatus> {
-    const NAME: &str = "keycloak-pg";
     if spec.identity.mode != IdentityMode::Platform {
         return None;
     }
     let namespace = &spec.namespace;
-    let cluster = keycloak_pg_cluster(namespace);
+    Some(
+        ensure_database(
+            ctx,
+            spec,
+            "keycloak-pg",
+            keycloak_pg_cluster(namespace),
+            keycloak_pg_backup(namespace),
+        )
+        .await,
+    )
+}
+
+/// The CloudNative-PG `Cluster` of Nova (its saved queries, settings and query log) plus its
+/// daily base backup. `None` without the `lakehouse` pillar: Nova is the interface of the
+/// lakehouse, so without one there is nothing to keep.
+pub async fn ensure_nova_pg(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<ComponentStatus> {
+    if !spec.pillars.lakehouse {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    Some(
+        ensure_database(
+            ctx,
+            spec,
+            NOVA_CLUSTER,
+            nova_pg_cluster(namespace),
+            nova_pg_backup(namespace),
+        )
+        .await,
+    )
+}
+
+/// Applies a `Cluster` and then its `ScheduledBackup`, and reports whether the database is
+/// Ready. A dry-run applies the Cluster only, as a plan.
+async fn ensure_database(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+    name: &str,
+    cluster: DynamicObject,
+    backup: DynamicObject,
+) -> ComponentStatus {
+    let namespace = &spec.namespace;
     let applied = match apply_dynamic(
         &ctx.client,
         namespace,
@@ -331,41 +371,37 @@ pub async fn ensure_keycloak_pg(
     .await
     {
         Err(kube::Error::Api(e)) if e.code == 404 => {
-            return Some(status(
-                NAME,
+            return status(
+                name,
                 false,
                 "CloudNative-PG is not installed: create a PlatformInstance first",
-            ));
+            );
         }
-        Err(e) => return Some(status(NAME, false, e.to_string())),
+        Err(e) => return status(name, false, e.to_string()),
         Ok(applied) => applied,
     };
     if spec.dry_run {
-        return Some(status(
-            NAME,
+        return status(
+            name,
             false,
             format!("planned (dry-run): Cluster {}", cluster.name_any()),
-        ));
+        );
     }
     if let Err(e) = apply_dynamic(
         &ctx.client,
         namespace,
         &cnpg_scheduled_backup_resource(),
-        &keycloak_pg_backup(namespace),
+        &backup,
         false,
     )
     .await
     {
-        return Some(status(NAME, false, e.to_string()));
+        return status(name, false, e.to_string());
     }
     if cluster_ready(&applied) {
-        Some(status(NAME, true, "database ready"))
+        status(name, true, "database ready")
     } else {
-        Some(status(
-            NAME,
-            false,
-            "waiting for the database to become Ready",
-        ))
+        status(name, false, "waiting for the database to become Ready")
     }
 }
 
@@ -390,25 +426,47 @@ pub async fn ensure_identity_secrets(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
 ) -> Option<ComponentStatus> {
-    const NAME: &str = "identity-secrets";
     if spec.identity.mode != IdentityMode::Platform {
         return None;
     }
+    Some(ensure_generated_secrets(ctx, spec, "identity-secrets", &keycloak::IDENTITY_SECRETS).await)
+}
+
+/// Nova's session key: Secret `stardelt-nova-session`, key `session`, generated once and kept
+/// (rotating it signs everybody out). `None` without the `lakehouse` pillar, like Nova itself.
+pub async fn ensure_nova_session(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    if !spec.pillars.lakehouse {
+        return None;
+    }
+    Some(ensure_generated_secrets(ctx, spec, "nova-session", &[nova::SESSION]).await)
+}
+
+/// Creates the Secrets in `desired` when absent and adds the keys an existing Secret lacks;
+/// never rewrites a value that is there. The status is named `name`.
+async fn ensure_generated_secrets(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+    name: &str,
+    desired: &[keycloak::IdentitySecret],
+) -> ComponentStatus {
     let namespace = &spec.namespace;
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let (mut created, mut kept) = (0, 0);
-    for desired in &keycloak::IDENTITY_SECRETS {
+    for desired in desired {
         let existing = match secrets.get_opt(desired.name).await {
             Ok(existing) => existing,
-            Err(e) => return Some(status(NAME, false, e.to_string())),
+            Err(e) => return status(name, false, e.to_string()),
         };
         let Some(existing) = existing else {
             let secret = match keycloak::identity_secret(desired, namespace) {
                 Ok(secret) => secret,
-                Err(e) => return Some(status(NAME, false, e.to_string())),
+                Err(e) => return status(name, false, e.to_string()),
             };
             if let Err(e) = apply::<Secret>(&ctx.client, namespace, &secret, spec.dry_run).await {
-                return Some(status(NAME, false, e.to_string()));
+                return status(name, false, e.to_string());
             }
             created += 1;
             continue;
@@ -422,7 +480,7 @@ pub async fn ensure_identity_secrets(
                 Some((_, value)) => (*value).to_string(),
                 None => match keycloak::generate_secret() {
                     Ok(value) => value,
-                    Err(e) => return Some(status(NAME, false, e.to_string())),
+                    Err(e) => return status(name, false, e.to_string()),
                 },
             };
             values.insert(key, value);
@@ -433,17 +491,17 @@ pub async fn ensure_identity_secrets(
         if let Err(e) =
             patch_identity_secret(&ctx.client, namespace, desired.name, &values, spec.dry_run).await
         {
-            return Some(status(NAME, false, e.to_string()));
+            return status(name, false, e.to_string());
         }
     }
     if spec.dry_run {
-        return Some(status(NAME, false, "planned (dry-run)"));
+        return status(name, false, "planned (dry-run)");
     }
-    Some(status(
-        NAME,
+    status(
+        name,
         true,
         format!("ready: created {created} / kept {kept}"),
-    ))
+    )
 }
 
 /// The key names of a Secret. Values are never read: the operator only decides which keys are
@@ -1339,5 +1397,131 @@ mod tests {
             store.lock().expect("store poisoned").is_empty(),
             "dry-run persisted a Secret"
         );
+    }
+
+    /// A platform spec with the `lakehouse` pillar switched on or off.
+    fn platform_with_lakehouse(lakehouse: bool, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "dryRun": dry_run,
+                "pillars": { "lakehouse": lakehouse },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
+    #[tokio::test]
+    async fn nova_pg_exists_only_with_the_lakehouse_pillar() {
+        let (client, requests) = mock_client(true);
+        assert!(
+            ensure_nova_pg(&context(client), &platform_with_lakehouse(false, false))
+                .await
+                .is_none()
+        );
+        assert!(
+            requests.lock().expect("requests poisoned").is_empty(),
+            "without the pillar the cluster must not be touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn nova_pg_dry_run_plans_only_the_cluster() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_nova_pg(&context(client), &platform_with_lakehouse(true, true))
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "nova-pg");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Cluster nova-pg")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            ["/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/nova-pg"]
+                .map(str::to_string)
+        );
+    }
+
+    #[tokio::test]
+    async fn nova_pg_applies_the_cluster_then_the_backup() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_nova_pg(&context(client), &platform_with_lakehouse(true, false))
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "nova-pg");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for the database to become Ready")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/nova-pg",
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/scheduledbackups/nova-pg-daily",
+            ]
+            .map(str::to_string)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nova_session_key_exists_only_with_the_lakehouse_pillar() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        assert!(
+            ensure_nova_session(&context(client), &platform_with_lakehouse(false, false))
+                .await
+                .is_none()
+        );
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_nova_session_key_is_generated_once_and_kept() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform_with_lakehouse(true, false);
+        let status = ensure_nova_session(&ctx, &spec).await.expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.name, "nova-session");
+        assert_eq!(status.message.as_deref(), Some("ready: created 1 / kept 0"));
+        assert_eq!(patch_count(&requests), 1);
+        let secret = applied_secret(&requests, "stardelt-nova-session");
+        assert_eq!(secret["kind"], "Secret");
+        assert_eq!(
+            secret["metadata"]["labels"]["app.kubernetes.io/part-of"],
+            "stardelt"
+        );
+        let data = secret["data"].as_object().expect("data");
+        assert_eq!(data.keys().collect::<Vec<_>>(), ["session"]);
+        assert_base64_of_48_bytes(data["session"].as_str().expect("a key"));
+
+        // The second reconcile reads the stored Secret and writes nothing.
+        let before = store.lock().expect("store poisoned").clone();
+        let status = ensure_nova_session(&ctx, &spec).await.expect("a status");
+        assert_eq!(status.message.as_deref(), Some("ready: created 0 / kept 1"));
+        assert_eq!(patch_count(&requests), 1, "a reconcile may not write");
+        assert_eq!(
+            *store.lock().expect("store poisoned"),
+            before,
+            "the session key was rewritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nova_session_key_dry_run_writes_nothing() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let status = ensure_nova_session(&context(client), &platform_with_lakehouse(true, true))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
+        assert_eq!(patch_count(&requests), 1);
+        assert!(store.lock().expect("store poisoned").is_empty());
     }
 }
