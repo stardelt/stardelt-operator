@@ -9,7 +9,8 @@ use k8s_openapi::{
     api::{
         apps::v1::Deployment,
         batch::v1::Job,
-        core::v1::{ConfigMap, Secret, Service},
+        core::v1::{ConfigMap, Secret, Service, ServiceAccount},
+        rbac::v1::{Role, RoleBinding},
     },
 };
 use kube::{
@@ -598,6 +599,96 @@ pub async fn ensure_keycloak(
             NAME,
             false,
             format!("planned (dry-run): Deployment {}", keycloak::NAME),
+        ));
+    }
+    if applied
+        .status
+        .as_ref()
+        .and_then(|s| s.available_replicas)
+        .unwrap_or(0)
+        >= 1
+    {
+        Some(status(NAME, true, "running"))
+    } else {
+        Some(status(
+            NAME,
+            false,
+            "waiting for the Deployment to become ready",
+        ))
+    }
+}
+
+/// The build of Nova the operator installs: the one `stardelt-platform` pins in
+/// `manifests/nova-deployment.yaml`, by digest, so a reconcile never changes it by itself
+/// (decision D-op-5 of `design/operator-parity.md`: a constant per operator release).
+pub const NOVA_IMAGE: &str = "ghcr.io/stardelt/nova:dev@sha256:a3f4e0450c12b4b2508e35e5a0349500b6dd8aea70e7bffd154d3af5c6c9a6ee";
+
+/// Secrets the Nova Deployment reads and cannot start without: the state store's URL
+/// (created by CloudNative-PG), the object-store keys (created with the Lakehouse) and the
+/// session key ([`ensure_nova_session`]). The workload waits for them instead of applying.
+pub const NOVA_SECRETS: [&str; 3] = ["nova-pg-app", S3_SECRET, nova::SESSION_SECRET];
+
+/// Nova: the ServiceAccount, the three Roles with their bindings, the Service and the
+/// Deployment. `None` without the `lakehouse` pillar. Nothing is applied until every Secret in
+/// [`NOVA_SECRETS`] exists; the identity contract, the OIDC client and the Trino CA are optional
+/// for Nova, so the workload does not wait for them.
+pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<ComponentStatus> {
+    const NAME: &str = "nova";
+    if !spec.pillars.lakehouse {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut missing = Vec::new();
+    for name in NOVA_SECRETS {
+        match secrets.get_opt(name).await {
+            Ok(Some(_)) => {}
+            Ok(None) => missing.push(name),
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        }
+    }
+    if !missing.is_empty() {
+        return Some(status(
+            NAME,
+            false,
+            format!("waiting for secrets: {}", missing.join(", ")),
+        ));
+    }
+    let dry_run = spec.dry_run;
+    let client = &ctx.client;
+    if let Err(e) = apply::<ServiceAccount>(
+        client,
+        namespace,
+        &nova::service_account(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    for role in nova::roles(namespace) {
+        if let Err(e) = apply::<Role>(client, namespace, &role, dry_run).await {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+    for binding in nova::role_bindings(namespace) {
+        if let Err(e) = apply::<RoleBinding>(client, namespace, &binding, dry_run).await {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+    if let Err(e) = apply::<Service>(client, namespace, &nova::service(namespace), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    let deployment = nova::deployment(namespace, NOVA_IMAGE, spec.base_domain.as_deref());
+    let applied = match apply::<Deployment>(client, namespace, &deployment, dry_run).await {
+        Ok(applied) => applied,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    if dry_run {
+        return Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): Deployment {}", nova::NAME),
         ));
     }
     if applied
@@ -1523,5 +1614,122 @@ mod tests {
         assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
         assert_eq!(patch_count(&requests), 1);
         assert!(store.lock().expect("store poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn nova_exists_only_with_the_lakehouse_pillar() {
+        let (client, requests) = keycloak_client(&[], Some(1));
+        assert!(
+            ensure_nova(&context(client), &platform_with_lakehouse(false, false))
+                .await
+                .is_none()
+        );
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn nova_waits_for_its_secrets_and_applies_nothing() {
+        let (client, requests) = keycloak_client(&["nova-pg-app", "stardelt-nova-session"], None);
+        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, false))
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "nova");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for secrets: nova-pg-app, stardelt-nova-session")
+        );
+        assert!(
+            applied_paths(&requests).is_empty(),
+            "nothing may be applied without the Secrets"
+        );
+    }
+
+    #[tokio::test]
+    async fn nova_dry_run_plans_every_object_in_order() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, true))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Deployment nova")
+        );
+        let rbac = "/apis/rbac.authorization.k8s.io/v1/namespaces/stardelt";
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                "/api/v1/namespaces/stardelt/serviceaccounts/nova".to_string(),
+                format!("{rbac}/roles/nova-workload-reader"),
+                format!("{rbac}/roles/nova-connections"),
+                format!("{rbac}/roles/nova-pipelines"),
+                format!("{rbac}/rolebindings/nova-workload-reader"),
+                format!("{rbac}/rolebindings/nova-connections"),
+                format!("{rbac}/rolebindings/nova-pipelines"),
+                "/api/v1/namespaces/stardelt/services/nova".to_string(),
+                "/apis/apps/v1/namespaces/stardelt/deployments/nova".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn nova_runs_the_pinned_image_and_reports_it_running() {
+        let (client, requests) = keycloak_client(&[], Some(1));
+        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, false))
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("running"));
+        let requests = requests.lock().expect("requests poisoned");
+        let deployment = requests
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/deployments/nova"))
+            .expect("the Deployment");
+        let body: serde_json::Value = serde_json::from_str(&deployment.2).expect("JSON body");
+        assert_eq!(body["kind"], "Deployment");
+        let image = body["spec"]["template"]["spec"]["containers"][0]["image"]
+            .as_str()
+            .expect("an image");
+        assert_eq!(image, NOVA_IMAGE);
+        assert!(
+            image.contains("@sha256:"),
+            "the image is pinned by digest: {image}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nova_waits_for_its_deployment_to_become_ready() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, false))
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for the Deployment to become ready")
+        );
+    }
+
+    #[tokio::test]
+    async fn nova_links_to_the_applications_under_the_base_domain() {
+        let (client, requests) = keycloak_client(&[], Some(1));
+        ensure_nova(&context(client), &platform("none", false))
+            .await
+            .expect("a status");
+        let requests = requests.lock().expect("requests poisoned");
+        let deployment = requests
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/deployments/nova"))
+            .expect("the Deployment");
+        let body: serde_json::Value = serde_json::from_str(&deployment.2).expect("JSON body");
+        let env = body["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env");
+        let domain = env
+            .iter()
+            .find(|var| var["name"] == "NOVA_BASE_DOMAIN")
+            .expect("NOVA_BASE_DOMAIN");
+        assert_eq!(domain["value"], "example.com");
     }
 }
