@@ -64,6 +64,9 @@ pub struct IdentitySecret {
     pub fixed: &'static [(&'static str, &'static str)],
     /// Keys generated once, then kept for the life of the install.
     pub generated: &'static [&'static str],
+    /// Keys that hold a Fernet key (32 random bytes, url-safe base64, 44 characters): generated
+    /// once and kept, like `generated`, but in the format Airflow's encryption needs.
+    pub fernet: &'static [&'static str],
 }
 
 impl IdentitySecret {
@@ -74,6 +77,7 @@ impl IdentitySecret {
             .iter()
             .map(|(key, _)| *key)
             .chain(self.generated.iter().copied())
+            .chain(self.fernet.iter().copied())
             .collect()
     }
 }
@@ -88,11 +92,13 @@ pub const IDENTITY_SECRETS: [IdentitySecret; 3] = [
         name: "keycloak-admin",
         fixed: &[("username", "admin")],
         generated: &["password"],
+        fernet: &[],
     },
     IdentitySecret {
         name: "stardelt-realm-admin",
         fixed: &[("username", "admin")],
         generated: &["password"],
+        fernet: &[],
     },
     IdentitySecret {
         name: "stardelt-oidc-clients",
@@ -106,6 +112,7 @@ pub const IDENTITY_SECRETS: [IdentitySecret; 3] = [
             "trino-group-sync",
             "pipeline-runner",
         ],
+        fernet: &[],
     },
 ];
 
@@ -117,6 +124,38 @@ pub fn generate_secret() -> Result<String, IdentityError> {
     getrandom::fill(&mut bytes)
         .map_err(|e| IdentityError(format!("cannot generate an identity credential: {e}")))?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// The alphabet of URL-safe base64 (RFC 4648 section 5).
+const BASE64_URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/// URL-safe base64 with `=` padding. Written here so that a Fernet key needs no new dependency.
+fn base64_url(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let group = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        for position in 0..4 {
+            if position <= chunk.len() {
+                out.push(char::from(
+                    BASE64_URL[((group >> (18 - 6 * position)) & 63) as usize],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// A Fernet key: 32 random bytes as URL-safe base64, 44 characters ending in `=`. Airflow encrypts
+/// the connections it stores with it and refuses to start with anything else.
+pub fn generate_fernet_key() -> Result<String, IdentityError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| IdentityError(format!("cannot generate a Fernet key: {e}")))?;
+    Ok(base64_url(&bytes))
 }
 
 /// Which keys a Secret still needs: `desired` minus the keys in `existing`, in `desired` order.
@@ -141,6 +180,12 @@ pub fn identity_secret(desired: &IdentitySecret, namespace: &str) -> Result<Secr
         data.insert(
             (*key).to_string(),
             ByteString(generate_secret()?.into_bytes()),
+        );
+    }
+    for key in desired.fernet {
+        data.insert(
+            (*key).to_string(),
+            ByteString(generate_fernet_key()?.into_bytes()),
         );
     }
     Ok(Secret {
@@ -887,5 +932,70 @@ mod tests {
         for key in IDENTITY_SECRETS[2].generated {
             assert_eq!(data[*key].0.len(), 48, "{key}");
         }
+    }
+
+    #[test]
+    fn base64_url_matches_the_rfc_vectors_and_the_url_safe_alphabet() {
+        assert_eq!(base64_url(b""), "");
+        assert_eq!(base64_url(b"f"), "Zg==");
+        assert_eq!(base64_url(b"fo"), "Zm8=");
+        assert_eq!(base64_url(b"foo"), "Zm9v");
+        assert_eq!(base64_url(b"foobar"), "Zm9vYmFy");
+        assert_eq!(
+            base64_url(&[0u8; 32]),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(
+            base64_url(&[255u8; 32]),
+            "__________________________________________8="
+        );
+        let counting: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            base64_url(&counting),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        );
+        let mixed: Vec<u8> = [0xfb, 0xff, 0xfe]
+            .iter()
+            .copied()
+            .cycle()
+            .take(30)
+            .chain([0xfb, 0xff])
+            .collect();
+        assert_eq!(
+            base64_url(&mixed),
+            "-__--__--__--__--__--__--__--__--__--__--_8="
+        );
+    }
+
+    #[test]
+    fn a_fernet_key_has_44_url_safe_characters_ending_in_one_padding_sign_and_differs_each_time() {
+        let key = generate_fernet_key().expect("a key");
+        assert_eq!(key.len(), 44);
+        assert!(key.ends_with('='));
+        assert!(
+            key[..43]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "not url-safe base64: {key}"
+        );
+        assert_ne!(key, generate_fernet_key().expect("a second key"));
+    }
+
+    #[test]
+    fn an_identity_secret_with_a_fernet_key_carries_one_in_that_format() {
+        const WITH_FERNET: IdentitySecret = IdentitySecret {
+            name: "demo",
+            fixed: &[("username", "demo")],
+            generated: &["password"],
+            fernet: &["fernet-key"],
+        };
+        assert_eq!(
+            WITH_FERNET.key_names(),
+            ["username", "password", "fernet-key"]
+        );
+        let secret = identity_secret(&WITH_FERNET, "stardelt").expect("a Secret");
+        let data = secret.data.expect("data");
+        assert_eq!(data["fernet-key"].0.len(), 44);
+        assert_eq!(data["password"].0.len(), 48, "a plain credential stays hex");
     }
 }
