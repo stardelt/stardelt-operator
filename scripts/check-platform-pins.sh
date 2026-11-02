@@ -27,6 +27,7 @@ declare -A PREFIX_OF=(
   [seaweedfs/seaweedfs]=SEAWEEDFS
   [lakekeeper/lakekeeper]=LAKEKEEPER
   [trino/trino]=TRINO
+  [apache-airflow/airflow]=AIRFLOW
 )
 
 status=0
