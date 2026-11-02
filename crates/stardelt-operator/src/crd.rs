@@ -285,6 +285,65 @@ impl Default for IdentitySpec {
     }
 }
 
+/// How the applications are reached from outside the cluster. Off by default: a cluster without an
+/// ingress controller installs as it is, and an administrator brings their own ingress or uses a
+/// port-forward. The Services stay `ClusterIP` either way.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)",
+        "message": "ingress.tls.enabled needs ingress.tls.issuer, the name of a cert-manager ClusterIssuer"
+    }
+]))]
+pub struct IngressSettings {
+    /// Create an Ingress for Nova (on `baseDomain` itself) and, with `identity.mode: platform`,
+    /// for the identity provider (`id.<baseDomain>`).
+    #[serde(default)]
+    pub enabled: bool,
+    /// IngressClass name, for example `nginx` or `traefik`. Absent: the cluster default.
+    #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 253))]
+    pub class_name: Option<String>,
+    /// TLS through cert-manager.
+    #[serde(default)]
+    pub tls: IngressTls,
+}
+
+/// TLS of the Ingress objects.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct IngressTls {
+    /// Requires cert-manager. Leave off when TLS ends elsewhere (a cloud load balancer, an edge proxy).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Name of a cert-manager ClusterIssuer; written as the `cert-manager.io/cluster-issuer`
+    /// annotation of every Ingress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 253))]
+    pub issuer: Option<String>,
+    /// Name of the Secret that holds the certificate; `{host}` becomes the host name with the
+    /// dots turned into dashes.
+    #[serde(
+        default = "default_secret_name_template",
+        rename = "secretNameTemplate"
+    )]
+    #[schemars(length(min = 1, max = 253))]
+    pub secret_name_template: String,
+}
+
+fn default_secret_name_template() -> String {
+    "{host}-tls".to_string()
+}
+
+impl Default for IngressTls {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            issuer: None,
+            secret_name_template: default_secret_name_template(),
+        }
+    }
+}
+
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -307,6 +366,10 @@ impl Default for IdentitySpec {
     {
         "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode == 'none' || has(self.baseDomain)",
         "message": "identity needs baseDomain (the application hosts and redirect addresses are built from it)"
+    },
+    {
+        "rule": "!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || has(self.baseDomain)",
+        "message": "ingress needs baseDomain (the hosts are built from it)"
     }
 ]))]
 pub struct PlatformInstanceSpec {
@@ -339,6 +402,9 @@ pub struct PlatformInstanceSpec {
     /// How users sign in; see [`IdentitySpec`].
     #[serde(default)]
     pub identity: IdentitySpec,
+    /// How the applications are reached from outside the cluster; see [`IngressSettings`].
+    #[serde(default)]
+    pub ingress: IngressSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -2095,6 +2161,49 @@ mod tests {
         }))
         .expect("deserialize PlatformInstance");
         assert_eq!(pi.spec.namespace, "lab");
+    }
+
+    #[test]
+    fn ingress_is_off_by_default_and_uses_the_cluster_default_class() {
+        let spec: PlatformInstanceSpec = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!spec.ingress.enabled);
+        assert_eq!(spec.ingress.class_name, None);
+        assert!(!spec.ingress.tls.enabled);
+        assert_eq!(spec.ingress.tls.issuer, None);
+        assert_eq!(spec.ingress.tls.secret_name_template, "{host}-tls");
+    }
+
+    #[test]
+    fn ingress_settings_are_read_from_the_spec() {
+        let spec: PlatformInstanceSpec = serde_json::from_value(serde_json::json!({
+            "baseDomain": "data.example.com",
+            "ingress": {
+                "enabled": true,
+                "className": "traefik",
+                "tls": { "enabled": true, "issuer": "letsencrypt", "secretNameTemplate": "tls-{host}" }
+            }
+        }))
+        .unwrap();
+        assert!(spec.ingress.enabled);
+        assert_eq!(spec.ingress.class_name.as_deref(), Some("traefik"));
+        assert!(spec.ingress.tls.enabled);
+        assert_eq!(spec.ingress.tls.issuer.as_deref(), Some("letsencrypt"));
+        assert_eq!(spec.ingress.tls.secret_name_template, "tls-{host}");
+    }
+
+    #[test]
+    fn the_crd_refuses_an_ingress_without_a_domain_and_tls_without_an_issuer() {
+        let crd = serde_json::to_string(&PlatformInstance::crd()).unwrap();
+        assert!(crd.contains("ingress needs baseDomain (the hosts are built from it)"));
+        assert!(crd.contains(
+            "!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || has(self.baseDomain)"
+        ));
+        assert!(crd.contains(
+            "ingress.tls.enabled needs ingress.tls.issuer, the name of a cert-manager ClusterIssuer"
+        ));
+        assert!(crd.contains(
+            "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)"
+        ));
     }
 
     #[test]
