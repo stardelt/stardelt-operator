@@ -672,6 +672,23 @@ mod tests {
     }
 
     #[test]
+    fn the_golden_airflow_webserver_config_maps_group_roles() {
+        let text = include_str!("../values/airflow.yaml");
+        for needle in [
+            "_AuthRolesMapping",
+            "get_all_roles",
+            "stardelt-group-",
+            "AUTH_ROLES_SYNC_AT_LOGIN = True",
+            "[(_admin_group, [\"Admin\"])]",
+        ] {
+            assert!(
+                text.contains(needle),
+                "the webserver config must contain {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn the_golden_airflow_values_pin_one_image_in_both_places_and_name_no_namespace() {
         let text = include_str!("../values/airflow.yaml");
         let values = golden_values("airflow");
