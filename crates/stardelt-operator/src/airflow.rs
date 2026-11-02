@@ -66,6 +66,9 @@ pub fn pipeline_reader_binding(namespace: &str) -> RoleBinding {
     }
 }
 
+/// The Secret that holds the service user Nova signs in to Airflow with (keys `username`, `password`).
+pub const NOVA_API_SECRET: &str = "airflow-nova-api";
+
 /// The Secrets Airflow reads, with the names and keys of `scripts/app-secrets.sh`: the chart's
 /// Secret-reference fields (`fernetKeySecretName`, `apiSecretKeySecretName`,
 /// `webserverSecretKeySecretName`, `jwtSecretName`), the local administrator and the service user
@@ -97,7 +100,7 @@ pub const SECRETS: [IdentitySecret; 5] = [
         fernet: &[],
     },
     IdentitySecret {
-        name: "airflow-nova-api",
+        name: NOVA_API_SECRET,
         fixed: &[("username", "nova-api")],
         generated: &["password"],
         fernet: &[],
@@ -190,5 +193,15 @@ mod tests {
         let data = webserver.data.expect("data");
         assert_eq!(data["webserver-secret-key"].0.len(), 48);
         assert_ne!(data["webserver-secret-key"], data["api-secret-key"]);
+    }
+
+    #[test]
+    fn nova_reads_the_password_from_the_secret_the_table_creates() {
+        assert_eq!(NOVA_API_SECRET, "airflow-nova-api");
+        assert!(
+            SECRETS
+                .iter()
+                .any(|s| s.name == NOVA_API_SECRET && s.key_names() == ["username", "password"])
+        );
     }
 }
