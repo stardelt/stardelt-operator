@@ -321,13 +321,13 @@ async fn workloads_ready(
     let mut total = 0;
     let deployment_counts = deployments_listed.items.iter().map(|d| {
         (
-            d.spec.as_ref().and_then(|s| s.replicas),
+            d.spec.replicas,
             d.status.as_ref().and_then(|s| s.ready_replicas),
         )
     });
     let statefulset_counts = statefulsets_listed.items.iter().map(|s| {
         (
-            s.spec.as_ref().and_then(|s| s.replicas),
+            s.spec.replicas,
             s.status.as_ref().and_then(|s| s.ready_replicas),
         )
     });
