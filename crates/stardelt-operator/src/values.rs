@@ -719,4 +719,22 @@ mod tests {
             "the second command must still run"
         );
     }
+
+    #[test]
+    fn people_who_sign_in_are_members_that_see_no_dag_until_a_group_role_grants_it() {
+        let values = golden_values("airflow");
+        let config = values["apiServer"]["apiServerConfig"]
+            .as_str()
+            .expect("the web server config");
+        assert!(config.contains("AUTH_USER_REGISTRATION_ROLE = \"stardelt-member\""));
+        assert!(!config.contains("AUTH_USER_REGISTRATION_ROLE = \"Viewer\""));
+        let script = values["createUserJob"]["args"][2]
+            .as_str()
+            .expect("the script");
+        assert!(script.contains("sm.add_role(\"stardelt-member\")"));
+        assert!(script.contains("sm.find_role(\"Viewer\").permissions"));
+        assert!(
+            script.contains("GLOBAL = {(\"can_read\", \"DAGs\"), (\"can_read\", \"DAG Runs\")}")
+        );
+    }
 }
