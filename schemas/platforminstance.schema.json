@@ -138,6 +138,66 @@
             }
           ]
         },
+        "ingress": {
+          "default": {
+            "enabled": false,
+            "tls": {
+              "enabled": false,
+              "secretNameTemplate": "{host}-tls"
+            }
+          },
+          "description": "How the applications are reached from outside the cluster; see [`IngressSettings`].",
+          "properties": {
+            "className": {
+              "description": "IngressClass name, for example `nginx` or `traefik`. Absent: the cluster default.",
+              "maxLength": 253,
+              "minLength": 1,
+              "nullable": true,
+              "type": "string"
+            },
+            "enabled": {
+              "default": false,
+              "description": "Create an Ingress for Nova (on `baseDomain` itself) and, with `identity.mode: platform`,\nfor the identity provider (`id.<baseDomain>`).",
+              "type": "boolean"
+            },
+            "tls": {
+              "default": {
+                "enabled": false,
+                "secretNameTemplate": "{host}-tls"
+              },
+              "description": "TLS through cert-manager.",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "description": "Requires cert-manager. Leave off when TLS ends elsewhere (a cloud load balancer, an edge proxy).",
+                  "type": "boolean"
+                },
+                "issuer": {
+                  "description": "Name of a cert-manager ClusterIssuer; written as the `cert-manager.io/cluster-issuer`\nannotation of every Ingress.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "nullable": true,
+                  "type": "string"
+                },
+                "secretNameTemplate": {
+                  "default": "{host}-tls",
+                  "description": "Name of the Secret that holds the certificate; `{host}` becomes the host name with the\ndots turned into dashes.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "object",
+          "x-kubernetes-validations": [
+            {
+              "message": "ingress.tls.enabled needs ingress.tls.issuer, the name of a cert-manager ClusterIssuer",
+              "rule": "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)"
+            }
+          ]
+        },
         "namespace": {
           "default": "stardelt",
           "description": "Namespace the platform's own components are installed into.",
@@ -277,6 +337,10 @@
         {
           "message": "identity needs baseDomain (the application hosts and redirect addresses are built from it)",
           "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode == 'none' || has(self.baseDomain)"
+        },
+        {
+          "message": "ingress needs baseDomain (the hosts are built from it)",
+          "rule": "!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || has(self.baseDomain)"
         }
       ]
     },
