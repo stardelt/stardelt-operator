@@ -360,14 +360,35 @@ createUserJob:
         secretKeyRef:
           name: airflow-admin
           key: password
+    # The service user Nova signs in with (NOVA_AIRFLOW_USER / NOVA_AIRFLOW_PASSWORD). The
+    # platform's own file creates only the administrator and leaves this user to a hand-made step
+    # (stardelt-platform#476); an operator-managed install creates it here, read-only (Viewer).
+    - name: AIRFLOW_NOVA_API_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: airflow-nova-api
+          key: username
+    - name: AIRFLOW_NOVA_API_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: airflow-nova-api
+          key: password
   args:
     - "bash"
     - "-c"
     - |
-      exec airflow users create \
+      set -e
+      airflow users create \
         --role Admin \
         --username "$AIRFLOW_ADMIN_USERNAME" \
         --email admin@stardelt.local \
         --firstname stardelt \
         --lastname Admin \
         --password "$AIRFLOW_ADMIN_PASSWORD"
+      airflow users create \
+        --role Viewer \
+        --username "$AIRFLOW_NOVA_API_USERNAME" \
+        --email nova-api@stardelt.local \
+        --firstname Nova \
+        --lastname API \
+        --password "$AIRFLOW_NOVA_API_PASSWORD"

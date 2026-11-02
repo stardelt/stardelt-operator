@@ -682,4 +682,41 @@ mod tests {
         assert!(text.contains("http://seaweedfs-s3:8333"));
         assert!(text.contains("http://lakekeeper:8181/catalog"));
     }
+
+    #[test]
+    fn the_golden_user_job_creates_the_administrator_and_the_read_only_service_user_of_nova() {
+        let values = golden_values("airflow");
+        let job = &values["createUserJob"];
+        let env: Vec<(&str, &str, &str)> = job["env"]
+            .as_array()
+            .expect("env")
+            .iter()
+            .map(|e| {
+                let source = &e["valueFrom"]["secretKeyRef"];
+                (
+                    e["name"].as_str().expect("a name"),
+                    source["name"].as_str().expect("a Secret"),
+                    source["key"].as_str().expect("a key"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("AIRFLOW_ADMIN_USERNAME", "airflow-admin", "username"),
+                ("AIRFLOW_ADMIN_PASSWORD", "airflow-admin", "password"),
+                ("AIRFLOW_NOVA_API_USERNAME", "airflow-nova-api", "username"),
+                ("AIRFLOW_NOVA_API_PASSWORD", "airflow-nova-api", "password"),
+            ]
+        );
+        let script = job["args"][2].as_str().expect("the script");
+        assert_eq!(script.matches("airflow users create").count(), 2);
+        assert!(script.contains("--role Admin") && script.contains("--role Viewer"));
+        assert!(script.contains("--username \"$AIRFLOW_NOVA_API_USERNAME\""));
+        assert!(script.starts_with("set -e"));
+        assert!(
+            !script.contains("exec "),
+            "the second command must still run"
+        );
+    }
 }

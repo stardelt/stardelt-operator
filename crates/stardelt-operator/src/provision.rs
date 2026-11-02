@@ -703,7 +703,12 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
     let namespace = &spec.namespace;
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let mut missing = Vec::new();
-    for name in NOVA_SECRETS {
+    // With the `pipelines` pillar Nova also reads the service user's password (airflow::SECRETS).
+    let mut required = NOVA_SECRETS.to_vec();
+    if spec.pillars.pipelines {
+        required.push(airflow::NOVA_API_SECRET);
+    }
+    for name in required {
         match secrets.get_opt(name).await {
             Ok(Some(_)) => {}
             Ok(None) => missing.push(name),
@@ -742,7 +747,12 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
     if let Err(e) = apply::<Service>(client, namespace, &nova::service(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
-    let deployment = nova::deployment(namespace, NOVA_IMAGE, spec.base_domain.as_deref());
+    let deployment = nova::deployment(
+        namespace,
+        NOVA_IMAGE,
+        spec.base_domain.as_deref(),
+        spec.pillars.pipelines,
+    );
     let applied = match apply::<Deployment>(client, namespace, &deployment, dry_run).await {
         Ok(applied) => applied,
         Err(e) => return Some(status(NAME, false, e.to_string())),
@@ -2123,5 +2133,50 @@ mod tests {
             status.message.as_deref(),
             Some("planned (dry-run): Role and RoleBinding airflow-pipeline-reader")
         );
+    }
+
+    #[tokio::test]
+    async fn nova_waits_for_the_airflow_service_user_password_only_with_the_pipelines_pillar() {
+        // Everything else exists; only the Airflow password Secret is missing.
+        let (client, requests) = keycloak_client(&["airflow-nova-api"], None);
+        let with = platform_with_pipelines(true, false);
+        let status = ensure_nova(&context(client), &with)
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for secrets: airflow-nova-api")
+        );
+        assert!(applied_paths(&requests).is_empty());
+
+        let (client, requests) = keycloak_client(&["airflow-nova-api"], Some(1));
+        let without = platform_with_lakehouse(true, false);
+        let status = ensure_nova(&context(client), &without)
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(applied_paths(&requests).len(), 9);
+    }
+
+    #[tokio::test]
+    async fn nova_points_at_airflow_when_the_pipelines_pillar_is_on() {
+        let (client, requests) = keycloak_client(&[], Some(1));
+        let status = ensure_nova(&context(client), &platform_with_pipelines(true, false))
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        let requests = requests.lock().expect("requests poisoned");
+        let deployment = requests
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/deployments/nova"))
+            .expect("the Deployment");
+        let body: serde_json::Value = serde_json::from_str(&deployment.2).expect("JSON body");
+        let env = body["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env");
+        let names: Vec<&str> = env.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(names.contains(&"NOVA_AIRFLOW_URL"), "{names:?}");
+        assert!(names.contains(&"NOVA_AIRFLOW_PASSWORD"), "{names:?}");
     }
 }

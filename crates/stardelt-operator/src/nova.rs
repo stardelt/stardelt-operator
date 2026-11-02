@@ -247,7 +247,7 @@ fn identity_env(name: &str, key: &str) -> EnvVar {
 /// the Trino CA, the events token) is optional, so Nova starts without it and runs in
 /// development mode; only the state store and the object-store keys are required. The settings
 /// for the catalog client, the secret store and Airflow arrive with those components.
-fn env(namespace: &str, base_domain: Option<&str>) -> Vec<EnvVar> {
+fn env(namespace: &str, base_domain: Option<&str>, airflow: bool) -> Vec<EnvVar> {
     let mut env = vec![
         identity_env("NOVA_TRINO_URL", "trinoUrl"),
         secret_env("NOVA_TRINO_CA_PEM", "trino-ca", "tls.crt", true),
@@ -297,6 +297,21 @@ fn env(namespace: &str, base_domain: Option<&str>) -> Vec<EnvVar> {
     if let Some(domain) = base_domain {
         env.push(value_env("NOVA_BASE_DOMAIN", domain));
     }
+    // The Pipelines page reads runs and logs with the service user Airflow's install creates. The
+    // address is the Service of the release `airflow` in this namespace.
+    if airflow {
+        env.push(value_env(
+            "NOVA_AIRFLOW_URL",
+            "http://airflow-api-server:8080",
+        ));
+        env.push(value_env("NOVA_AIRFLOW_USER", "nova-api"));
+        env.push(secret_env(
+            "NOVA_AIRFLOW_PASSWORD",
+            crate::airflow::NOVA_API_SECRET,
+            "password",
+            false,
+        ));
+    }
     env
 }
 
@@ -307,7 +322,7 @@ fn quantities(values: [(&str, &str); 2]) -> std::collections::BTreeMap<String, Q
         .collect()
 }
 
-fn container(image: &str, namespace: &str, base_domain: Option<&str>) -> Container {
+fn container(image: &str, namespace: &str, base_domain: Option<&str>, airflow: bool) -> Container {
     let port = |name: &str, container_port: i32| ContainerPort {
         name: Some(name.into()),
         container_port,
@@ -320,7 +335,7 @@ fn container(image: &str, namespace: &str, base_domain: Option<&str>) -> Contain
         // the registry is unreachable.
         image_pull_policy: Some("IfNotPresent".into()),
         ports: Some(vec![port("http", 8080), port("internal", 8081)]),
-        env: Some(env(namespace, base_domain)),
+        env: Some(env(namespace, base_domain, airflow)),
         readiness_probe: Some(Probe {
             http_get: Some(HTTPGetAction {
                 path: Some("/api/health".into()),
@@ -352,8 +367,14 @@ fn container(image: &str, namespace: &str, base_domain: Option<&str>) -> Contain
 /// The Nova Deployment: one replica, running as ServiceAccount `nova` without root and with a
 /// read-only filesystem. `image` is the reference to run (pinned by digest in a real install);
 /// `base_domain` is the domain the applications are served under, used for the links Nova shows
-/// to the other applications (none when it is `None`).
-pub fn deployment(namespace: &str, image: &str, base_domain: Option<&str>) -> Deployment {
+/// to the other applications (none when it is `None`). `airflow` adds the three variables that
+/// point Nova at the Airflow of the `pipelines` pillar.
+pub fn deployment(
+    namespace: &str,
+    image: &str,
+    base_domain: Option<&str>,
+    airflow: bool,
+) -> Deployment {
     let mut labels = name_selector();
     labels.extend(part_of());
     Deployment {
@@ -389,7 +410,7 @@ pub fn deployment(namespace: &str, image: &str, base_domain: Option<&str>) -> De
                     image_pull_secrets: Some(vec![LocalObjectReference {
                         name: "ghcr-creds".into(),
                     }]),
-                    containers: vec![container(image, namespace, base_domain)],
+                    containers: vec![container(image, namespace, base_domain, airflow)],
                     ..PodSpec::default()
                 }),
             },
@@ -577,7 +598,7 @@ mod tests {
 
     #[test]
     fn the_deployment_runs_the_given_image_as_the_nova_service_account() {
-        let deployment = deployment("stardelt", IMAGE, None);
+        let deployment = deployment("stardelt", IMAGE, None, false);
         assert_eq!(deployment.metadata.name.as_deref(), Some("nova"));
         assert_eq!(deployment.metadata.namespace.as_deref(), Some("stardelt"));
         let spec = deployment.spec.clone().expect("spec");
@@ -604,7 +625,7 @@ mod tests {
 
     #[test]
     fn the_pod_is_locked_down() {
-        let deployment = deployment("stardelt", IMAGE, None);
+        let deployment = deployment("stardelt", IMAGE, None, false);
         let pod = deployment
             .spec
             .clone()
@@ -633,7 +654,7 @@ mod tests {
 
     #[test]
     fn the_container_ports_are_the_ones_the_service_targets() {
-        let container = container_of(&deployment("stardelt", IMAGE, None));
+        let container = container_of(&deployment("stardelt", IMAGE, None, false));
         let ports: Vec<_> = container
             .ports
             .expect("ports")
@@ -655,7 +676,7 @@ mod tests {
 
     #[test]
     fn the_environment_is_exactly_the_core_set() {
-        let env = env_of(&deployment("stardelt", IMAGE, None));
+        let env = env_of(&deployment("stardelt", IMAGE, None, false));
         let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
@@ -688,7 +709,7 @@ mod tests {
 
     #[test]
     fn only_the_state_store_and_the_object_store_keys_are_required() {
-        let env = env_of(&deployment("stardelt", IMAGE, None));
+        let env = env_of(&deployment("stardelt", IMAGE, None, false));
         let mut required = Vec::new();
         for var in &env {
             let Some(source) = &var.value_from else {
@@ -715,7 +736,7 @@ mod tests {
 
     #[test]
     fn the_secrets_are_read_from_the_names_the_platform_uses() {
-        let env = env_of(&deployment("stardelt", IMAGE, None));
+        let env = env_of(&deployment("stardelt", IMAGE, None, false));
         let secret = |name: &str| {
             let selector = named(&env, name)
                 .value_from
@@ -766,7 +787,7 @@ mod tests {
 
     #[test]
     fn the_addresses_follow_the_namespace() {
-        let env = env_of(&deployment("lab", IMAGE, None));
+        let env = env_of(&deployment("lab", IMAGE, None, false));
         let value = |name: &str| named(&env, name).value.expect(name);
         assert_eq!(
             value("NOVA_LAKEKEEPER_URL"),
@@ -784,13 +805,58 @@ mod tests {
 
     #[test]
     fn the_base_domain_is_set_only_when_given() {
-        let without = env_of(&deployment("stardelt", IMAGE, None));
+        let without = env_of(&deployment("stardelt", IMAGE, None, false));
         assert!(without.iter().all(|e| e.name != "NOVA_BASE_DOMAIN"));
-        let with = env_of(&deployment("stardelt", IMAGE, Some("data.example.com")));
+        let with = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+        ));
         assert_eq!(
             named(&with, "NOVA_BASE_DOMAIN").value.as_deref(),
             Some("data.example.com")
         );
         assert_eq!(with.len(), without.len() + 1);
+    }
+
+    #[test]
+    fn with_the_pipelines_pillar_nova_gets_the_airflow_address_user_and_password() {
+        let without = env_of(&deployment("lab", IMAGE, None, false));
+        assert!(without.iter().all(|e| !e.name.starts_with("NOVA_AIRFLOW")));
+        let env = env_of(&deployment("lab", IMAGE, None, true));
+        let added: Vec<&str> = env
+            .iter()
+            .map(|e| e.name.as_str())
+            .filter(|name| name.starts_with("NOVA_AIRFLOW"))
+            .collect();
+        assert_eq!(
+            added,
+            [
+                "NOVA_AIRFLOW_URL",
+                "NOVA_AIRFLOW_USER",
+                "NOVA_AIRFLOW_PASSWORD"
+            ]
+        );
+        assert_eq!(env.len(), without.len() + 3);
+        assert_eq!(
+            named(&env, "NOVA_AIRFLOW_URL").value.as_deref(),
+            Some("http://airflow-api-server:8080")
+        );
+        assert_eq!(
+            named(&env, "NOVA_AIRFLOW_USER").value.as_deref(),
+            Some("nova-api")
+        );
+        let password = named(&env, "NOVA_AIRFLOW_PASSWORD")
+            .value_from
+            .and_then(|s| s.secret_key_ref)
+            .expect("a Secret reference");
+        assert_eq!(password.name, "airflow-nova-api");
+        assert_eq!(password.key, "password");
+        assert_eq!(
+            password.optional,
+            Some(false),
+            "a missing password keeps the pod from starting instead of running without it"
+        );
     }
 }
