@@ -1140,6 +1140,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_workload_with_fewer_ready_replicas_than_it_wants_is_not_ready() {
+        // One of two replicas is ready: the desired count comes from `spec.replicas`.
+        let (client, _requests) = mock_client(&deployment_list(1, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm_stub(),
+        };
+        let values = ComponentValues::default();
+
+        let outcome = apply_plan(
+            &ctx,
+            "stardelt",
+            &plan(),
+            &overrides_context(&values),
+            false,
+            false,
+            &[],
+        )
+        .await;
+
+        let status = &outcome.components[0];
+        assert!(!status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("0/1 workloads ready"));
+    }
+
+    #[tokio::test]
     async fn ready_workloads_report_ready() {
         let helm = helm_stub();
         let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
