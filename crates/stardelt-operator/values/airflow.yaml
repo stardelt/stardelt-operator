@@ -148,10 +148,13 @@ apiServer:
                 },
             }
         ]
-        # Realm users may sign in read-only; stardelt-admins is synced to Admin
+        # Realm users sign in as stardelt-member: Viewer without the global read on DAGs and DAG
+        # Runs, so a member sees no DAG until a role of their group grants it (createUserJob below
+        # creates the role; stardelt-internal design/airflow-access.md, platform#477). A plain
+        # Viewer sees every group's DAGs, runs, logs and code. stardelt-admins is synced to Admin
         # at every login (the same group Nova treats as administrator).
         AUTH_USER_REGISTRATION = True
-        AUTH_USER_REGISTRATION_ROLE = "Viewer"
+        AUTH_USER_REGISTRATION_ROLE = "stardelt-member"
         AUTH_ROLES_MAPPING = {_admin_group: ["Admin"]}
         AUTH_ROLES_SYNC_AT_LOGIN = True
     else:
@@ -392,3 +395,16 @@ createUserJob:
         --firstname Nova \
         --lastname API \
         --password "$AIRFLOW_NOVA_API_PASSWORD"
+      python - <<'PY'
+      from airflow.providers.fab.auth_manager.cli_commands.utils import get_application_builder
+
+      # stardelt-member (the registration role): Viewer without the two permissions that make
+      # every DAG visible. Run again, it changes nothing.
+      GLOBAL = {("can_read", "DAGs"), ("can_read", "DAG Runs")}
+      with get_application_builder() as appbuilder:
+          sm = appbuilder.sm
+          role = sm.find_role("stardelt-member") or sm.add_role("stardelt-member")
+          for permission in sm.find_role("Viewer").permissions:
+              if (permission.action.name, permission.resource.name) not in GLOBAL:
+                  sm.add_permission_to_role(role, permission)
+      PY
