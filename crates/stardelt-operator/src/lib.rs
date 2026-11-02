@@ -12,6 +12,7 @@ pub mod helm;
 pub mod identity;
 pub mod identity_checklist;
 pub mod keycloak;
+pub mod nova;
 pub mod objects;
 pub mod planner;
 pub mod prerequisites;
