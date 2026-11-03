@@ -36,6 +36,7 @@ use crate::{
         notebooks_bucket_job, notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster,
         s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
     },
+    superset,
 };
 use k8s_openapi::api::batch::v1::CronJob;
 
@@ -712,6 +713,17 @@ pub async fn ensure_airflow_secrets(
         return None;
     }
     Some(ensure_generated_secrets(ctx, spec, "airflow-secrets", &airflow::SECRETS).await)
+}
+
+/// The Superset Secrets ([`superset::SECRETS`]), for the `dashboards` pillar. `None` without it.
+pub async fn ensure_superset_secrets(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    if !spec.pillars.dashboards {
+        return None;
+    }
+    Some(ensure_generated_secrets(ctx, spec, "superset-secrets", &superset::SECRETS).await)
 }
 
 /// The Role that lets Airflow read the `Pipeline` and `ServicePrincipal` resources, and its
@@ -2240,6 +2252,21 @@ mod tests {
         instance.spec
     }
 
+    fn platform_with_dashboards(dashboards: bool, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "dryRun": dry_run,
+                "pillars": { "dashboards": dashboards },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
     fn platform_with_apps(pipelines: bool, notebooks: bool, dry_run: bool) -> PlatformInstanceSpec {
         let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
             "apiVersion": "stardelt.io/v1alpha1",
@@ -2280,6 +2307,30 @@ mod tests {
         assert!(status.ready, "{status:?}");
         assert_eq!(status.message.as_deref(), Some("ready: created 5 / kept 0"));
         assert_eq!(patch_count(&requests), 5);
+    }
+
+    #[tokio::test]
+    async fn superset_secrets_exist_only_with_the_dashboards_pillar() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        assert!(
+            ensure_superset_secrets(&context(client), &platform_with_dashboards(false, false))
+                .await
+                .is_none()
+        );
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn superset_secrets_are_created_for_the_dashboards_pillar() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let status =
+            ensure_superset_secrets(&context(client), &platform_with_dashboards(true, false))
+                .await
+                .expect("a status");
+        assert_eq!(status.name, "superset-secrets");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.message.as_deref(), Some("ready: created 3 / kept 0"));
+        assert_eq!(patch_count(&requests), 3);
     }
 
     #[tokio::test]

@@ -51,6 +51,8 @@ pub fn golden_values(component: &str) -> Value {
         // addresses and no Reloader annotation (see the header of the file).
         "airflow" => serde_yaml::from_str(include_str!("../values/airflow.yaml"))
             .expect("values/airflow.yaml is not valid YAML"),
+        "superset" => serde_yaml::from_str(include_str!("../values/superset.yaml"))
+            .expect("values/superset.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }
@@ -275,6 +277,9 @@ mod tests {
                 include_str!("../values/seaweedfs.demo.yaml"),
             ),
             ("trino.demo.yaml", include_str!("../values/trino.demo.yaml")),
+            ("jupyterhub.yaml", include_str!("../values/jupyterhub.yaml")),
+            ("airflow.yaml", include_str!("../values/airflow.yaml")),
+            ("superset.yaml", include_str!("../values/superset.yaml")),
         ] {
             let value: Value = serde_yaml::from_str(document)
                 .unwrap_or_else(|e| panic!("values/{name} is not valid YAML: {e}"));
@@ -683,6 +688,43 @@ mod tests {
                 "the webserver config must contain {needle}"
             );
         }
+    }
+
+    #[test]
+    fn the_golden_superset_values_pin_the_image_and_stay_admin_only() {
+        let values = golden_values("superset");
+        assert_eq!(
+            values["image"]["repository"],
+            serde_json::json!("ghcr.io/stardelt/superset")
+        );
+        assert_eq!(
+            values["image"]["tag"],
+            serde_json::json!(
+                "dev@sha256:b9ced85d81a0c9efd2ca993f27bba5470e4815aad9d246b93e3ca5e62d26e8cd"
+            )
+        );
+        let config_overrides = values["configOverrides"].as_object().unwrap();
+        assert!(config_overrides.contains_key("iframe_embedding"));
+        assert!(config_overrides.contains_key("password_store"));
+        assert!(!config_overrides.contains_key("oauth"));
+        let text = include_str!("../values/superset.yaml");
+        assert!(!text.contains("AUTH_TYPE"));
+        assert!(!text.contains("OAUTH_PROVIDERS"));
+        assert!(!text.contains("AUTH_USER_REGISTRATION"));
+        assert!(!text.contains("_AuthRolesMapping"));
+        assert!(!text.contains("stardelt-identity"));
+        assert!(!text.contains("serviceAccountName"));
+        assert!(!text.contains("superset-analyst-role.py"));
+        assert!(!text.contains("superset-group-roles.py"));
+        let init_script = values["init"]["initscript"].as_str().unwrap();
+        assert!(!init_script.contains("superset-analyst-role.py"));
+        assert!(!init_script.contains("superset-group-roles.py"));
+        let import = values["extraConfigs"]["import_datasources.yaml"]
+            .as_str()
+            .unwrap();
+        assert!(import.contains("trino://superset@trino:8080/"));
+        assert!(import.contains("warehouse"));
+        assert!(import.contains("shared"));
     }
 
     #[test]

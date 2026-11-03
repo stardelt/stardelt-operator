@@ -36,6 +36,12 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
             chart: Some("apache-airflow/airflow"),
         });
     }
+    if spec.pillars.dashboards {
+        plan.push(ComponentPlan {
+            name: "superset",
+            chart: Some("superset/superset"),
+        });
+    }
     plan
 }
 
@@ -149,6 +155,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "trino/trino" => Some("1.42.2"),
         "jupyterhub/jupyterhub" => Some("4.4.3"),
         "apache-airflow/airflow" => Some("1.21.0"),
+        "superset/superset" => Some("0.15.5"),
         _ => None,
     }
 }
@@ -163,6 +170,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "trino/trino" => Some("https://trinodb.github.io/charts"),
         "jupyterhub/jupyterhub" => Some("https://jupyterhub.github.io/helm-chart/"),
         "apache-airflow/airflow" => Some("https://airflow.apache.org"),
+        "superset/superset" => Some("https://apache.github.io/superset"),
         _ => None,
     }
 }
@@ -303,6 +311,39 @@ mod tests {
             chart_repo("apache-airflow/airflow"),
             Some("https://airflow.apache.org")
         );
+    }
+
+    #[test]
+    fn dashboards_pillar_adds_superset_to_the_platform_plan() {
+        let base = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            ingress: Default::default(),
+        };
+        assert!(!base.pillars.dashboards, "dashboards stay opt-in");
+        let plan = plan_platform(&PlatformInstanceSpec {
+            pillars: Pillars {
+                dashboards: true,
+                ..Default::default()
+            },
+            ..base.clone()
+        });
+        assert_eq!(names(&plan), vec!["cnpg", "superset"]);
+        assert_eq!(plan[1].chart, Some("superset/superset"));
+        let both = plan_platform(&PlatformInstanceSpec {
+            pillars: Pillars {
+                pipelines: true,
+                dashboards: true,
+                ..Default::default()
+            },
+            ..base
+        });
+        assert_eq!(names(&both), vec!["cnpg", "airflow", "superset"]);
     }
 
     #[test]

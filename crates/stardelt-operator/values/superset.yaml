@@ -1,0 +1,159 @@
+# Apache Superset — BI / dashboards.
+# Chart: superset/superset 0.15.5, appVersion 5.0.0.
+#
+# Curated by the operator for admin-only install (O7a): OIDC and group scoping
+# are added by O7b. The pod reads credentials from Secrets via extraEnvRaw.
+
+image:
+  repository: ghcr.io/stardelt/superset
+  tag: "dev@sha256:b9ced85d81a0c9efd2ca993f27bba5470e4815aad9d246b93e3ca5e62d26e8cd"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ghcr-creds
+
+bootstrapScript: |
+  #!/bin/bash
+  if [ ! -f ~/bootstrap ]; then echo "Running Superset" > ~/bootstrap; fi
+
+configOverrides:
+  iframe_embedding: |
+    TALISMAN_ENABLED = False
+    HTTP_HEADERS = {}
+    SESSION_COOKIE_SAMESITE = "Lax"
+    ENABLE_PROXY_FIX = True
+
+  password_store: |
+    import os
+    from superset.config import SECRET_KEY
+
+
+    def AUTH_DB_PASSWORD_STORE(url):
+        # Superset calls this only when the URI lacks a password. The Trino
+        # service account password is stored in Secret trino-password-db and
+        # injected as TRINO_SUPERSET_PASSWORD via extraEnvRaw.
+        if url.drivername == "trino":
+            password = os.environ.get("TRINO_SUPERSET_PASSWORD")
+            if password:
+                url = url.set(password=password)
+        return url
+
+
+    SQLALCHEMY_CUSTOM_PASSWORD_STORE = AUTH_DB_PASSWORD_STORE
+
+extraEnvRaw:
+  - name: SUPERSET_SECRET_KEY
+    valueFrom:
+      secretKeyRef:
+        name: superset-secret-key
+        key: secret-key
+  - name: SUPERSET_ADMIN_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: superset-admin
+        key: password
+  - name: TRINO_SUPERSET_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: trino-password-db
+        key: password
+        optional: true
+
+extraConfigs:
+  import_datasources.yaml: |
+    databases:
+    - database_name: Trino Warehouse
+      sqlalchemy_uri: trino://superset@trino:8080/warehouse
+      allow_multi_catalog: true
+      impersonate_user: true
+    - database_name: Trino Shared
+      sqlalchemy_uri: trino://superset@trino:8080/shared
+      allow_multi_catalog: true
+      impersonate_user: true
+      extra: >-
+        {"allow_multi_catalog": true, "metadata_params": {}, "engine_params": {},
+         "metadata_cache_timeout": {}, "schemas_allowed_for_csv_upload": []}
+      tables: []
+
+init:
+  adminUser:
+    username: admin
+    firstname: stardelt
+    lastname: Admin
+    email: admin@stardelt.local
+  initscript: |
+    #!/bin/sh
+    set -eu
+    echo "Upgrading DB schema..."
+    superset db upgrade
+    echo "Initializing roles..."
+    superset init
+    {{ if .Values.init.createAdmin }}
+    echo "Creating admin user..."
+    superset fab create-admin \
+                    --username {{ .Values.init.adminUser.username }} \
+                    --firstname {{ .Values.init.adminUser.firstname }} \
+                    --lastname {{ .Values.init.adminUser.lastname }} \
+                    --email {{ .Values.init.adminUser.email }} \
+                    --password "$SUPERSET_ADMIN_PASSWORD" \
+                    || true
+    {{- end }}
+    {{ if .Values.init.loadExamples }}
+    echo "Loading examples..."
+    superset load_examples
+    {{- end }}
+    if [ -f "{{ .Values.extraConfigMountPath }}/import_datasources.yaml" ]; then
+      echo "Importing database connections.... "
+      superset import_datasources -p {{ .Values.extraConfigMountPath }}/import_datasources.yaml
+    fi
+  loadExamples: false
+
+supersetNode:
+  replicas:
+    enabled: true
+    replicaCount: 1
+  resources:
+    requests: { cpu: "100m", memory: "512Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"  }
+
+supersetWorker:
+  replicas:
+    enabled: true
+    replicaCount: 1
+  command:
+    - "/bin/sh"
+    - "-c"
+    - ". {{ .Values.configMountPath }}/superset_bootstrap.sh; celery --app=superset.tasks.celery_app:app worker --concurrency=2"
+  resources:
+    requests: { cpu: "100m", memory: "512Mi" }
+    limits:   { cpu: "2",    memory: "1Gi"  }
+
+supersetCeleryBeat:
+  enabled: false
+
+supersetWebsockets:
+  enabled: false
+
+postgresql:
+  enabled: true
+  primary:
+    persistence:
+      size: 2Gi
+    resources:
+      requests: { cpu: "50m", memory: "256Mi" }
+      limits:   { cpu: "1",   memory: "512Mi" }
+
+redis:
+  enabled: true
+  master:
+    persistence:
+      size: 1Gi
+    resources:
+      requests: { cpu: "50m", memory: "128Mi" }
+      limits:   { cpu: "1",   memory: "256Mi" }
+  replica:
+    replicaCount: 0
+
+service:
+  type: ClusterIP
+  port: 8088

@@ -20,4 +20,5 @@ pub mod planner;
 pub mod prerequisites;
 pub mod principal;
 pub mod provision;
+pub mod superset;
 pub mod values;
