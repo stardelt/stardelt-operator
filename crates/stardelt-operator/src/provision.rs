@@ -31,10 +31,10 @@ use crate::{
     },
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, NOVA_CLUSTER, S3_CONFIG_SECRET, S3_SECRET, S3Keys,
-        S3Location, bootstrap_job, bootstrap_job_name, catalog_cluster, discovery_config_map,
-        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, notebooks_bucket_job,
-        notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, s3_creds_secret, s3_endpoint,
-        seaweedfs_config_secret,
+        S3Location, bootstrap_job, bootstrap_job_name, catalog_cluster, catalog_pg_backup,
+        discovery_config_map, discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster,
+        notebooks_bucket_job, notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster,
+        s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
     },
 };
 use k8s_openapi::api::batch::v1::CronJob;
@@ -182,7 +182,7 @@ pub async fn ensure_catalog_database(
     const NAME: &str = "catalog-database";
     let dry_run = lh.spec.dry_run;
     let cluster = catalog_cluster(&lh.name_any(), namespace, lh.spec.profile);
-    match apply_dynamic(
+    let applied = match apply_dynamic(
         &ctx.client,
         namespace,
         &cnpg_cluster_resource(),
@@ -191,19 +191,38 @@ pub async fn ensure_catalog_database(
     )
     .await
     {
-        Err(kube::Error::Api(e)) if e.code == 404 => status(
-            NAME,
-            false,
-            "CloudNative-PG is not installed: create a PlatformInstance first",
-        ),
-        Err(e) => status(NAME, false, e.to_string()),
-        Ok(_) if dry_run => status(
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            return status(
+                NAME,
+                false,
+                "CloudNative-PG is not installed: create a PlatformInstance first",
+            );
+        }
+        Err(e) => return status(NAME, false, e.to_string()),
+        Ok(applied) => applied,
+    };
+    if dry_run {
+        return status(
             NAME,
             false,
             format!("planned (dry-run): Cluster {CATALOG_CLUSTER}"),
-        ),
-        Ok(applied) if cluster_ready(&applied) => status(NAME, true, "database ready"),
-        Ok(_) => status(NAME, false, "waiting for the database to become Ready"),
+        );
+    }
+    if let Err(e) = apply_dynamic(
+        &ctx.client,
+        namespace,
+        &cnpg_scheduled_backup_resource(),
+        &catalog_pg_backup(&lh.name_any(), namespace),
+        false,
+    )
+    .await
+    {
+        return status(NAME, false, e.to_string());
+    }
+    if cluster_ready(&applied) {
+        status(NAME, true, "database ready")
+    } else {
+        status(NAME, false, "waiting for the database to become Ready")
     }
 }
 
@@ -2483,5 +2502,42 @@ mod tests {
         assert!(!status.ready);
         assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
         assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn catalog_database_applies_the_cluster_then_its_daily_backup() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_catalog_database(&context(client), &lakehouse(), "stardelt").await;
+        assert_eq!(status.name, "catalog-database");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for the database to become Ready")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg",
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/scheduledbackups/lakekeeper-pg-daily",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_database_dry_run_plans_only_the_cluster() {
+        let mut lh = lakehouse();
+        lh.spec.dry_run = true;
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_catalog_database(&context(client), &lh, "stardelt").await;
+        assert_eq!(status.name, "catalog-database");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): Cluster lakekeeper-pg")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            ["/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg"]
+        );
     }
 }
