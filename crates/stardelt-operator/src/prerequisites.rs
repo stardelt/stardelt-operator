@@ -150,12 +150,16 @@ pub fn catalog_cluster(lakehouse: &str, namespace: &str, profile: Profile) -> Dy
         metadata: meta(CATALOG_CLUSTER, namespace, lakehouse, "lakekeeper"),
         data: json!({"spec": {
             "instances": 1,
+            "imageName": "ghcr.io/cloudnative-pg/postgresql:17.7-system-trixie",
             "storage": {"size": size},
+            "backup": continuous_backup(namespace),
             "bootstrap": {"initdb": {"database": "lakekeeper", "owner": "lakekeeper"}},
             "resources": {
                 "requests": {"cpu": "50m", "memory": "256Mi"},
                 "limits": {"cpu": "1", "memory": "512Mi"},
             },
+            "postgresql": {"parameters": {"max_connections": "150"}},
+            "probes": {"startup": {"failureThreshold": 120}},
         }}),
     }
 }
@@ -191,6 +195,7 @@ pub fn keycloak_pg_cluster(namespace: &str) -> DynamicObject {
         metadata: platform_meta("keycloak-pg", namespace, "keycloak-pg"),
         data: json!({"spec": {
             "instances": 1,
+            "imageName": "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
             "storage": {"size": "1Gi"},
             "backup": continuous_backup(namespace),
             "bootstrap": {"initdb": {"database": "keycloak", "owner": "keycloak"}},
@@ -198,6 +203,8 @@ pub fn keycloak_pg_cluster(namespace: &str) -> DynamicObject {
                 "requests": {"cpu": "50m", "memory": "128Mi"},
                 "limits": {"cpu": "500m", "memory": "256Mi"},
             },
+            "postgresql": {"parameters": {"max_connections": "150"}},
+            "probes": {"startup": {"failureThreshold": 120}},
         }}),
     }
 }
@@ -216,6 +223,24 @@ pub fn keycloak_pg_backup(namespace: &str) -> DynamicObject {
             "backupOwnerReference": "self",
             "method": "barmanObjectStore",
             "cluster": {"name": "keycloak-pg"},
+        }}),
+    }
+}
+
+/// The daily base backup of the catalog database. Mirrors the platform manifest.
+pub fn catalog_pg_backup(lakehouse: &str, namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "ScheduledBackup".into(),
+        }),
+        metadata: meta("lakekeeper-pg-daily", namespace, lakehouse, "lakekeeper"),
+        data: json!({"spec": {
+            "schedule": "0 30 2 * * *",
+            "immediate": true,
+            "backupOwnerReference": "self",
+            "method": "barmanObjectStore",
+            "cluster": {"name": CATALOG_CLUSTER},
         }}),
     }
 }
@@ -832,6 +857,63 @@ mod tests {
     #[test]
     fn the_notebooks_bucket_is_the_one_nova_publishes_to() {
         assert_eq!(NOTEBOOKS_BUCKET, crate::nova::NOTEBOOK_BUCKET);
+    }
+
+    #[test]
+    fn catalog_pg_backup_is_the_daily_barman_schedule() {
+        let backup = catalog_pg_backup("main", "data");
+        assert_eq!(
+            backup
+                .types
+                .as_ref()
+                .map(|t| (t.api_version.as_str(), t.kind.as_str())),
+            Some(("postgresql.cnpg.io/v1", "ScheduledBackup"))
+        );
+        assert_eq!(backup.metadata.name.as_deref(), Some("lakekeeper-pg-daily"));
+        assert_eq!(backup.metadata.namespace.as_deref(), Some("data"));
+        let spec = &backup.data["spec"];
+        assert_eq!(spec["schedule"], "0 30 2 * * *");
+        assert_eq!(spec["immediate"], true);
+        assert_eq!(spec["backupOwnerReference"], "self");
+        assert_eq!(spec["method"], "barmanObjectStore");
+        assert_eq!(spec["cluster"]["name"], "lakekeeper-pg");
+    }
+
+    #[test]
+    fn the_catalog_cluster_pins_postgresql_17_and_keeps_its_hardening() {
+        let cluster = catalog_cluster("main", "data", Profile::Full);
+        assert_eq!(
+            cluster.data["spec"]["imageName"],
+            "ghcr.io/cloudnative-pg/postgresql:17.7-system-trixie"
+        );
+        assert_eq!(cluster.data["spec"]["backup"]["retentionPolicy"], "14d");
+        let store = &cluster.data["spec"]["backup"]["barmanObjectStore"];
+        assert_eq!(store["destinationPath"], "s3://backups/");
+        assert_eq!(
+            cluster.data["spec"]["postgresql"]["parameters"]["max_connections"],
+            "150"
+        );
+        assert_eq!(
+            cluster.data["spec"]["probes"]["startup"]["failureThreshold"],
+            120
+        );
+    }
+
+    #[test]
+    fn the_keycloak_cluster_pins_postgresql_18_and_keeps_its_hardening() {
+        let cluster = keycloak_pg_cluster("stardelt");
+        assert_eq!(
+            cluster.data["spec"]["imageName"],
+            "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie"
+        );
+        assert_eq!(
+            cluster.data["spec"]["postgresql"]["parameters"]["max_connections"],
+            "150"
+        );
+        assert_eq!(
+            cluster.data["spec"]["probes"]["startup"]["failureThreshold"],
+            120
+        );
     }
 
     fn location() -> S3Location {
