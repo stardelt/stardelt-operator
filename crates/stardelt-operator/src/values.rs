@@ -692,7 +692,10 @@ mod tests {
         let digest = values["images"]["airflow"]["digest"]
             .as_str()
             .expect("a digest");
-        assert!(digest.starts_with("sha256:"));
+        assert_eq!(
+            digest, "sha256:2d9504d1a88770bbea76c64dae7cd64c2fb6097c19bc20d19d5b0314c5d4c33f",
+            "the golden Airflow image must carry the loader's access_control (platform#493)"
+        );
         let worker = values["env"]
             .as_array()
             .expect("env")
