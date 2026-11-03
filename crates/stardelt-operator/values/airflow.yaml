@@ -426,34 +426,15 @@ createUserJob:
         --lastname API \
         --password "$AIRFLOW_NOVA_API_PASSWORD"
       python - <<'PY'
-      import os
-
       from airflow.providers.fab.auth_manager.cli_commands.utils import get_application_builder
 
       # stardelt-member (the registration role): Viewer without the two permissions that make
       # every DAG visible. Run again, it changes nothing.
       GLOBAL = {("can_read", "DAGs"), ("can_read", "DAG Runs")}
-      # Nova's own sign-in needs the actions too (platform#496): trigger a DAG (can_create on
-      # DAG Runs) and pause it (can_edit on DAGs). Nova checks the caller's owner group first;
-      # this is the service identity, not a person.
-      NOVA_WRITE = (("can_edit", "DAGs"), ("can_create", "DAG Runs"))
       with get_application_builder() as appbuilder:
           sm = appbuilder.sm
           role = sm.find_role("stardelt-member") or sm.add_role("stardelt-member")
           for permission in sm.find_role("Viewer").permissions:
               if (permission.action.name, permission.resource.name) not in GLOBAL:
                   sm.add_permission_to_role(role, permission)
-
-          service = sm.find_role("nova-service") or sm.add_role("nova-service")
-          for permission in sm.find_role("Viewer").permissions:
-              sm.add_permission_to_role(service, permission)
-          for action, resource in NOVA_WRITE:
-              sm.add_permission_to_role(
-                  service,
-                  sm.get_permission(action, resource) or sm.create_permission(action, resource),
-              )
-          user = sm.find_user(username=os.environ["AIRFLOW_NOVA_API_USERNAME"])
-          if user is not None and service.name not in {r.name for r in user.roles}:
-              user.roles.append(service)
-              sm.update_user(user)
       PY
