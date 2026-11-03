@@ -157,7 +157,7 @@
             },
             "enabled": {
               "default": false,
-              "description": "Create an Ingress for Nova (on `baseDomain` itself) and, with `identity.mode: platform`,\nfor the identity provider (`id.<baseDomain>`).",
+              "description": "Create an Ingress for Nova (on `baseDomain` itself); the identity provider\non `id.` with `identity.mode: platform`; Airflow on `airflow.` with the `pipelines` pillar;\nJupyterHub on `jupyter.` with `notebooks`.",
               "type": "boolean"
             },
             "tls": {

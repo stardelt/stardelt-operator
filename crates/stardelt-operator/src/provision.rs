@@ -914,6 +914,12 @@ pub async fn ensure_ingress(ctx: &Context, spec: &PlatformInstanceSpec) -> Optio
         objects.extend(ingress::nova(spec));
     }
     objects.extend(ingress::keycloak(spec));
+    if spec.pillars.pipelines {
+        objects.extend(ingress::airflow(spec));
+    }
+    if spec.pillars.notebooks {
+        objects.extend(ingress::jupyterhub(spec));
+    }
     if objects.is_empty() {
         return Some(status(
             NAME,
@@ -2118,6 +2124,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingress_publishes_airflow_and_jupyterhub_with_their_pillars() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(&context(client), &platform_with_apps(true, true, false))
+            .await
+            .expect("a status");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("applied: nova, airflow, jupyterhub")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            vec![
+                "/apis/networking.k8s.io/v1/namespaces/stardelt/ingresses/nova".to_string(),
+                "/apis/networking.k8s.io/v1/namespaces/stardelt/ingresses/airflow".to_string(),
+                "/apis/networking.k8s.io/v1/namespaces/stardelt/ingresses/jupyterhub".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn the_airflow_secrets_are_created_once_and_the_fernet_key_has_its_format() {
         let (client, store, requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
@@ -2189,6 +2215,24 @@ mod tests {
                 "namespace": "stardelt",
                 "dryRun": dry_run,
                 "pillars": { "pipelines": pipelines },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
+    fn platform_with_apps(pipelines: bool, notebooks: bool, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "baseDomain": "example.com",
+                "dryRun": dry_run,
+                "identity": { "mode": "none" },
+                "pillars": { "lakehouse": true, "pipelines": pipelines, "notebooks": notebooks },
+                "ingress": { "enabled": true, "className": "traefik" },
             }
         }))
         .expect("deserialize PlatformInstance");
