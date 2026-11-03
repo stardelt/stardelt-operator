@@ -1,13 +1,20 @@
-//! Airflow (the `pipelines` pillar of `design/operator-parity.md`, step O6): the two pieces that
-//! need no decision, as pure builders. The chart, its values, the images and the controller step
-//! that applies all of it come later; nothing here is called yet.
+//! Airflow (the `pipelines` pillar of `design/operator-parity.md`, step O6): builders for the
+//! Role/binding, Secrets, and group-roles sync CronJob applied by the controller/provision step.
 //!
 //! Every field mirrors `stardelt-platform`: the Role is `manifests/airflow-pipelines.yaml`, the
-//! Secrets are the Airflow part of `scripts/app-secrets.sh`.
+//! Secrets are the Airflow part of `scripts/app-secrets.sh`, and the group-roles job mirrors
+//! `manifests/airflow-group-roles.yaml`.
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
+use k8s_openapi::api::core::v1::{
+    Capabilities, ConfigMap, ConfigMapVolumeSource, Container, EnvVar, EnvVarSource, PodSpec,
+    PodTemplateSpec, ResourceRequirements, SecretKeySelector, SecurityContext, ServiceAccount,
+    Volume, VolumeMount,
+};
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::ObjectMeta;
 
 use crate::keycloak::IdentitySecret;
@@ -66,6 +73,184 @@ pub fn pipeline_reader_binding(namespace: &str) -> RoleBinding {
     }
 }
 
+/// Name of the ServiceAccount, ConfigMap, RoleBinding and CronJob that create the FAB roles.
+pub const GROUP_ROLES_JOB: &str = "airflow-group-roles";
+
+/// The image the Job runs: the same Airflow build the chart runs (`images.airflow` in the
+/// golden values), by digest.
+pub fn image() -> String {
+    let values = crate::values::golden_values("airflow");
+    let repository = values["images"]["airflow"]["repository"]
+        .as_str()
+        .expect("values/airflow.yaml has images.airflow.repository");
+    let digest = values["images"]["airflow"]["digest"]
+        .as_str()
+        .expect("values/airflow.yaml has images.airflow.digest");
+    format!("{repository}@{digest}")
+}
+
+pub fn group_roles_service_account(namespace: &str) -> ServiceAccount {
+    ServiceAccount {
+        metadata: meta(GROUP_ROLES_JOB, namespace),
+        automount_service_account_token: Some(true),
+        ..ServiceAccount::default()
+    }
+}
+
+pub fn group_roles_config_map(namespace: &str) -> ConfigMap {
+    ConfigMap {
+        metadata: meta(GROUP_ROLES_JOB, namespace),
+        data: Some(BTreeMap::from([(
+            "sync.py".to_string(),
+            include_str!("airflow_group_roles.py").to_string(),
+        )])),
+        ..ConfigMap::default()
+    }
+}
+
+pub fn group_roles_binding(namespace: &str) -> RoleBinding {
+    RoleBinding {
+        metadata: meta(GROUP_ROLES_JOB, namespace),
+        role_ref: RoleRef {
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            kind: "Role".into(),
+            name: PIPELINE_READER_ROLE.into(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".into(),
+            name: GROUP_ROLES_JOB.into(),
+            namespace: Some(namespace.into()),
+            ..Subject::default()
+        }]),
+    }
+}
+
+pub fn group_roles_cron_job(namespace: &str, image: &str) -> CronJob {
+    let container = Container {
+        name: "sync".to_string(),
+        image: Some(image.to_string()),
+        command: Some(vec![
+            "python".to_string(),
+            "/opt/scripts/sync.py".to_string(),
+        ]),
+        env: Some(vec![
+            EnvVar {
+                name: "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN".to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: "airflow-metadata".to_string(),
+                        key: "connection".to_string(),
+                        optional: None,
+                    }),
+                    ..EnvVarSource::default()
+                }),
+                ..EnvVar::default()
+            },
+            EnvVar {
+                name: "AIRFLOW__API__SECRET_KEY".to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: "airflow-webserver-key".to_string(),
+                        key: "api-secret-key".to_string(),
+                        optional: None,
+                    }),
+                    ..EnvVarSource::default()
+                }),
+                ..EnvVar::default()
+            },
+            EnvVar {
+                name: "AIRFLOW__API_AUTH__JWT_SECRET".to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: "airflow-jwt-secret".to_string(),
+                        key: "jwt-secret".to_string(),
+                        optional: None,
+                    }),
+                    ..EnvVarSource::default()
+                }),
+                ..EnvVar::default()
+            },
+            EnvVar {
+                name: "AIRFLOW__CORE__FERNET_KEY".to_string(),
+                value_from: Some(EnvVarSource {
+                    secret_key_ref: Some(SecretKeySelector {
+                        name: "airflow-fernet-key".to_string(),
+                        key: "fernet-key".to_string(),
+                        optional: None,
+                    }),
+                    ..EnvVarSource::default()
+                }),
+                ..EnvVar::default()
+            },
+        ]),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "scripts".to_string(),
+            mount_path: "/opt/scripts".to_string(),
+            read_only: Some(true),
+            ..VolumeMount::default()
+        }]),
+        resources: Some(ResourceRequirements {
+            requests: Some(BTreeMap::from([
+                ("cpu".to_string(), Quantity("50m".to_string())),
+                ("memory".to_string(), Quantity("64Mi".to_string())),
+            ])),
+            limits: Some(BTreeMap::from([
+                ("cpu".to_string(), Quantity("500m".to_string())),
+                ("memory".to_string(), Quantity("256Mi".to_string())),
+            ])),
+            ..ResourceRequirements::default()
+        }),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".to_string()]),
+                ..Capabilities::default()
+            }),
+            ..SecurityContext::default()
+        }),
+        ..Container::default()
+    };
+
+    CronJob {
+        metadata: meta(GROUP_ROLES_JOB, namespace),
+        spec: CronJobSpec {
+            schedule: "*/5 * * * *".to_string(),
+            concurrency_policy: Some("Forbid".to_string()),
+            failed_jobs_history_limit: Some(3),
+            successful_jobs_history_limit: Some(1),
+            starting_deadline_seconds: None,
+            suspend: None,
+            time_zone: None,
+            job_template: JobTemplateSpec {
+                metadata: Some(meta(GROUP_ROLES_JOB, namespace)),
+                spec: Some(JobSpec {
+                    backoff_limit: Some(1),
+                    template: PodTemplateSpec {
+                        metadata: Some(meta(GROUP_ROLES_JOB, namespace)),
+                        spec: Some(PodSpec {
+                            restart_policy: Some("Never".to_string()),
+                            service_account_name: Some(GROUP_ROLES_JOB.to_string()),
+                            containers: vec![container],
+                            volumes: Some(vec![Volume {
+                                name: "scripts".to_string(),
+                                config_map: Some(ConfigMapVolumeSource {
+                                    name: GROUP_ROLES_JOB.to_string(),
+                                    default_mode: Some(0o444),
+                                    ..ConfigMapVolumeSource::default()
+                                }),
+                                ..Volume::default()
+                            }]),
+                            ..PodSpec::default()
+                        }),
+                    },
+                    ..JobSpec::default()
+                }),
+            },
+        },
+        status: None,
+    }
+}
+
 /// The Secret that holds the service user Nova signs in to Airflow with (keys `username`, `password`).
 pub const NOVA_API_SECRET: &str = "airflow-nova-api";
 
@@ -110,6 +295,137 @@ pub const SECRETS: [IdentitySecret; 5] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_group_roles_job_runs_every_five_minutes_on_the_pinned_image() {
+        let job = group_roles_cron_job("stardelt", &image());
+        let spec = &job.spec;
+        assert_eq!(spec.schedule, "*/5 * * * *");
+        assert_eq!(spec.concurrency_policy.as_deref(), Some("Forbid"));
+        assert_eq!(spec.successful_jobs_history_limit, Some(1));
+        assert_eq!(spec.failed_jobs_history_limit, Some(3));
+        let job_spec = spec.job_template.spec.as_ref().unwrap();
+        assert_eq!(job_spec.backoff_limit, Some(1));
+        let pod_spec = job_spec.template.spec.as_ref().unwrap();
+        assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
+        let container = &pod_spec.containers[0];
+        assert_eq!(container.name, "sync");
+        let expected = {
+            let values = crate::values::golden_values("airflow");
+            format!(
+                "{}@{}",
+                values["images"]["airflow"]["repository"].as_str().unwrap(),
+                values["images"]["airflow"]["digest"].as_str().unwrap()
+            )
+        };
+        assert_eq!(container.image.as_deref(), Some(expected.as_str()));
+        assert_eq!(image(), expected);
+    }
+
+    #[test]
+    fn the_group_roles_job_mounts_the_script_and_reads_the_airflow_secrets() {
+        let cm = group_roles_config_map("stardelt");
+        let data = cm.data.as_ref().unwrap();
+        let script = data.get("sync.py").unwrap();
+        assert!(script.contains("get_application_builder"));
+        assert!(script.contains("ownerGroup"));
+        assert!(script.contains("stardelt-group-"));
+        let job = group_roles_cron_job("stardelt", &image());
+        let env = job
+            .spec
+            .job_template
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .env
+            .as_ref()
+            .unwrap();
+        let names: Vec<_> = env.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"));
+        assert!(names.contains(&"AIRFLOW__API__SECRET_KEY"));
+        assert!(names.contains(&"AIRFLOW__API_AUTH__JWT_SECRET"));
+        assert!(names.contains(&"AIRFLOW__CORE__FERNET_KEY"));
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN")
+                .unwrap()
+                .value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .name,
+            "airflow-metadata"
+        );
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "AIRFLOW__API__SECRET_KEY")
+                .unwrap()
+                .value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .key,
+            "api-secret-key"
+        );
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "AIRFLOW__API_AUTH__JWT_SECRET")
+                .unwrap()
+                .value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .key,
+            "jwt-secret"
+        );
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "AIRFLOW__CORE__FERNET_KEY")
+                .unwrap()
+                .value_from
+                .as_ref()
+                .unwrap()
+                .secret_key_ref
+                .as_ref()
+                .unwrap()
+                .key,
+            "fernet-key"
+        );
+        let mounts = job
+            .spec
+            .job_template
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap()
+            .containers[0]
+            .volume_mounts
+            .as_ref()
+            .unwrap();
+        assert_eq!(mounts[0].mount_path, "/opt/scripts");
+        assert_eq!(mounts[0].read_only, Some(true));
+    }
+
+    #[test]
+    fn the_group_roles_binding_names_the_pipeline_reader_role() {
+        let binding = group_roles_binding("stardelt");
+        assert_eq!(binding.subjects.as_ref().unwrap()[0].name, GROUP_ROLES_JOB);
+        assert_eq!(binding.role_ref.name, PIPELINE_READER_ROLE);
+    }
 
     #[test]
     fn the_role_reads_pipelines_and_service_principals_and_nothing_else() {

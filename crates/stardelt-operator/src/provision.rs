@@ -37,6 +37,7 @@ use crate::{
         seaweedfs_config_secret,
     },
 };
+use k8s_openapi::api::batch::v1::CronJob;
 
 fn status(name: &str, ready: bool, message: impl Into<String>) -> ComponentStatus {
     ComponentStatus {
@@ -734,6 +735,68 @@ pub async fn ensure_airflow_rbac(
         ));
     }
     Some(status(NAME, true, "applied: airflow-pipeline-reader"))
+}
+
+/// The CronJob that creates `stardelt-group-<ownerGroup>` FAB roles for the owner groups of
+/// Pipelines and ServicePrincipals (platform#477 S1b). `None` without the `pipelines` pillar.
+pub async fn ensure_airflow_group_roles(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "airflow-group-roles";
+    if !spec.pillars.pipelines {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let image = airflow::image();
+    if let Err(e) = apply::<ServiceAccount>(
+        &ctx.client,
+        namespace,
+        &airflow::group_roles_service_account(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<ConfigMap>(
+        &ctx.client,
+        namespace,
+        &airflow::group_roles_config_map(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        &ctx.client,
+        namespace,
+        &airflow::group_roles_binding(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<CronJob>(
+        &ctx.client,
+        namespace,
+        &airflow::group_roles_cron_job(namespace, &image),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): ServiceAccount, ConfigMap, RoleBinding and CronJob airflow-group-roles",
+        ));
+    }
+    Some(status(NAME, true, "applied: airflow-group-roles"))
 }
 
 /// The build of Nova the operator installs: the one `stardelt-platform` pins in
@@ -2139,6 +2202,7 @@ mod tests {
         let spec = platform_with_pipelines(false, false);
         assert!(ensure_airflow_secrets(&ctx, &spec).await.is_none());
         assert!(ensure_airflow_rbac(&ctx, &spec).await.is_none());
+        assert!(ensure_airflow_group_roles(&ctx, &spec).await.is_none());
         assert!(requests.lock().expect("requests poisoned").is_empty());
     }
 
@@ -2187,6 +2251,45 @@ mod tests {
         assert_eq!(
             status.message.as_deref(),
             Some("planned (dry-run): Role and RoleBinding airflow-pipeline-reader")
+        );
+    }
+
+    #[tokio::test]
+    async fn airflow_group_roles_applies_the_service_account_config_map_binding_and_job() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status =
+            ensure_airflow_group_roles(&context(client), &platform_with_pipelines(true, false))
+                .await
+                .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("applied: airflow-group-roles")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                "/api/v1/namespaces/stardelt/serviceaccounts/airflow-group-roles",
+                "/api/v1/namespaces/stardelt/configmaps/airflow-group-roles",
+                "/apis/rbac.authorization.k8s.io/v1/namespaces/stardelt/rolebindings/airflow-group-roles",
+                "/apis/batch/v1/namespaces/stardelt/cronjobs/airflow-group-roles",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn airflow_group_roles_dry_run_says_planned_and_is_not_ready() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let status =
+            ensure_airflow_group_roles(&context(client), &platform_with_pipelines(true, true))
+                .await
+                .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some(
+                "planned (dry-run): ServiceAccount, ConfigMap, RoleBinding and CronJob airflow-group-roles"
+            )
         );
     }
 
