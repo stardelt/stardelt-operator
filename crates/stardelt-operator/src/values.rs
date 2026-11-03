@@ -653,6 +653,21 @@ mod tests {
         assert_eq!(values["fernetKeySecretName"], "airflow-fernet-key");
     }
 
+    /// platform#496: Nova's Airflow identity is read-only; Run/Pause live in Airflow's UI, where
+    /// the person's own group role carries the permission.
+    #[test]
+    fn the_golden_airflow_create_user_job_keeps_nova_api_read_only() {
+        let text = include_str!("../values/airflow.yaml");
+        assert!(
+            text.contains("--role Viewer"),
+            "the nova-api user must be created with --role Viewer"
+        );
+        assert!(
+            !text.contains("nova-service"),
+            "the golden values must not create a write role for Nova"
+        );
+    }
+
     #[test]
     fn the_golden_airflow_webserver_config_maps_group_roles() {
         let text = include_str!("../values/airflow.yaml");
