@@ -39,6 +39,10 @@ pub struct Pillars {
     /// queries does not need them. Nova's Pipelines page and `stardelt bundle run` need it.
     #[serde(default)]
     pub pipelines: bool,
+    /// BI dashboards (Superset). Off by default: it brings a metadata database, Redis and
+    /// three long-running pods; until O7b it signs in the local administrator only.
+    #[serde(default)]
+    pub dashboards: bool,
     #[serde(default)]
     pub streaming: bool,
     #[serde(default)]
@@ -56,6 +60,7 @@ impl Default for Pillars {
             batch: false,
             notebooks: false,
             pipelines: false,
+            dashboards: false,
             streaming: false,
             ml: false,
         }

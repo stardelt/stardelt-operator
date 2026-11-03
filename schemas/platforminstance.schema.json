@@ -206,6 +206,7 @@
         "pillars": {
           "default": {
             "batch": false,
+            "dashboards": false,
             "lakehouse": true,
             "ml": false,
             "notebooks": false,
@@ -216,6 +217,11 @@
           "properties": {
             "batch": {
               "default": false,
+              "type": "boolean"
+            },
+            "dashboards": {
+              "default": false,
+              "description": "BI dashboards (Superset). Off by default: it brings a metadata database, Redis and\nthree long-running pods; until O7b it signs in the local administrator only.",
               "type": "boolean"
             },
             "lakehouse": {

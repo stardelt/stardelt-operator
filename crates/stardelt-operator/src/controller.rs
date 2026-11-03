@@ -40,7 +40,7 @@ use crate::provision::{
     ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets, ensure_bootstrap,
     ensure_catalog_database, ensure_discovery, ensure_identity, ensure_identity_secrets,
     ensure_ingress, ensure_keycloak, ensure_keycloak_pg, ensure_notebooks_bucket, ensure_nova,
-    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
+    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets, ensure_superset_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -911,6 +911,8 @@ async fn reconcile_platform(
         .unwrap_or(&[]);
     // Airflow's Secrets come before its release: its pods read them when they start.
     let airflow_secrets = ensure_airflow_secrets(&ctx, &instance.spec).await;
+    // Superset's Secrets come before its release.
+    let superset_secrets = ensure_superset_secrets(&ctx, &instance.spec).await;
     let mut outcome = apply_plan(
         &ctx,
         &instance.spec.namespace,
@@ -922,6 +924,9 @@ async fn reconcile_platform(
     )
     .await;
     if let Some(secrets) = airflow_secrets {
+        outcome.components.push(secrets);
+    }
+    if let Some(secrets) = superset_secrets {
         outcome.components.push(secrets);
     }
     if let Some(rbac) = ensure_airflow_rbac(&ctx, &instance.spec).await {
