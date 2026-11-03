@@ -5,8 +5,7 @@
 //! Every field mirrors `stardelt-platform` `chart/templates/ingress.yaml`: Nova answers on
 //! `spec.baseDomain` itself and every other application on a subdomain (the chart's
 //! `stardelt.appHost`); the class, the cert-manager issuer annotation and the TLS block come
-//! from `spec.ingress`. Only Nova and the identity provider are built here: the other
-//! applications arrive with their components.
+//! from `spec.ingress`. The four applications built today (Nova, identity provider, Airflow, JupyterHub); Trino and Lakekeeper stay unpublished until they authenticate (see "do not").
 
 use std::collections::BTreeMap;
 
@@ -69,6 +68,40 @@ pub fn keycloak(spec: &PlatformInstanceSpec) -> Option<Ingress> {
         "id",
         &KEYCLOAK_PATHS,
         true,
+    )
+}
+
+/// The Ingress of Airflow, on `airflow.<base domain>`, with the `pipelines` pillar. Airflow
+/// signs in through the platform IdP (values/airflow.yaml), so this is not an anonymous host.
+pub fn airflow(spec: &PlatformInstanceSpec) -> Option<Ingress> {
+    if !spec.pillars.pipelines {
+        return None;
+    }
+    build(
+        spec,
+        "airflow",
+        "airflow-api-server",
+        8080,
+        "airflow",
+        &["/"],
+        false,
+    )
+}
+
+/// The Ingress of JupyterHub, on `jupyter.<base domain>`, with the `notebooks` pillar.
+/// JupyterHub signs in through the platform IdP (values/jupyterhub.yaml).
+pub fn jupyterhub(spec: &PlatformInstanceSpec) -> Option<Ingress> {
+    if !spec.pillars.notebooks {
+        return None;
+    }
+    build(
+        spec,
+        "jupyterhub",
+        "proxy-public",
+        80,
+        "jupyter",
+        &["/"],
+        false,
     )
 }
 
@@ -295,5 +328,57 @@ mod tests {
                 "apiAudience": "api", "clients": { "nova": { "clientId": "nova", "clientSecretRef": { "name": "s" } } } } });
             assert!(keycloak(&spec(value)).is_none(), "{mode}");
         }
+    }
+
+    #[test]
+    fn airflow_answers_on_its_subdomain_with_the_api_server() {
+        let ingress = airflow(&spec(
+            serde_json::json!({ "pillars": { "pipelines": true } }),
+        ))
+        .expect("an Ingress");
+        let (host, paths) = rule_of(&ingress);
+        assert_eq!(host, "airflow.data.example.com");
+        assert_eq!(paths, [("/".to_string(), "Prefix".to_string())]);
+        let inner = ingress.spec.expect("spec");
+        let backend = inner.rules.expect("rules")[0]
+            .http
+            .clone()
+            .expect("http")
+            .paths[0]
+            .backend
+            .service
+            .clone()
+            .expect("service");
+        assert_eq!(backend.name, "airflow-api-server");
+        assert_eq!(backend.port.expect("port").number, Some(8080));
+    }
+
+    #[test]
+    fn jupyterhub_answers_on_jupyter_and_needs_the_notebooks_pillar() {
+        let ingress = jupyterhub(&spec(
+            serde_json::json!({ "pillars": { "notebooks": true } }),
+        ))
+        .expect("an Ingress");
+        let (host, paths) = rule_of(&ingress);
+        assert_eq!(host, "jupyter.data.example.com");
+        assert_eq!(paths, [("/".to_string(), "Prefix".to_string())]);
+        let inner = ingress.spec.expect("spec");
+        let backend = inner.rules.expect("rules")[0]
+            .http
+            .clone()
+            .expect("http")
+            .paths[0]
+            .backend
+            .service
+            .clone()
+            .expect("service");
+        assert_eq!(backend.name, "proxy-public");
+        assert_eq!(backend.port.expect("port").number, Some(80));
+        assert!(jupyterhub(&spec(serde_json::json!({}))).is_none());
+    }
+
+    #[test]
+    fn airflow_needs_the_pipelines_pillar() {
+        assert!(airflow(&spec(serde_json::json!({}))).is_none());
     }
 }

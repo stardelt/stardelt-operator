@@ -302,8 +302,9 @@ impl Default for IdentitySpec {
     }
 ]))]
 pub struct IngressSettings {
-    /// Create an Ingress for Nova (on `baseDomain` itself) and, with `identity.mode: platform`,
-    /// for the identity provider (`id.<baseDomain>`).
+    /// Create an Ingress for Nova (on `baseDomain` itself); the identity provider
+    /// on `id.` with `identity.mode: platform`; Airflow on `airflow.` with the `pipelines` pillar;
+    /// JupyterHub on `jupyter.` with `notebooks`.
     #[serde(default)]
     pub enabled: bool,
     /// IngressClass name, for example `nginx` or `traefik`. Absent: the cluster default.
