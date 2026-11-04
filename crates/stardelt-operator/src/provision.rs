@@ -1897,15 +1897,17 @@ pub async fn ensure_external_store(
     )
     .await
     {
-        Err(kube::Error::Api(e)) if e.code == 404 => {
-            Some(status(
-                NAME,
-                false,
-                "External Secrets Operator is not installed (make external-secrets)",
-            ))
-        }
+        Err(kube::Error::Api(e)) if e.code == 404 => Some(status(
+            NAME,
+            false,
+            "External Secrets Operator is not installed (make external-secrets)",
+        )),
         Err(e) => Some(status(NAME, false, e.to_string())),
-        Ok(_) => Some(status(NAME, true, "published ClusterSecretStore enterprise")),
+        Ok(_) => Some(status(
+            NAME,
+            true,
+            "published ClusterSecretStore enterprise",
+        )),
     }
 }
 

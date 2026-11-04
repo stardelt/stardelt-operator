@@ -88,8 +88,20 @@ pub fn credential_secret_name(provider: &Value) -> Result<String, String> {
         match v {
             Value::Object(map) => {
                 // Common inline secret patterns
-                for key in ["token", "password", "secret", "secretKey", "accessKey", "privateKey", "credentials"] {
-                    if map.contains_key(key) && key != "tokenSecretRef" && key != "secretRef" && key != "authSecretRef" {
+                for key in [
+                    "token",
+                    "password",
+                    "secret",
+                    "secretKey",
+                    "accessKey",
+                    "privateKey",
+                    "credentials",
+                ] {
+                    if map.contains_key(key)
+                        && key != "tokenSecretRef"
+                        && key != "secretRef"
+                        && key != "authSecretRef"
+                    {
                         // But need to be careful - "token" as direct value might be inline
                         if let Some(Value::String(s)) = map.get(key) {
                             // If it's not inside a ref object structure, might be inline
@@ -133,11 +145,9 @@ pub fn external_store(spec: &PlatformInstanceSpec) -> Result<Option<Value>, Stri
     match spec.secrets.mode {
         SecretsMode::None | SecretsMode::Platform => Ok(None),
         SecretsMode::External => {
-            let external = spec
-                .secrets
-                .external
-                .as_ref()
-                .ok_or_else(|| "secrets.mode external needs secrets.external.provider".to_string())?;
+            let external = spec.secrets.external.as_ref().ok_or_else(|| {
+                "secrets.mode external needs secrets.external.provider".to_string()
+            })?;
             let provider = &external.provider;
             let (provider_name, _provider_value) = provider_block(provider)?;
             // Also validate credential ref exists
@@ -187,7 +197,10 @@ mod tests {
 
     #[test]
     fn credential_secret_name_rejects_inline() {
-        let err = credential_secret_name(&serde_json::json!({"vault": {"server": "…", "token": "s3cret"}})).unwrap_err();
+        let err = credential_secret_name(
+            &serde_json::json!({"vault": {"server": "…", "token": "s3cret"}}),
+        )
+        .unwrap_err();
         assert!(err.contains("secretRef"));
     }
 
@@ -218,6 +231,9 @@ mod tests {
         });
         let store = external_store(&spec).unwrap().unwrap();
         assert_eq!(store["metadata"]["name"], "enterprise");
-        assert_eq!(store["spec"]["provider"], spec.secrets.external.as_ref().unwrap().provider);
+        assert_eq!(
+            store["spec"]["provider"],
+            spec.secrets.external.as_ref().unwrap().provider
+        );
     }
 }
