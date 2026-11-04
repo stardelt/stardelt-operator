@@ -38,7 +38,7 @@ use crate::prerequisites::CATALOG_CLUSTER;
 use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
-    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
+    ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
     ensure_notebooks_bucket, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
     ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
@@ -857,11 +857,18 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     } else {
         None
     };
+    // The object-store archive: the destination bucket, then the nightly sync into it.
+    let archive = if charts_ready || lh.spec.dry_run {
+        ensure_archive(&ctx, &lh, &namespace, previous).await
+    } else {
+        None
+    };
     // The discovery ConfigMap is published last: it advertises a working catalog.
     let discovery = ensure_discovery(&ctx, &lh, &namespace, bootstrap.ready).await;
     let mut components = vec![s3, database];
     components.append(&mut outcome.components);
     components.extend(notebooks_bucket);
+    components.extend(archive);
     components.push(bootstrap);
     components.push(discovery);
     outcome.components = components;
@@ -1826,11 +1833,16 @@ mod tests {
             .iter()
             .position(|n| *n == "notebooks-bucket")
             .expect("the bucket step");
+        let archive = names
+            .iter()
+            .position(|n| *n == "object-store-archive")
+            .expect("the archive step");
         let bootstrap = names
             .iter()
             .position(|n| *n == "lakekeeper-bootstrap")
             .expect("the bootstrap");
-        assert_eq!(bucket + 1, bootstrap, "{names:?}");
+        assert!(bucket < archive);
+        assert_eq!(archive + 1, bootstrap, "{names:?}");
     }
 
     #[tokio::test]

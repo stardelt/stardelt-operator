@@ -31,10 +31,11 @@ use crate::{
     },
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, NOVA_CLUSTER, S3_CONFIG_SECRET, S3_SECRET, S3Keys,
-        S3Location, bootstrap_job, bootstrap_job_name, catalog_cluster, catalog_pg_backup,
-        discovery_config_map, discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster,
-        notebooks_bucket_job, notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster,
-        s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
+        S3Location, archive_bucket_job, archive_bucket_job_name, archive_cron_job, bootstrap_job,
+        bootstrap_job_name, catalog_cluster, catalog_pg_backup, discovery_config_map,
+        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, notebooks_bucket_job,
+        notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, s3_creds_secret, s3_endpoint,
+        seaweedfs_config_secret,
     },
     superset,
 };
@@ -337,6 +338,69 @@ pub async fn ensure_notebooks_bucket(
         }
         Ok(_) => Some(status(NAME, false, "the bucket Job is running")),
     }
+}
+
+/// The object-store archive: the destination bucket (a Job, remembered like the notebooks
+/// bucket) and the nightly `aws s3 sync` into it. `None` with your own object store (`byoS3`):
+/// there the archive destination is the administrator's bucket to create and protect.
+pub async fn ensure_archive(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+    previous: &[ComponentStatus],
+) -> Option<ComponentStatus> {
+    const NAME: &str = "object-store-archive";
+    if lh.spec.storage.implementation != StorageImpl::Seaweedfs {
+        return None;
+    }
+    if lh.spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    match secrets.get_opt(S3_SECRET).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Some(status(NAME, false, "waiting for Secret stardelt-s3-creds")),
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    }
+    let job_name = archive_bucket_job_name(&s3_endpoint(namespace));
+    let done = previous
+        .iter()
+        .any(|p| p.name == NAME && p.ready && p.applied_hash.as_deref() == Some(job_name.as_str()));
+    if !done {
+        let job = archive_bucket_job(&lh.name_any(), namespace, &job_name, owner_reference(lh));
+        match apply::<Job>(&ctx.client, namespace, &job, false).await {
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+            Ok(job_applied)
+                if job_applied
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.succeeded)
+                    .unwrap_or(0)
+                    >= 1 => {}
+            Ok(_) => {
+                // Fall through to apply CronJob as per ticket
+            }
+        }
+    }
+    // The CronJob is applied on every reconcile: server-side apply converges it.
+    if let Err(e) = apply::<CronJob>(
+        &ctx.client,
+        namespace,
+        &archive_cron_job(namespace, &lh.name_any()),
+        false,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    Some(ComponentStatus {
+        applied_hash: Some(job_name),
+        ..status(
+            NAME,
+            true,
+            "bucket lakehouse-backup exists; archive runs at 03:15",
+        )
+    })
 }
 
 /// `<lakehouse>-discovery`: the ConfigMap that tells consumers where the catalog, the
@@ -2897,6 +2961,46 @@ mod tests {
         .expect("a status");
         assert!(!status.ready);
         assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_archive_is_applied_once_the_s3_secret_exists() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_archive(
+            &context(client),
+            &lakehouse_with_storage("seaweedfs", false),
+            "data",
+            &[],
+        )
+        .await
+        .expect("a status");
+        assert!(status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("bucket lakehouse-backup exists; archive runs at 03:15")
+        );
+        let name = archive_bucket_job_name(&s3_endpoint("data"));
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                format!("/apis/batch/v1/namespaces/data/jobs/{name}"),
+                "/apis/batch/v1/namespaces/data/cronjobs/lakehouse-backup".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_archive_is_absent_without_the_seaweedfs_store() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_archive(
+            &context(client),
+            &lakehouse_with_storage("byoS3", false),
+            "data",
+            &[],
+        )
+        .await;
+        assert!(status.is_none());
         assert!(requests.lock().expect("requests poisoned").is_empty());
     }
 
