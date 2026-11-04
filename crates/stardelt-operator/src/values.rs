@@ -73,6 +73,18 @@ pub fn golden_values(component: &str) -> Value {
     }
 }
 
+/// Values layered over a component when the platform has an identity provider. The
+/// controller decides that from the cluster (ConfigMap `stardelt-identity` and Trino's key
+/// material); the file itself lives next to the golden values so the platform's
+/// `helm-values/trino-identity.yaml` and this one can be diffed by eye.
+pub fn identity_values(component: &str) -> Value {
+    match component {
+        "trino" => serde_yaml::from_str(include_str!("../values/trino-identity.yaml"))
+            .expect("values/trino-identity.yaml is not valid YAML"),
+        _ => Value::Object(Map::new()),
+    }
+}
+
 /// Sizing for one profile, applied between the golden values and anything the CR asks for.
 ///
 /// The platform already thinks this way: `make install-core SLIM=1` layers
@@ -913,5 +925,82 @@ mod tests {
         assert!(
             script.contains("GLOBAL = {(\"can_read\", \"DAGs\"), (\"can_read\", \"DAG Runs\")}")
         );
+    }
+
+    #[test]
+    fn trino_identity_values_turn_authentication_on() {
+        let values = identity_values("trino");
+        assert_eq!(
+            values["server"]["config"]["authenticationType"],
+            serde_json::json!("PASSWORD,OAUTH2")
+        );
+        assert_eq!(
+            values["server"]["config"]["https"]["port"],
+            serde_json::json!(8443)
+        );
+        assert_eq!(
+            values["auth"]["passwordAuthSecret"],
+            serde_json::json!("trino-password-db")
+        );
+        assert_eq!(
+            values["coordinator"]["secretMounts"][0]["secretName"],
+            serde_json::json!("trino-coordinator-tls")
+        );
+        let extra = values["server"]["coordinatorExtraConfig"]
+            .as_str()
+            .expect("a string");
+        assert!(extra.contains("http-server.authentication.allow-insecure-over-http=false"));
+        assert!(
+            extra.contains("http-server.authentication.oauth2.issuer=${ENV:TRINO_OIDC_ISSUER}")
+        );
+        assert!(
+            extra.contains("query.max-execution-time=10m"),
+            "the base guards are restated"
+        );
+        let props = values["additionalConfigProperties"]
+            .as_array()
+            .expect("a list");
+        assert!(props.contains(&serde_json::json!(
+            "internal-communication.shared-secret=${ENV:TRINO_INTERNAL_SHARED_SECRET}"
+        )));
+        assert!(props.contains(&serde_json::json!("http-server.process-forwarded=true")));
+
+        let merged = deep_merge(
+            effective_values(
+                "trino",
+                crate::crd::Profile::Full,
+                None,
+                Some(&serde_json::json!({
+                    "server": {"config": {"authenticationType": "NONE"}}
+                })),
+            ),
+            identity_values("trino"),
+        );
+        assert_eq!(
+            merged["server"]["config"]["authenticationType"],
+            serde_json::json!("PASSWORD,OAUTH2")
+        );
+    }
+
+    #[test]
+    fn only_trino_has_identity_values() {
+        for component in ["lakekeeper", "superset", "airflow", "cnpg"] {
+            assert_eq!(
+                identity_values(component),
+                serde_json::json!({}),
+                "{component}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_golden_trino_values_stay_anonymous() {
+        // The overlay is the only place with an authenticator: a cluster without an IdP must
+        // not render one, and a CR must not be able to make it silent either (the overlay is
+        // merged last by the controller).
+        let text = include_str!("../values/trino.yaml");
+        assert!(!text.contains("authenticationType"));
+        assert!(!text.contains("passwordAuthSecret"));
+        assert!(!text.contains("allow-insecure-over-http=false"));
     }
 }
