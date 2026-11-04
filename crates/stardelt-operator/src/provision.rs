@@ -2966,14 +2966,18 @@ mod tests {
         let status = ensure_access_sync(&ctx, &spec).await.expect("a status");
         assert!(status.ready);
         let paths = applied_paths(&requests);
-        assert!(paths[paths.len() - 5..].iter().zip([
-            "/serviceaccounts/access-sync",
-            "/configmaps/access-sync",
-            "/roles/access-sync",
-            "/rolebindings/access-sync",
-            "/cronjobs/access-sync",
-        ])
-        .all(|(p, suffix)| p.ends_with(suffix)));
+        assert!(
+            paths[paths.len() - 5..]
+                .iter()
+                .zip([
+                    "/serviceaccounts/access-sync",
+                    "/configmaps/access-sync",
+                    "/roles/access-sync",
+                    "/rolebindings/access-sync",
+                    "/cronjobs/access-sync",
+                ])
+                .all(|(p, suffix)| p.ends_with(suffix))
+        );
     }
 
     #[tokio::test]
