@@ -30,8 +30,9 @@ use crate::{
     },
     identity, ingress, keycloak, network_policy, nova,
     objects::{
-        apply, apply_dynamic, cert_manager_certificate_resource, cert_manager_issuer_resource,
-        cnpg_cluster_resource, cnpg_scheduled_backup_resource, labels, owner_reference,
+        apply, apply_dynamic, apply_dynamic_cluster, cert_manager_certificate_resource,
+        cert_manager_issuer_resource, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
+        labels, owner_reference,
     },
     pg_dump,
     prerequisites::{
@@ -42,7 +43,7 @@ use crate::{
         notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, openfga_pg_backup,
         openfga_pg_cluster, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
     },
-    superset,
+    secrets, superset,
 };
 use k8s_openapi::api::batch::v1::CronJob;
 
@@ -1866,6 +1867,46 @@ pub async fn ensure_identity(
             Err(e) => status(NAME, false, e.to_string()),
         },
     )
+}
+
+/// The enterprise's store (decision D23, `secrets.mode: external`): one ClusterSecretStore.
+/// It needs the External Secrets CRDs, so on a first reconcile it reports the 404 and the next
+/// one succeeds — that is the documented order, not an error to retry inside the step.
+pub async fn ensure_external_store(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "secret-store";
+    let store = match secrets::external_store(spec) {
+        Ok(None) => return None,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+        Ok(Some(s)) => s,
+    };
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    let dynamic: kube::core::DynamicObject = match serde_json::from_value(store) {
+        Ok(d) => d,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    match apply_dynamic_cluster(
+        &ctx.client,
+        &secrets::cluster_secret_store_resource(),
+        &dynamic,
+        false,
+    )
+    .await
+    {
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            Some(status(
+                NAME,
+                false,
+                "External Secrets Operator is not installed (make external-secrets)",
+            ))
+        }
+        Err(e) => Some(status(NAME, false, e.to_string())),
+        Ok(_) => Some(status(NAME, true, "published ClusterSecretStore enterprise")),
+    }
 }
 
 #[cfg(test)]

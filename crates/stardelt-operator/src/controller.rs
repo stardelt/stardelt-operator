@@ -38,8 +38,8 @@ use crate::prerequisites::CATALOG_CLUSTER;
 use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
-    ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
-    ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
+    ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_external_store,
+    ensure_identity, ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
     ensure_lakekeeper_network_policy, ensure_notebooks_bucket, ensure_nova, ensure_nova_events,
     ensure_nova_pg, ensure_nova_session, ensure_openbao_seal_key, ensure_openfga_database,
     ensure_openfga_network_policy, ensure_pg_dumps, ensure_s3_secrets, ensure_superset_group_roles,
@@ -1100,6 +1100,9 @@ async fn reconcile_platform(
         previous,
     )
     .await;
+    if let Some(store) = ensure_external_store(&ctx, &instance.spec).await {
+        outcome.components.push(store);
+    }
     if let Some(seal) = openbao_seal {
         outcome.components.push(seal);
     }
