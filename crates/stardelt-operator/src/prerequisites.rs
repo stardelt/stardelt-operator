@@ -628,6 +628,13 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
             ttl_seconds_after_finished: Some(600),
             backoff_limit: Some(4),
             template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(BTreeMap::from([(
+                        crate::network_policy::BOOTSTRAP_POD_LABEL.to_string(),
+                        crate::network_policy::BOOTSTRAP_POD_VALUE.to_string(),
+                    )])),
+                    ..ObjectMeta::default()
+                }),
                 spec: Some(PodSpec {
                     restart_policy: Some("OnFailure".into()),
                     automount_service_account_token: Some(false),

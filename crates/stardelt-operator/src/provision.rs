@@ -10,7 +10,7 @@ use k8s_openapi::{
         apps::v1::Deployment,
         batch::v1::Job,
         core::v1::{ConfigMap, Secret, Service, ServiceAccount},
-        networking::v1::Ingress,
+        networking::v1::{Ingress, NetworkPolicy},
         rbac::v1::{Role, RoleBinding},
     },
 };
@@ -23,8 +23,10 @@ use kube::{
 use crate::{
     access_sync, airflow,
     controller::Context,
-    crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
-    identity, ingress, keycloak, nova,
+    crd::{
+        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl,
+    },
+    identity, ingress, keycloak, network_policy, nova,
     objects::{
         apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
         owner_reference,
@@ -339,6 +341,36 @@ pub async fn ensure_notebooks_bucket(
         }
         Ok(_) => Some(status(NAME, false, "the bucket Job is running")),
     }
+}
+
+/// The catalog's ingress policy, for a Lakekeeper catalog only. `None` for Polaris.
+pub async fn ensure_lakekeeper_network_policy(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "lakekeeper-network-policy";
+    if !matches!(lh.spec.catalog.implementation, CatalogImpl::Lakekeeper) {
+        return None;
+    }
+    if lh.spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): NetworkPolicy lakekeeper-ingress",
+        ));
+    }
+    if let Err(e) = apply::<NetworkPolicy>(
+        &ctx.client,
+        namespace,
+        &network_policy::lakekeeper_ingress(namespace),
+        false,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    Some(status(NAME, true, "applied: lakekeeper-ingress"))
 }
 
 /// The object-store archive: the destination bucket (a Job, remembered like the notebooks
@@ -3078,6 +3110,41 @@ mod tests {
         .expect("a status");
         assert!(!status.ready);
         assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_catalog_network_policy_exists_only_for_lakekeeper() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_lakekeeper_network_policy(&context(client), &lakehouse(), "data")
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        assert_eq!(
+            applied_paths(&requests).last().map(|s| s.as_str()),
+            Some("/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/lakekeeper-ingress")
+        );
+        let mut lh = lakehouse();
+        lh.spec.catalog.implementation = crate::crd::CatalogImpl::Polaris;
+        let (client, requests) = mock_client(true);
+        let status = ensure_lakekeeper_network_policy(&context(client), &lh, "data").await;
+        assert!(status.is_none());
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_catalog_network_policy_dry_run_writes_nothing() {
+        let mut lh = lakehouse();
+        lh.spec.dry_run = true;
+        let (client, requests) = mock_client(true);
+        let status = ensure_lakekeeper_network_policy(&context(client), &lh, "data")
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): NetworkPolicy lakekeeper-ingress")
+        );
         assert!(requests.lock().expect("requests poisoned").is_empty());
     }
 

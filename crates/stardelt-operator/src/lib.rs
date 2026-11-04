@@ -15,6 +15,7 @@ pub mod identity;
 pub mod identity_checklist;
 pub mod ingress;
 pub mod keycloak;
+pub mod network_policy;
 pub mod nova;
 pub mod objects;
 pub mod pg_dump;
