@@ -33,6 +33,20 @@ resources:
   requests: { cpu: "20m", memory: "64Mi" }
   limits:   { cpu: "500m", memory: "192Mi" }
 
+# Probe budget (stardelt-platform#516): the chart's defaults (timeout 5 s, failureThreshold 12)
+# kill the store after 120 s of a node-wide stall — every pod on the host times out at once, so
+# the probes cannot tell "slow host" from "hung process". A restarted store is worse than a slow
+# one: Lakekeeper is fail-closed, so while openfga is gone every table read answers 503.
+# Readiness stays at the chart's values on purpose: a store that cannot answer should leave the
+# Service, so Lakekeeper fails fast instead of waiting on a socket.
+livenessProbe:
+  enabled: true
+  initialDelaySeconds: 60
+  periodSeconds: 10
+  timeoutSeconds: 10
+  failureThreshold: 30
+  successThreshold: 1
+
 # No tracing, no metrics: nothing scrapes this release yet.
 telemetry:
   trace:

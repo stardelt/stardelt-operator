@@ -217,6 +217,29 @@ mod tests {
             serde_json::json!("openfga/openfga")
         );
         assert_eq!(o["image"]["tag"], serde_json::json!("v1.14.0"));
+        assert_eq!(
+            o["livenessProbe"]["timeoutSeconds"],
+            serde_json::json!(10),
+            "a 5 s probe timeout turns a node stall into a catalog outage"
+        );
+        assert_eq!(
+            o["livenessProbe"]["failureThreshold"],
+            serde_json::json!(30),
+            "five minutes of tolerated unavailability, not the chart's two"
+        );
+    }
+
+    #[test]
+    fn the_openfga_probe_budget_matches_the_platform() {
+        // stardelt-platform/helm-values/openfga.yaml carries the same block (#518). This test
+        // cannot read the other repository; it only states the numbers the two must share.
+        let o = golden_values("openfga");
+        assert_eq!(o["livenessProbe"]["timeoutSeconds"], serde_json::json!(10));
+        assert_eq!(
+            o["livenessProbe"]["failureThreshold"],
+            serde_json::json!(30)
+        );
+        assert_eq!(o["livenessProbe"]["enabled"], serde_json::json!(true));
     }
 
     #[test]
