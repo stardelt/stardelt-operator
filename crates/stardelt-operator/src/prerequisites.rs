@@ -7,7 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use k8s_openapi::{
     api::{
-        batch::v1::{Job, JobSpec},
+        batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec},
         core::v1::{
             Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec,
             SeccompProfile, Secret, SecretKeySelector, SecurityContext,
@@ -448,6 +448,176 @@ pub fn notebooks_bucket_job(
     }
 }
 
+/// Destination of the object-store archive: a copy of the live bucket outside itself
+/// (`design/operator-parity.md`, O8; platform#462). Append-only — the sync never deletes.
+pub const ARCHIVE_BUCKET: &str = "lakehouse-backup";
+/// Creates [`ARCHIVE_BUCKET`] (idempotent; no versioning).
+pub const ARCHIVE_BUCKET_SCRIPT: &str = include_str!("archive_bucket.sh");
+/// The nightly archive CronJob.
+pub const ARCHIVE_JOB: &str = "lakehouse-backup";
+
+/// Name of the archive-bucket Job. It changes when the endpoint changes, because a Job spec is
+/// immutable and a new object store needs the bucket again (same rule as
+/// [`notebooks_bucket_job_name`], line 385).
+pub fn archive_bucket_job_name(endpoint: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    (ARCHIVE_BUCKET, endpoint).hash(&mut hasher);
+    format!("archive-bucket-{:08x}", hasher.finish() as u32)
+}
+
+/// The Job that creates the archive destination bucket.
+pub fn archive_bucket_job(
+    lakehouse: &str,
+    namespace: &str,
+    name: &str,
+    owner: OwnerReference,
+) -> Job {
+    let mut metadata = meta(name, namespace, lakehouse, "archive-bucket");
+    metadata.owner_references = Some(vec![owner]);
+    Job {
+        metadata,
+        spec: Some(JobSpec {
+            ttl_seconds_after_finished: Some(600),
+            backoff_limit: Some(4),
+            template: PodTemplateSpec {
+                spec: Some(PodSpec {
+                    restart_policy: Some("OnFailure".into()),
+                    automount_service_account_token: Some(false),
+                    containers: vec![Container {
+                        name: "bucket".into(),
+                        image: Some("amazon/aws-cli:2.17.0".into()),
+                        command: Some(vec!["sh".into(), "-c".into()]),
+                        args: Some(vec![ARCHIVE_BUCKET_SCRIPT.to_string()]),
+                        env: Some(vec![
+                            EnvVar {
+                                name: "BUCKET".into(),
+                                value: Some(ARCHIVE_BUCKET.into()),
+                                ..Default::default()
+                            },
+                            secret_env("AWS_ACCESS_KEY_ID", "access-key"),
+                            secret_env("AWS_SECRET_ACCESS_KEY", "secret-key"),
+                            secret_env("AWS_ENDPOINT_URL", "endpoint"),
+                            secret_env("AWS_DEFAULT_REGION", "region"),
+                        ]),
+                        security_context: Some(SecurityContext {
+                            allow_privilege_escalation: Some(false),
+                            capabilities: Some(Capabilities {
+                                drop: Some(vec!["ALL".into()]),
+                                add: None,
+                            }),
+                            seccomp_profile: Some(SeccompProfile {
+                                type_: "RuntimeDefault".into(),
+                                localhost_profile: None,
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+pub fn archive_cron_job(namespace: &str, lakehouse: &str) -> CronJob {
+    let metadata = meta(ARCHIVE_JOB, namespace, lakehouse, "lakehouse-backup");
+    let script = "echo \"› source:      s3://${SOURCE_BUCKET}\"\necho \"› destination: s3://${DEST_BUCKET}\"\nexec aws s3 sync \"s3://${SOURCE_BUCKET}\" \"s3://${DEST_BUCKET}\" --endpoint-url \"${AWS_ENDPOINT_URL}\" --no-progress\n";
+    CronJob {
+        metadata: metadata.clone(),
+        spec: CronJobSpec {
+            schedule: "15 3 * * *".into(),
+            concurrency_policy: Some("Forbid".into()),
+            successful_jobs_history_limit: Some(3),
+            failed_jobs_history_limit: Some(3),
+            starting_deadline_seconds: None,
+            suspend: None,
+            time_zone: None,
+            job_template: JobTemplateSpec {
+                metadata: None,
+                spec: Some(JobSpec {
+                    backoff_limit: Some(1),
+                    template: PodTemplateSpec {
+                        metadata: Some(metadata),
+                        spec: Some(PodSpec {
+                            restart_policy: Some("Never".into()),
+                            automount_service_account_token: Some(false),
+                            containers: vec![Container {
+                                name: "s3-sync".into(),
+                                image: Some("amazon/aws-cli:2.17.0".into()),
+                                command: Some(vec!["/bin/sh".into(), "-ec".into()]),
+                                args: Some(vec![script.to_string()]),
+                                env: Some(vec![
+                                    secret_env("AWS_ENDPOINT_URL", "endpoint"),
+                                    secret_env("AWS_ACCESS_KEY_ID", "access-key"),
+                                    secret_env("AWS_SECRET_ACCESS_KEY", "secret-key"),
+                                    secret_env("AWS_DEFAULT_REGION", "region"),
+                                    secret_env("SOURCE_BUCKET", "bucket"),
+                                    EnvVar {
+                                        name: "DEST_BUCKET".into(),
+                                        value: Some(ARCHIVE_BUCKET.into()),
+                                        ..Default::default()
+                                    },
+                                ]),
+                                resources: Some(k8s_openapi::api::core::v1::ResourceRequirements {
+                                    requests: Some(
+                                        [
+                                            (
+                                                "cpu".into(),
+                                                k8s_openapi::apimachinery::pkg::api::resource::Quantity("50m".into()),
+                                            ),
+                                            (
+                                                "memory".into(),
+                                                k8s_openapi::apimachinery::pkg::api::resource::Quantity("128Mi".into()),
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        .collect(),
+                                    ),
+                                    limits: Some(
+                                        [
+                                            (
+                                                "cpu".into(),
+                                                k8s_openapi::apimachinery::pkg::api::resource::Quantity("1".into()),
+                                            ),
+                                            (
+                                                "memory".into(),
+                                                k8s_openapi::apimachinery::pkg::api::resource::Quantity("512Mi".into()),
+                                            ),
+                                        ]
+                                        .into_iter()
+                                        .collect(),
+                                    ),
+                                    ..Default::default()
+                                }),
+                                security_context: Some(SecurityContext {
+                                    allow_privilege_escalation: Some(false),
+                                    capabilities: Some(Capabilities {
+                                        drop: Some(vec!["ALL".into()]),
+                                        add: None,
+                                    }),
+                                    seccomp_profile: Some(SeccompProfile {
+                                        type_: "RuntimeDefault".into(),
+                                        localhost_profile: None,
+                                    }),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }),
+                    },
+                    ..Default::default()
+                }),
+            },
+        },
+        status: None,
+    }
+}
+
 /// The Job that bootstraps Lakekeeper and creates or refreshes the `warehouse`.
 pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerReference) -> Job {
     let mut metadata = meta(name, namespace, lakehouse, "lakekeeper-bootstrap");
@@ -852,6 +1022,113 @@ mod tests {
             notebooks_bucket_job_name("http://seaweedfs-s3.other.svc.cluster.local:8333")
         );
         assert!(a.starts_with("notebooks-bucket-"));
+    }
+
+    #[test]
+    fn the_archive_bucket_job_creates_the_destination_bucket_without_versioning() {
+        let owner = OwnerReference {
+            name: "main".into(),
+            ..Default::default()
+        };
+        let job = archive_bucket_job("main", "data", "archive-bucket-1", owner);
+        let pod = job.spec.expect("spec").template.spec.expect("pod");
+        assert_eq!(pod.restart_policy.as_deref(), Some("OnFailure"));
+        let c = &pod.containers[0];
+        assert_eq!(c.image.as_deref(), Some("amazon/aws-cli:2.17.0"));
+        let env: Vec<(&str, Option<&str>)> = c
+            .env
+            .as_ref()
+            .expect("env")
+            .iter()
+            .map(|e| {
+                (
+                    e.name.as_str(),
+                    e.value_from
+                        .as_ref()
+                        .and_then(|v| v.secret_key_ref.as_ref())
+                        .map(|s| s.key.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("BUCKET", None),
+                ("AWS_ACCESS_KEY_ID", Some("access-key")),
+                ("AWS_SECRET_ACCESS_KEY", Some("secret-key")),
+                ("AWS_ENDPOINT_URL", Some("endpoint")),
+                ("AWS_DEFAULT_REGION", Some("region")),
+            ]
+        );
+        assert_eq!(
+            c.env.as_ref().expect("env")[0].value.as_deref(),
+            Some("lakehouse-backup")
+        );
+        let script = &c.args.as_ref().expect("args")[0];
+        assert!(script.contains("create-bucket"));
+        assert!(!script.contains("put-bucket-versioning"));
+    }
+
+    #[test]
+    fn the_archive_cron_job_copies_the_live_bucket_into_the_archive_every_night() {
+        let cj = archive_cron_job("data", "main");
+        assert_eq!(cj.metadata.name.as_deref(), Some("lakehouse-backup"));
+        assert_eq!(cj.spec.schedule, "15 3 * * *");
+        let job_spec = cj.spec.job_template.spec.as_ref().unwrap();
+        assert_eq!(job_spec.backoff_limit, Some(1));
+        let pod_spec = job_spec.template.spec.as_ref().unwrap();
+        assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(pod_spec.automount_service_account_token, Some(false));
+        let c = &pod_spec.containers[0];
+        assert_eq!(c.name, "s3-sync");
+        assert_eq!(c.image.as_deref(), Some("amazon/aws-cli:2.17.0"));
+        let env: Vec<(&str, Option<&str>)> = c
+            .env
+            .as_ref()
+            .expect("env")
+            .iter()
+            .map(|e| {
+                (
+                    e.name.as_str(),
+                    e.value_from
+                        .as_ref()
+                        .and_then(|v| v.secret_key_ref.as_ref())
+                        .map(|s| s.key.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("AWS_ENDPOINT_URL", Some("endpoint")),
+                ("AWS_ACCESS_KEY_ID", Some("access-key")),
+                ("AWS_SECRET_ACCESS_KEY", Some("secret-key")),
+                ("AWS_DEFAULT_REGION", Some("region")),
+                ("SOURCE_BUCKET", Some("bucket")),
+                ("DEST_BUCKET", None),
+            ]
+        );
+        assert_eq!(
+            c.env.as_ref().expect("env")[5].value.as_deref(),
+            Some("lakehouse-backup")
+        );
+        let script = &c.args.as_ref().expect("args")[0];
+        assert!(script.contains("aws s3 sync"));
+        assert!(!script.contains("--delete"));
+    }
+
+    #[test]
+    fn the_archive_bucket_job_name_follows_the_endpoint() {
+        let a = archive_bucket_job_name("http://seaweedfs-s3.data.svc.cluster.local:8333");
+        assert_eq!(
+            a,
+            archive_bucket_job_name("http://seaweedfs-s3.data.svc.cluster.local:8333")
+        );
+        assert_ne!(
+            a,
+            archive_bucket_job_name("http://seaweedfs-s3.other.svc.cluster.local:8333")
+        );
+        assert!(a.starts_with("archive-bucket-"));
     }
 
     #[test]
