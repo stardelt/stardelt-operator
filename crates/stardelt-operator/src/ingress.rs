@@ -5,7 +5,7 @@
 //! Every field mirrors `stardelt-platform` `chart/templates/ingress.yaml`: Nova answers on
 //! `spec.baseDomain` itself and every other application on a subdomain (the chart's
 //! `stardelt.appHost`); the class, the cert-manager issuer annotation and the TLS block come
-//! from `spec.ingress`. The five applications built today (Nova, identity provider, Airflow, JupyterHub, Superset); Trino and Lakekeeper stay unpublished until they authenticate (see "do not").
+//! from `spec.ingress`. The six applications built today (Nova, identity provider, Airflow, JupyterHub, Superset, Trino); Lakekeeper stays unpublished until it authenticates.
 
 use std::collections::BTreeMap;
 
@@ -124,6 +124,31 @@ pub fn superset(spec: &PlatformInstanceSpec) -> Option<Ingress> {
         8088,
         "superset",
         &["/"],
+        false,
+    )
+}
+
+/// The Ingress of Trino, on `trino.<base domain>`: the one path outside clients (Superset,
+/// BI tools, `curl`) take to the query engine. Published **only with an IdP**
+/// (`identity.mode != none`): without the overlay (`values/trino-identity.yaml`) Trino has no
+/// authenticator, and this host would be anonymous SQL on the internet.
+///
+/// Backend port 8080 and plain HTTP to the Service are correct: the coordinator's
+/// `http-server.process-forwarded=true` (the identity overlay) reads ingress-nginx's
+/// `X-Forwarded-Proto`, while `allow-insecure-over-http=false` still refuses a direct plain
+/// request. The two paths are the platform's `chart/templates/ingress.yaml` list: statements
+/// and result polling under `/v1/statement`, the browser sign-in under `/oauth2`.
+pub fn trino(spec: &PlatformInstanceSpec) -> Option<Ingress> {
+    if spec.identity.mode == IdentityMode::None {
+        return None;
+    }
+    build(
+        spec,
+        "trino",
+        "trino",
+        8080,
+        "trino",
+        &["/v1/statement", "/oauth2"],
         false,
     )
 }
@@ -429,5 +454,48 @@ mod tests {
     #[test]
     fn airflow_needs_the_pipelines_pillar() {
         assert!(airflow(&spec(serde_json::json!({}))).is_none());
+    }
+
+    #[test]
+    fn trino_is_published_only_with_sign_in() {
+        let anonymous = spec(serde_json::json!({}));
+        assert!(trino(&anonymous).is_none());
+
+        let signed_in = spec(serde_json::json!({
+            "identity": {"mode": "platform"},
+            "ingress": { "enabled": true, "tls": { "enabled": true, "issuer": "letsencrypt" } }
+        }));
+        let ingress = trino(&signed_in).expect("an Ingress");
+        assert_eq!(ingress.metadata.name.as_deref(), Some("trino"));
+        let rule = &ingress.spec.as_ref().unwrap().rules.as_ref().unwrap()[0];
+        assert_eq!(rule.host.as_deref(), Some("trino.data.example.com"));
+        let paths: Vec<_> = rule
+            .http
+            .as_ref()
+            .unwrap()
+            .paths
+            .iter()
+            .map(|p| (p.path.clone().unwrap(), p.path_type.clone()))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("/v1/statement".to_string(), "Prefix".to_string()),
+                ("/oauth2".to_string(), "Prefix".to_string()),
+            ]
+        );
+        let backend = rule.http.as_ref().unwrap().paths[0]
+            .backend
+            .service
+            .as_ref()
+            .unwrap();
+        assert_eq!(backend.name, "trino");
+        assert_eq!(backend.port.as_ref().unwrap().number, Some(8080));
+        let tls = ingress.spec.as_ref().unwrap().tls.as_ref().unwrap();
+        assert_eq!(tls.len(), 1);
+        assert_eq!(
+            tls[0].secret_name.as_deref(),
+            Some("trino-data-example-com-tls")
+        );
     }
 }
