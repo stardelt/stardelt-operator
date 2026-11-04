@@ -1,0 +1,24 @@
+# Superset's Trino datasources on the public host — the identity overlay.
+#
+# Layered over values/superset.yaml only when the platform has an IdP, because only then does
+# Trino authenticate (values/trino-identity.yaml) and `ingress.rs::trino` publish the host.
+# TLS ends at ingress-nginx, so the pod needs no internal CA; the password still comes from
+# Secret trino-password-db at connect time (SQLALCHEMY_CUSTOM_PASSWORD_STORE), never the URI.
+#
+# `__BASE_DOMAIN__` is replaced by `values::substitute_base_domain` from spec.baseDomain; a
+# literal cannot live in a checked-in file.
+extraConfigs:
+  import_datasources.yaml: |
+    databases:
+    - database_name: Trino Warehouse
+      sqlalchemy_uri: trino://superset@trino.__BASE_DOMAIN__:443/warehouse
+      allow_multi_catalog: true
+      impersonate_user: true
+    - database_name: Trino Shared
+      sqlalchemy_uri: trino://superset@trino.__BASE_DOMAIN__:443/shared
+      allow_multi_catalog: true
+      impersonate_user: true
+      extra: >-
+        {"allow_multi_catalog": true, "metadata_params": {}, "engine_params": {},
+         "metadata_cache_timeout": {}, "schemas_allowed_for_csv_upload": []}
+      tables: []

@@ -81,7 +81,26 @@ pub fn identity_values(component: &str) -> Value {
     match component {
         "trino" => serde_yaml::from_str(include_str!("../values/trino-identity.yaml"))
             .expect("values/trino-identity.yaml is not valid YAML"),
+        // Superset's datasources move to the public Trino host, which exists only with an IdP.
+        "superset" => serde_yaml::from_str(include_str!("../values/superset-identity.yaml"))
+            .expect("values/superset-identity.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
+    }
+}
+
+/// Replace every `__BASE_DOMAIN__` in the strings of a values document. The identity overlays
+/// are checked-in files and cannot read `spec.baseDomain`; `identity_checklist.rs` uses the
+/// same placeholder for its commands.
+pub fn substitute_base_domain(values: &mut Value, domain: &str) {
+    match values {
+        Value::String(text) => *text = text.replace("__BASE_DOMAIN__", domain),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| substitute_base_domain(item, domain)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| substitute_base_domain(item, domain)),
+        _ => {}
     }
 }
 
@@ -835,6 +854,11 @@ mod tests {
         assert!(import.contains("trino://superset@trino:8080/"));
         assert!(import.contains("warehouse"));
         assert!(import.contains("shared"));
+        assert!(
+            !serde_json::to_string(&golden_values("superset"))
+                .unwrap()
+                .contains("__BASE_DOMAIN__")
+        );
     }
 
     #[test]
@@ -1007,7 +1031,7 @@ mod tests {
 
     #[test]
     fn only_trino_has_identity_values() {
-        for component in ["lakekeeper", "superset", "airflow", "cnpg"] {
+        for component in ["lakekeeper", "airflow", "cnpg"] {
             assert_eq!(
                 identity_values(component),
                 serde_json::json!({}),
@@ -1025,5 +1049,26 @@ mod tests {
         assert!(!text.contains("authenticationType"));
         assert!(!text.contains("passwordAuthSecret"));
         assert!(!text.contains("allow-insecure-over-http=false"));
+    }
+
+    #[test]
+    fn superset_identity_values_name_the_public_trino_host() {
+        let values = identity_values("superset");
+        let import = values["extraConfigs"]["import_datasources.yaml"]
+            .as_str()
+            .expect("import_datasources.yaml");
+        assert!(import.contains("trino://superset@trino.__BASE_DOMAIN__:443/warehouse"));
+        assert!(import.contains("trino://superset@trino.__BASE_DOMAIN__:443/shared"));
+        assert!(import.contains("impersonate_user: true"));
+    }
+
+    #[test]
+    fn base_domain_is_substituted_in_strings_only() {
+        let mut values =
+            serde_json::json!({"a": "x.__BASE_DOMAIN__", "b": ["y.__BASE_DOMAIN__"], "n": 1});
+        substitute_base_domain(&mut values, "example.com");
+        assert_eq!(values["a"], serde_json::json!("x.example.com"));
+        assert_eq!(values["b"][0], serde_json::json!("y.example.com"));
+        assert_eq!(values["n"], serde_json::json!(1));
     }
 }
