@@ -12,6 +12,11 @@ image:
 imagePullSecrets:
   - name: ghcr-creds
 
+# The pods and the chart's init Job run as the operator-created ServiceAccount (src/superset.rs
+# `SERVICE_ACCOUNT`), which may also list Catalogs for the group-roles CronJob. The chart
+# 0.15.5 does not create a ServiceAccount of its own.
+serviceAccountName: superset
+
 bootstrapScript: |
   #!/bin/bash
   if [ ! -f ~/bootstrap ]; then echo "Running Superset" > ~/bootstrap; fi

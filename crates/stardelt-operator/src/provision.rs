@@ -726,6 +726,103 @@ pub async fn ensure_superset_secrets(
     Some(ensure_generated_secrets(ctx, spec, "superset-secrets", &superset::SECRETS).await)
 }
 
+/// The `superset` ServiceAccount, the Catalogs read Role and its binding. **Must be applied
+/// before the Superset release**: the chart's pods and init Job run as this ServiceAccount,
+/// and a Pod naming a ServiceAccount that does not exist stays Pending. `None` without the
+/// `dashboards` pillar.
+pub async fn ensure_superset_rbac(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "superset-rbac";
+    if !spec.pillars.dashboards {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    if let Err(e) = apply::<ServiceAccount>(
+        &ctx.client,
+        namespace,
+        &superset::service_account(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Role>(
+        &ctx.client,
+        namespace,
+        &superset::catalog_reader_role(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        &ctx.client,
+        namespace,
+        &superset::catalog_reader_binding(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): ServiceAccount, Role and RoleBinding superset-group-roles",
+        ));
+    }
+    Some(status(NAME, true, "applied: superset-rbac"))
+}
+
+/// The ConfigMap with the group-roles script and the CronJob that converges
+/// `stardelt-group-<group>` FAB roles from the Catalogs' grants (platform#494). Applied after
+/// the release, because the Job reads the chart's `superset-env`/`superset-config` Secrets.
+/// `None` without the `dashboards` pillar.
+pub async fn ensure_superset_group_roles(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "superset-group-roles";
+    if !spec.pillars.dashboards {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let image = superset::image();
+    if let Err(e) = apply::<ConfigMap>(
+        &ctx.client,
+        namespace,
+        &superset::group_roles_config_map(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<CronJob>(
+        &ctx.client,
+        namespace,
+        &superset::group_roles_cron_job(namespace, &image),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): ConfigMap and CronJob superset-group-roles",
+        ));
+    }
+    Some(status(NAME, true, "applied: superset-group-roles"))
+}
+
 /// The Role that lets Airflow read the `Pipeline` and `ServicePrincipal` resources, and its
 /// binding to the DAG processor and the worker. `None` without the `pipelines` pillar. The
 /// ServiceAccounts come with the Airflow release; a binding may name one that does not exist yet.
@@ -2331,6 +2428,74 @@ mod tests {
         assert!(status.ready, "{status:?}");
         assert_eq!(status.message.as_deref(), Some("ready: created 3 / kept 0"));
         assert_eq!(patch_count(&requests), 3);
+    }
+
+    #[tokio::test]
+    async fn superset_rbac_and_group_roles_exist_only_with_the_dashboards_pillar() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform_with_dashboards(false, false);
+        assert!(ensure_superset_rbac(&ctx, &spec).await.is_none());
+        assert!(ensure_superset_group_roles(&ctx, &spec).await.is_none());
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn superset_rbac_applies_the_service_account_role_and_binding() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_superset_rbac(&context(client), &platform_with_dashboards(true, false))
+            .await
+            .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.name, "superset-rbac");
+        assert_eq!(status.message.as_deref(), Some("applied: superset-rbac"));
+        let core = "/api/v1/namespaces/stardelt";
+        let rbac = "/apis/rbac.authorization.k8s.io/v1/namespaces/stardelt";
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                format!("{core}/serviceaccounts/superset"),
+                format!("{rbac}/roles/superset-group-roles"),
+                format!("{rbac}/rolebindings/superset-group-roles"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn superset_group_roles_applies_the_config_map_and_cron_job() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status =
+            ensure_superset_group_roles(&context(client), &platform_with_dashboards(true, false))
+                .await
+                .expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("applied: superset-group-roles")
+        );
+        let core = "/api/v1/namespaces/stardelt";
+        let batch = "/apis/batch/v1/namespaces/stardelt";
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                format!("{core}/configmaps/superset-group-roles"),
+                format!("{batch}/cronjobs/superset-group-roles"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn superset_group_roles_dry_run_says_planned_and_is_not_ready() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let status =
+            ensure_superset_group_roles(&context(client), &platform_with_dashboards(true, true))
+                .await
+                .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("planned (dry-run): ConfigMap and CronJob superset-group-roles")
+        );
     }
 
     #[tokio::test]

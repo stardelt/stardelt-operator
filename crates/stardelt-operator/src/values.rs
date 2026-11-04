@@ -713,7 +713,6 @@ mod tests {
         assert!(!text.contains("AUTH_USER_REGISTRATION"));
         assert!(!text.contains("_AuthRolesMapping"));
         assert!(!text.contains("stardelt-identity"));
-        assert!(!text.contains("serviceAccountName"));
         assert!(!text.contains("superset-analyst-role.py"));
         assert!(!text.contains("superset-group-roles.py"));
         let init_script = values["init"]["initscript"].as_str().unwrap();
