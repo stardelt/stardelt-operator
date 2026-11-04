@@ -1120,4 +1120,44 @@ mod tests {
         assert_eq!(values["b"][0], serde_json::json!("y.example.com"));
         assert_eq!(values["n"], serde_json::json!(1));
     }
+
+    #[test]
+    fn the_notebook_reaches_trino_as_the_person() {
+        let values = effective_values("jupyterhub", Profile::Full, None, None);
+        let snippet = values["hub"]["extraConfig"]["10-oidc"]
+            .as_str()
+            .expect("10-oidc");
+        assert!(snippet.contains("c.Authenticator.enable_auth_state = True"));
+        assert!(snippet.contains("spawner.environment[\"TRINO_TOKEN\"]"));
+        assert!(snippet.contains("REQUESTS_CA_BUNDLE"));
+        assert_eq!(
+            values["hub"]["extraEnv"]["STARDELT_TRINO_URL"]["valueFrom"]["configMapKeyRef"],
+            serde_json::json!({ "name": "stardelt-identity", "key": "trinoUrl", "optional": true })
+        );
+        let single = &values["singleuser"];
+        assert_eq!(
+            single["image"]["name"],
+            "ghcr.io/stardelt/jupyter-singleuser"
+        );
+        assert!(
+            single["image"]["tag"]
+                .as_str()
+                .unwrap()
+                .contains("@sha256:")
+        );
+        let volume = &single["storage"]["extraVolumes"][0];
+        assert_eq!(volume["secret"]["secretName"], "trino-ca");
+        assert_eq!(
+            volume["secret"]["items"][0],
+            serde_json::json!({"key": "tls.crt", "path": "ca.crt"})
+        );
+        assert_eq!(
+            single["storage"]["extraVolumeMounts"][0]["mountPath"],
+            "/etc/stardelt/trino-ca"
+        );
+        assert_eq!(
+            single["networkPolicy"]["egress"][0]["ports"][0],
+            serde_json::json!({"port": 8443, "protocol": "TCP"})
+        );
+    }
 }
