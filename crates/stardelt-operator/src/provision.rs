@@ -2670,7 +2670,7 @@ mod tests {
 
     #[tokio::test]
     async fn pg_dumps_follow_the_two_pillars() {
-        let (client, requests) = keycloak_client(&[], None);
+        let (client, _requests) = keycloak_client(&[], None);
         let ctx = context(client);
         assert!(
             ensure_pg_dumps(&ctx, &platform_with_dashboards(false, false))
@@ -2685,6 +2685,10 @@ mod tests {
             .expect("a status");
         assert_eq!(status.message.as_deref(), Some("applied: superset-pg-dump"));
         assert!(status.ready, "{status:?}");
+        assert_eq!(
+            applied_paths(&requests),
+            vec!["/apis/batch/v1/namespaces/stardelt/cronjobs/superset-pg-dump".to_string()]
+        );
         let (client, requests) = keycloak_client(&[], None);
         let mut spec = platform_with_apps(true, false, false);
         spec.pillars.dashboards = true;
@@ -2696,6 +2700,13 @@ mod tests {
             Some("applied: superset-pg-dump, airflow-pg-dump")
         );
         assert!(status.ready, "{status:?}");
+        assert_eq!(
+            applied_paths(&requests),
+            vec![
+                "/apis/batch/v1/namespaces/stardelt/cronjobs/superset-pg-dump".to_string(),
+                "/apis/batch/v1/namespaces/stardelt/cronjobs/airflow-pg-dump".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

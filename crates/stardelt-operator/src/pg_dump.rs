@@ -49,6 +49,22 @@ fn meta(name: &str, namespace: &str) -> ObjectMeta {
     }
 }
 
+/// One environment variable read from Secret `stardelt-s3-creds`, never a literal.
+fn s3_env(name: &str, key: &str) -> EnvVar {
+    EnvVar {
+        name: name.to_string(),
+        value_from: Some(EnvVarSource {
+            secret_key_ref: Some(SecretKeySelector {
+                name: "stardelt-s3-creds".to_string(),
+                key: key.to_string(),
+                optional: Some(false),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn dump_container(app: &str, image: &str, host: &str, database: &str, user: &str) -> Container {
     let script = "/bin/bash -ec '\n\
 export PGPASSWORD=\"$(cat \"$PGPASSWORD_FILE\")\"\n\
@@ -57,37 +73,38 @@ SIZE=$(stat -c%s /dump/${APP}.dump || echo 0)\n\
 if [ \"$SIZE\" -eq 0 ]; then echo \"empty dump\" >&2; exit 1; fi\n\
 ' _";
 
-    let mut env = Vec::new();
-    env.push(EnvVar {
-        name: "APP".to_string(),
-        value: Some(app.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "PGHOST".to_string(),
-        value: Some(host.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "PGPORT".to_string(),
-        value: Some("5432".to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "PGDATABASE".to_string(),
-        value: Some(database.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "PGUSER".to_string(),
-        value: Some(user.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "PGPASSWORD_FILE".to_string(),
-        value: Some("/run/pg-secret/password".to_string()),
-        ..Default::default()
-    });
+    let env = vec![
+        EnvVar {
+            name: "APP".to_string(),
+            value: Some(app.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "PGHOST".to_string(),
+            value: Some(host.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "PGPORT".to_string(),
+            value: Some("5432".to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "PGDATABASE".to_string(),
+            value: Some(database.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "PGUSER".to_string(),
+            value: Some(user.to_string()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "PGPASSWORD_FILE".to_string(),
+            value: Some("/run/pg-secret/password".to_string()),
+            ..Default::default()
+        },
+    ];
 
     Container {
         name: "pg-dump".to_string(),
@@ -150,70 +167,27 @@ CUTOFF=$(date -u -d \"${RETENTION_DAYS} days ago\" +%Y-%m-%d 2>/dev/null || date
 aws s3api list-objects-v2 --bucket \"${BACKUP_BUCKET}\" --prefix pgdump/${APP}/ --query \"Contents[?LastModified<='\"$CUTOFF\"T23:59:59Z'].Key\" --output text | grep -v '^None$' | xargs -r -n1 -I{} aws s3 rm s3://${BACKUP_BUCKET}/{}\n\
 '";
 
-    let mut env = Vec::new();
-    env.push(EnvVar {
-        name: "APP".to_string(),
-        value: Some(app.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "BACKUP_BUCKET".to_string(),
-        value: Some(BACKUP_BUCKET.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "RETENTION_DAYS".to_string(),
-        value: Some(RETENTION_DAYS.to_string()),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "AWS_ENDPOINT_URL".to_string(),
-        value_from: Some(EnvVarSource {
-            secret_key_ref: Some(SecretKeySelector {
-                name: "stardelt-s3-creds".to_string(),
-                key: "endpoint".to_string(),
-                optional: Some(false),
-            }),
+    let env = vec![
+        EnvVar {
+            name: "APP".to_string(),
+            value: Some(app.to_string()),
             ..Default::default()
-        }),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "AWS_ACCESS_KEY_ID".to_string(),
-        value_from: Some(EnvVarSource {
-            secret_key_ref: Some(SecretKeySelector {
-                name: "stardelt-s3-creds".to_string(),
-                key: "access-key".to_string(),
-                optional: Some(false),
-            }),
+        },
+        EnvVar {
+            name: "BACKUP_BUCKET".to_string(),
+            value: Some(BACKUP_BUCKET.to_string()),
             ..Default::default()
-        }),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "AWS_SECRET_ACCESS_KEY".to_string(),
-        value_from: Some(EnvVarSource {
-            secret_key_ref: Some(SecretKeySelector {
-                name: "stardelt-s3-creds".to_string(),
-                key: "secret-key".to_string(),
-                optional: Some(false),
-            }),
+        },
+        EnvVar {
+            name: "RETENTION_DAYS".to_string(),
+            value: Some(RETENTION_DAYS.to_string()),
             ..Default::default()
-        }),
-        ..Default::default()
-    });
-    env.push(EnvVar {
-        name: "AWS_DEFAULT_REGION".to_string(),
-        value_from: Some(EnvVarSource {
-            secret_key_ref: Some(SecretKeySelector {
-                name: "stardelt-s3-creds".to_string(),
-                key: "region".to_string(),
-                optional: Some(false),
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    });
+        },
+        s3_env("AWS_ENDPOINT_URL", "endpoint"),
+        s3_env("AWS_ACCESS_KEY_ID", "access-key"),
+        s3_env("AWS_SECRET_ACCESS_KEY", "secret-key"),
+        s3_env("AWS_DEFAULT_REGION", "region"),
+    ];
 
     Container {
         name: "upload".to_string(),
