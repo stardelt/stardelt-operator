@@ -128,11 +128,9 @@ mod tests {
 
     #[test]
     fn credential_secret_name_finds_refs() {
-        let v1 =
-            serde_json::json!({"vault": {"auth": {"tokenSecretRef": {"name": "vault-token", "key": "token"}}}});
+        let v1 = serde_json::json!({"vault": {"auth": {"tokenSecretRef": {"name": "vault-token", "key": "token"}}}});
         assert_eq!(credential_secret_name(&v1).unwrap(), "vault-token");
-        let v2 =
-            serde_json::json!({"aws": {"auth": {"secretRef": {"name": "aws-creds", "key": "access-key"}}}});
+        let v2 = serde_json::json!({"aws": {"auth": {"secretRef": {"name": "aws-creds", "key": "access-key"}}}});
         assert_eq!(credential_secret_name(&v2).unwrap(), "aws-creds");
         let v3 = serde_json::json!({"azurekv": {"auth": {"authSecretRef": {"name": "az-creds", "key": "client-secret"}}}});
         assert_eq!(credential_secret_name(&v3).unwrap(), "az-creds");
