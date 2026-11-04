@@ -41,9 +41,9 @@ use crate::provision::{
     ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
     ensure_lakekeeper_network_policy, ensure_notebooks_bucket, ensure_nova, ensure_nova_events,
-    ensure_nova_pg, ensure_nova_session, ensure_openfga_database, ensure_pg_dumps,
-    ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
-    ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
+    ensure_nova_pg, ensure_nova_session, ensure_openfga_database, ensure_openfga_network_policy,
+    ensure_pg_dumps, ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac,
+    ensure_superset_secrets, ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
 use crate::values::{deep_merge, effective_values, identity_values, parse_values_document};
 
@@ -974,6 +974,9 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     } else {
         None
     };
+    // The permission store's policy: it has no authentication of its own, and the catalog is
+    // its only caller.
+    let openfga_policy = ensure_openfga_network_policy(&ctx, &lh, &namespace).await;
     // The discovery ConfigMap is published last: it advertises a working catalog.
     let discovery = ensure_discovery(
         &ctx,
@@ -988,6 +991,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     components.extend(notebooks_bucket);
     components.extend(archive);
     components.extend(network_policy);
+    components.extend(openfga_policy);
     components.push(bootstrap);
     components.push(discovery);
     outcome.components = components;
