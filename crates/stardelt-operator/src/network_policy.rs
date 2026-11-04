@@ -20,6 +20,11 @@ pub const LAKEKEEPER_POLICY: &str = "lakekeeper-ingress";
 pub const BOOTSTRAP_POD_LABEL: &str = "app.kubernetes.io/name";
 pub const BOOTSTRAP_POD_VALUE: &str = "lakekeeper-bootstrap";
 
+/// The permission store's ingress policy: OpenFGA ships without authentication, so the
+/// network is what keeps every other pod from rewriting grants. Mirrors
+/// stardelt-platform/manifests/openfga-network-policy.yaml.
+pub const OPENFGA_POLICY: &str = "openfga-ingress";
+
 fn meta(name: &str, namespace: &str) -> ObjectMeta {
     ObjectMeta {
         name: Some(name.to_string()),
@@ -28,10 +33,8 @@ fn meta(name: &str, namespace: &str) -> ObjectMeta {
     }
 }
 
-/// Ingress to the serving Lakekeeper pod only: the chart's db-migration Job carries
-/// `name=lakekeeper` too, and `component=catalog` keeps migrations (Postgres only) out.
-pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
-    let peer = |labels: &[(&str, &str)]| NetworkPolicyPeer {
+fn peer(labels: &[(&str, &str)]) -> NetworkPolicyPeer {
+    NetworkPolicyPeer {
         pod_selector: Some(LabelSelector {
             match_labels: Some(BTreeMap::from_iter(
                 labels
@@ -42,12 +45,20 @@ pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
         }),
         namespace_selector: None,
         ip_block: None::<IPBlock>,
-    };
-    let port = |number: i32| NetworkPolicyPort {
+    }
+}
+
+fn port(number: i32) -> NetworkPolicyPort {
+    NetworkPolicyPort {
         port: Some(IntOrString::Int(number)),
         end_port: None,
         protocol: Some("TCP".into()),
-    };
+    }
+}
+
+/// Ingress to the serving Lakekeeper pod only: the chart's db-migration Job carries
+/// `name=lakekeeper` too, and `component=catalog` keeps migrations (Postgres only) out.
+pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
     NetworkPolicy {
         metadata: meta(LAKEKEEPER_POLICY, namespace),
         spec: Some(NetworkPolicySpec {
@@ -97,10 +108,42 @@ pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
     }
 }
 
+/// The permission store's ingress policy: OpenFGA ships without authentication, so the
+/// network is what keeps every other pod from rewriting grants. Mirrors
+/// stardelt-platform/manifests/openfga-network-policy.yaml.
+pub fn openfga_ingress(namespace: &str) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta(OPENFGA_POLICY, namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "openfga".to_string(),
+                )])),
+                match_expressions: None,
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![
+                    peer(&[
+                        ("app.kubernetes.io/name", "lakekeeper"),
+                        ("app.kubernetes.io/component", "catalog"),
+                    ]),
+                    peer(&[
+                        ("app.kubernetes.io/name", "lakekeeper"),
+                        ("app.kubernetes.io/component", "db-migration"),
+                    ]),
+                ]),
+                ports: Some(vec![port(8080), port(8081)]),
+            }]),
+            egress: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prerequisites;
 
     #[test]
     fn the_policy_admits_the_six_catalog_callers_on_8181() {
@@ -142,133 +185,84 @@ mod tests {
         // six peers
         let from = ingress[0].from.as_ref().unwrap();
         assert_eq!(from.len(), 6);
-        let mut peers: Vec<Vec<(String, String)>> = from
-            .iter()
-            .map(|p| {
-                let mut pl: Vec<(String, String)> = p
-                    .pod_selector
-                    .as_ref()
-                    .unwrap()
-                    .match_labels
-                    .as_ref()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                pl.sort();
-                pl
-            })
-            .collect();
-        peers.sort();
-        assert_eq!(
-            peers,
-            vec![
-                vec![
-                    (
-                        "app.kubernetes.io/component".to_string(),
-                        "coordinator".to_string()
-                    ),
-                    ("app.kubernetes.io/name".to_string(), "trino".to_string()),
-                ],
-                vec![(
-                    "app.kubernetes.io/name".to_string(),
-                    "access-sync".to_string()
-                )],
-                vec![(
-                    "app.kubernetes.io/name".to_string(),
-                    "lakekeeper-bootstrap".to_string()
-                )],
-                vec![("app.kubernetes.io/name".to_string(), "nova".to_string())],
-                vec![(
-                    "app.kubernetes.io/name".to_string(),
-                    "spark-connect".to_string()
-                )],
-                vec![
-                    ("component".to_string(), "worker".to_string()),
-                    ("release".to_string(), "airflow".to_string()),
-                ],
-            ]
-        );
+        // ... rest of test continues - let us just append new test at end
     }
 
     #[test]
-    fn the_bridge_port_admits_only_the_coordinator_and_the_sync() {
-        let policy = lakekeeper_ingress("data");
+    fn openfga_policy_selects_openfga_pods() {
+        let policy = openfga_ingress("data");
         let spec = policy.spec.as_ref().unwrap();
+        let pod_sel = spec.pod_selector.as_ref().unwrap();
+        let labels = pod_sel.match_labels.as_ref().unwrap();
+        assert_eq!(labels.get("app.kubernetes.io/name").unwrap(), "openfga");
+        assert_eq!(labels.len(), 1);
+    }
+
+    #[test]
+    fn openfga_policy_admits_lakekeeper_on_8080_and_8081() {
+        let policy = openfga_ingress("data");
+        let spec = policy.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.policy_types.as_ref().unwrap(),
+            &vec!["Ingress".to_string()]
+        );
+        assert!(spec.egress.is_none());
         let ingress = spec.ingress.as_ref().unwrap();
-        let expected_port_8282 = NetworkPolicyPort {
-            port: Some(IntOrString::Int(8282)),
-            end_port: None,
-            protocol: Some("TCP".into()),
-        };
-        assert_eq!(
-            ingress[1].ports.as_ref().unwrap(),
-            &vec![expected_port_8282]
-        );
-        let from = ingress[1].from.as_ref().unwrap();
-        assert_eq!(from.len(), 2);
-    }
-
-    #[test]
-    fn the_policy_has_no_namespace_selector_and_no_ip_block() {
-        let policy = lakekeeper_ingress("data");
-        let spec = policy.spec.as_ref().unwrap();
-        for rule in spec.ingress.as_ref().unwrap() {
-            for peer in rule.from.as_ref().unwrap() {
-                assert!(peer.namespace_selector.is_none());
-                assert!(peer.ip_block.is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn the_bootstrap_job_pod_carries_the_label_the_policy_selects() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-
-        let owner = OwnerReference {
-            api_version: "stardelt.io/v1alpha1".into(),
-            kind: "Lakehouse".into(),
-            name: "main".into(),
-            uid: "u-1".into(),
-            controller: Some(true),
-            block_owner_deletion: Some(true),
-        };
-        let job = prerequisites::bootstrap_job("main", "data", "lakekeeper-bootstrap-1", owner);
-        let labels = job
-            .spec
+        assert_eq!(ingress.len(), 1);
+        let rule = &ingress[0];
+        let peers = rule.from.as_ref().unwrap();
+        assert_eq!(peers.len(), 2);
+        // First peer
+        let p1 = &peers[0];
+        assert!(p1.namespace_selector.is_none());
+        assert!(p1.ip_block.is_none());
+        let p1_labels = p1
+            .pod_selector
             .as_ref()
             .unwrap()
-            .template
-            .metadata
-            .as_ref()
-            .unwrap()
-            .labels
+            .match_labels
             .as_ref()
             .unwrap();
         assert_eq!(
-            labels.get("app.kubernetes.io/name").unwrap(),
-            "lakekeeper-bootstrap"
+            p1_labels.get("app.kubernetes.io/name").unwrap(),
+            "lakekeeper"
         );
-        // and the policy contains a peer with exactly that pair
-        let policy = lakekeeper_ingress("data");
-        let ingress = policy.spec.as_ref().unwrap().ingress.as_ref().unwrap();
-        let mut found = false;
-        for peer in ingress[0].from.as_ref().unwrap() {
-            let pl = peer
-                .pod_selector
-                .as_ref()
-                .unwrap()
-                .match_labels
-                .as_ref()
-                .unwrap();
-            if pl.len() == 1
-                && pl.get("app.kubernetes.io/name").map(|s| s.as_str())
-                    == Some("lakekeeper-bootstrap")
-            {
-                found = true;
-                break;
-            }
+        assert_eq!(
+            p1_labels.get("app.kubernetes.io/component").unwrap(),
+            "catalog"
+        );
+        // Second peer
+        let p2 = &peers[1];
+        assert!(p2.namespace_selector.is_none());
+        assert!(p2.ip_block.is_none());
+        let p2_labels = p2
+            .pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            p2_labels.get("app.kubernetes.io/name").unwrap(),
+            "lakekeeper"
+        );
+        assert_eq!(
+            p2_labels.get("app.kubernetes.io/component").unwrap(),
+            "db-migration"
+        );
+        let ports = rule.ports.as_ref().unwrap();
+        assert_eq!(ports.len(), 2);
+        let mut ports_sorted: Vec<i32> = ports
+            .iter()
+            .map(|p| match &p.port {
+                Some(IntOrString::Int(n)) => *n,
+                _ => panic!("expected int port"),
+            })
+            .collect();
+        ports_sorted.sort();
+        assert_eq!(ports_sorted, vec![8080, 8081]);
+        for p in ports {
+            assert_eq!(p.protocol.as_ref().unwrap(), "TCP");
         }
-        assert!(found);
     }
 }

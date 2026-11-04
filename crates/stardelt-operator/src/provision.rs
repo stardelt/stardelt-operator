@@ -616,6 +616,34 @@ pub async fn ensure_lakekeeper_network_policy(
     Some(status(NAME, true, "applied: lakekeeper-ingress"))
 }
 
+/// The permission store's ingress policy. Applied on every reconcile: it selects pods by
+/// label, so it is inert until the OpenFGA release exists.
+pub async fn ensure_openfga_network_policy(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "openfga-network-policy";
+    if let Err(e) = apply::<NetworkPolicy>(
+        &ctx.client,
+        namespace,
+        &network_policy::openfga_ingress(namespace),
+        lh.spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if lh.spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): NetworkPolicy openfga-ingress",
+        ));
+    }
+    Some(status(NAME, true, "applied: openfga-ingress"))
+}
+
 /// `<lakehouse>-discovery`: the ConfigMap that tells consumers where the catalog, the
 /// object store and Trino are. Published once the warehouse is bootstrapped, with
 /// server-side apply on every reconcile, and owned by the Lakehouse (it is derived
@@ -3942,6 +3970,20 @@ mod tests {
         assert_eq!(
             status.message.as_deref(),
             Some("planned (dry-run): NetworkPolicy lakekeeper-ingress")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_permission_store_network_policy_is_applied() {
+        let (client, requests) = mock_client(false);
+        let status = ensure_openfga_network_policy(&context(client), &lakehouse(), "data")
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        let paths = applied_paths(&requests);
+        assert_eq!(
+            paths.last().cloned().unwrap_or_default(),
+            "/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/openfga-ingress"
         );
     }
 }
