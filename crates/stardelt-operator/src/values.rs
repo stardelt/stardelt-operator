@@ -269,6 +269,26 @@ mod tests {
     }
 
     #[test]
+    fn trino_posts_the_query_log_to_nova() {
+        let values = golden_values("trino");
+        assert_eq!(
+            values["eventListenerProperties"][4],
+            serde_json::json!(
+                "http-event-listener.connect-http-headers=Authorization:Bearer ${ENV:NOVA_EVENTS_TOKEN},X-Stardelt-Warehouse:default"
+            )
+        );
+        let env = values["env"].as_array().expect("env");
+        let token_env = env
+            .iter()
+            .find(|e| e["name"] == "NOVA_EVENTS_TOKEN")
+            .expect("NOVA_EVENTS_TOKEN env var");
+        assert_eq!(
+            token_env["valueFrom"]["secretKeyRef"],
+            serde_json::json!({ "name": "nova-events", "key": "token", "optional": true })
+        );
+    }
+
+    #[test]
     fn jupyterhub_golden_values_come_from_the_yaml_file() {
         let file: Value = serde_yaml::from_str(include_str!("../values/jupyterhub.yaml"))
             .expect("values/jupyterhub.yaml is valid YAML");

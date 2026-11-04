@@ -51,6 +51,17 @@ pub const SESSION: IdentitySecret = IdentitySecret {
     generated: &["session"],
     fernet: &[],
 };
+/// Secret that holds the bearer token Trino's query-log event listener presents to Nova's
+/// internal endpoint (key `token`). Nova turns the collector off without it.
+/// Mirrors stardelt-platform/scripts/nova-events-token.sh.
+pub const EVENTS_SECRET: &str = "nova-events";
+/// The token as a generated Secret: one key, created once and kept, like the session key.
+pub const EVENTS: IdentitySecret = IdentitySecret {
+    name: EVENTS_SECRET,
+    fixed: &[],
+    generated: &["token"],
+    fernet: &[],
+};
 /// Secret that CloudNative-PG generates for the state store; its `uri` key is a complete URL.
 pub const DATABASE_SECRET: &str = "nova-pg-app";
 /// Bucket for published notebooks (the object store versions it).

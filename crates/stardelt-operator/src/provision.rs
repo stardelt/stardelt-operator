@@ -671,6 +671,18 @@ pub async fn ensure_nova_session(
     Some(ensure_generated_secrets(ctx, spec, "nova-session", &[nova::SESSION]).await)
 }
 
+/// Nova's query-log token: Secret `nova-events`, key `token`, generated once and kept. The same
+/// value is read by Nova (collector) and by Trino (event listener), so it lives in one Secret.
+pub async fn ensure_nova_events(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    if !spec.pillars.lakehouse {
+        return None;
+    }
+    Some(ensure_generated_secrets(ctx, spec, "nova-events", &[nova::EVENTS]).await)
+}
+
 /// Creates the Secrets in `desired` when absent and adds the keys an existing Secret lacks;
 /// never rewrites a value that is there. The status is named `name`.
 async fn ensure_generated_secrets(
@@ -2349,6 +2361,38 @@ mod tests {
         assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
         assert_eq!(patch_count(&requests), 1);
         assert!(store.lock().expect("store poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_query_log_token_is_generated_once_and_kept() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform_with_lakehouse(true, false);
+        let status = ensure_nova_events(&ctx, &spec).await.expect("a status");
+        assert!(status.ready, "{status:?}");
+        assert_eq!(status.name, "nova-events");
+        assert_eq!(status.message.as_deref(), Some("ready: created 1 / kept 0"));
+        assert_eq!(patch_count(&requests), 1);
+        let secret = applied_secret(&requests, "nova-events");
+        assert_eq!(secret["kind"], "Secret");
+        assert_eq!(
+            secret["metadata"]["labels"]["app.kubernetes.io/part-of"],
+            "stardelt"
+        );
+        let data = secret["data"].as_object().expect("data");
+        assert_eq!(data.keys().collect::<Vec<_>>(), ["token"]);
+        assert_base64_of_48_bytes(data["token"].as_str().expect("a token"));
+
+        // The second reconcile reads the stored Secret and writes nothing.
+        let before = store.lock().expect("store poisoned").clone();
+        let status = ensure_nova_events(&ctx, &spec).await.expect("a status");
+        assert_eq!(status.message.as_deref(), Some("ready: created 0 / kept 1"));
+        assert_eq!(patch_count(&requests), 1, "a reconcile may not write");
+        assert_eq!(
+            *store.lock().expect("store poisoned"),
+            before,
+            "the token was rewritten"
+        );
     }
 
     #[tokio::test]
