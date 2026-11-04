@@ -82,3 +82,4 @@ jobs:
             echo
             echo "Pin it: \`kubectl -n stardelt set image deploy/stardelt-operator operator=ghcr.io/stardelt/stardelt-operator@${{ steps.build.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "Pin this image: ghcr.io/stardelt/stardelt-operator@${{ steps.build.outputs.digest }}"
