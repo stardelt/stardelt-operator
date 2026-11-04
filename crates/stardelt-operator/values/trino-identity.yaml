@@ -47,6 +47,33 @@ coordinator:
     - name: trino-tls
       secretName: trino-coordinator-tls
       path: /etc/trino/tls
+  # Resource groups and the group provider: both files are written by the access-sync CronJob
+  # (access_sync.rs) into ConfigMaps trino-warehouses and trino-group-file, created empty when
+  # absent (provision.rs ensure_trino_config_maps). The resource-group file manager reads its
+  # file once at startup — a SqlWarehouse class change needs a coordinator restart; groups.txt
+  # is re-read every 30 s. Ported from stardelt-platform/helm-values/trino-identity.yaml.
+  additionalConfigFiles:
+    resource-groups.properties: |
+      resource-groups.configuration-manager=file
+      resource-groups.config-file=/etc/trino/warehouses/resource-groups.json
+    group-provider.properties: |
+      group-provider.name=file
+      file.group-file=/etc/trino/groups/groups.txt
+      file.refresh-period=30s
+  additionalVolumes:
+    - name: trino-groups
+      configMap: { name: trino-group-file }
+    - name: trino-warehouses
+      configMap: { name: trino-warehouses }
+    - name: trino-fscache
+      emptyDir: { sizeLimit: 12Gi }
+    - name: trino-dumps
+      emptyDir: { sizeLimit: 2Gi }
+  additionalVolumeMounts:
+    - { name: trino-groups, mountPath: /etc/trino/groups }
+    - { name: trino-warehouses, mountPath: /etc/trino/warehouses }
+    - { name: trino-fscache, mountPath: /var/trino/cache }
+    - { name: trino-dumps, mountPath: /dumps }
 # Rendered into the coordinator *and* worker ConfigMaps, so it replaces the base
 # list: `http-server.process-forwarded` is restated. The shared secret is required
 # as soon as an authenticator is on (Secret trino-internal-secret).

@@ -1017,6 +1017,55 @@ mod tests {
     }
 
     #[test]
+    fn trino_identity_values_configure_the_group_and_warehouse_files() {
+        let values = identity_values("trino");
+        let coordinator = &values["coordinator"];
+        assert_eq!(
+            coordinator["additionalConfigFiles"]["resource-groups.properties"]
+                .as_str()
+                .unwrap(),
+            "resource-groups.configuration-manager=file\n\
+             resource-groups.config-file=/etc/trino/warehouses/resource-groups.json\n"
+        );
+        assert!(
+            coordinator["additionalConfigFiles"]["group-provider.properties"]
+                .as_str()
+                .unwrap()
+                .contains("file.group-file=/etc/trino/groups/groups.txt")
+        );
+        let volumes: Vec<_> = coordinator["additionalVolumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            volumes,
+            vec![
+                "trino-groups",
+                "trino-warehouses",
+                "trino-fscache",
+                "trino-dumps"
+            ]
+        );
+        let mounts: Vec<_> = coordinator["additionalVolumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["mountPath"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            mounts,
+            vec![
+                "/etc/trino/groups",
+                "/etc/trino/warehouses",
+                "/var/trino/cache",
+                "/dumps"
+            ]
+        );
+    }
+
+    #[test]
     fn the_golden_trino_values_stay_anonymous() {
         // The overlay is the only place with an authenticator: a cluster without an IdP must
         // not render one, and a CR must not be able to make it silent either (the overlay is
