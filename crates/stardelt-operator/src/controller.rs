@@ -137,6 +137,11 @@ struct OverridesContext<'a> {
     /// datasources). `None` on the Lakehouse path: a Lakehouse has no base domain and its plan
     /// contains no Superset.
     base_domain: Option<&'a str>,
+    /// `metadata.resourceVersion` of ConfigMap `trino-warehouses`, stamped into the coordinator's
+    /// pod template. The resource-group file manager reads the file once at startup and the
+    /// operator installs no Reloader (D-op-3), so this is what turns a `SqlWarehouse` class
+    /// change into a coordinator roll. `None` when the ConfigMap does not exist yet.
+    trino_warehouses: Option<&'a str>,
 }
 
 /// Outcome of applying (or planning) one component plan.
@@ -296,6 +301,15 @@ async fn resolve_component_values(
     {
         crate::values::substitute_base_domain(&mut values, domain);
     }
+    // The coordinator reads the resource-group file once (D-op-3): the stamp is the change
+    // signal, not a preference — it must not be an override the CR can set.
+    if component == "trino"
+        && overrides.identity
+        && let Some(stamp) = overrides.trino_warehouses
+    {
+        values["coordinator"]["annotations"]["stardelt.io/trino-warehouses"] =
+            serde_json::json!(stamp);
+    }
     // The effective values are otherwise invisible until something is applied, which makes
     // "why did it plan that?" unanswerable from the cluster. Debug rather than info: this is
     // a diagnostic, not an event.
@@ -327,6 +341,18 @@ async fn identity_contract_present(client: &Client, namespace: &str) -> bool {
         .ok()
         .flatten()
         .is_some()
+}
+
+/// The change stamp of the resource-group file: ConfigMap `trino-warehouses` is written by
+/// the access-sync CronJob only when its rendered text changes, so its `resourceVersion` is
+/// stable while the file is.
+async fn trino_warehouses_stamp(client: &Client, namespace: &str) -> Option<String> {
+    Api::<ConfigMap>::namespaced(client.clone(), namespace)
+        .get_opt("trino-warehouses")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|cm| cm.metadata.resource_version)
 }
 
 /// The three Secrets the identity overlay reads: the PKCS12 keystore (`trino-coordinator-tls`,
@@ -875,12 +901,18 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     let trino_ready = lh.spec.dry_run
         || !identity_contract
         || trino_key_material_present(&ctx.client, &namespace).await;
+    let warehouses_stamp = if identity_contract && trino_ready {
+        trino_warehouses_stamp(&ctx.client, &namespace).await
+    } else {
+        None
+    };
     let overrides = OverridesContext {
         scope_namespace: Some(&namespace),
         overrides: &lh.spec.component_values,
         profile: lh.spec.profile,
         identity: identity_contract && trino_ready,
         base_domain: None,
+        trino_warehouses: warehouses_stamp.as_deref(),
     };
     let previous = lh
         .status
@@ -1033,6 +1065,7 @@ async fn reconcile_platform(
         profile: instance.spec.profile,
         identity: instance.spec.identity.mode != IdentityMode::None,
         base_domain: instance.spec.base_domain.as_deref(),
+        trino_warehouses: None,
     };
     let previous = instance
         .status
@@ -1193,6 +1226,7 @@ mod tests {
             profile: Profile::Demo,
             identity: false,
             base_domain: Some("data.example.com"),
+            trino_warehouses: None,
         }
     }
 
@@ -2523,5 +2557,33 @@ mod tests {
             json!("old"),
             "an unchanged Ready keeps its transition time"
         );
+    }
+
+    #[tokio::test]
+    async fn the_trino_release_is_stamped_with_the_warehouse_resource_version() {
+        let (client, _requests) = mock_client("[]", "[]");
+        let ctx = Context {
+            client,
+            helm: helm_stub(),
+        };
+        let values = ComponentValues::default();
+        let mut overrides = overrides_context(&values);
+        overrides.identity = true;
+        overrides.trino_warehouses = Some("4711");
+
+        let trino = resolve_component_values(&ctx, &overrides, "trino")
+            .await
+            .expect("values");
+        assert_eq!(
+            trino["coordinator"]["annotations"]["stardelt.io/trino-warehouses"],
+            "4711"
+        );
+
+        // Without the identity overlay there is no mounted ConfigMap and no restart.
+        overrides.identity = false;
+        let trino = resolve_component_values(&ctx, &overrides, "trino")
+            .await
+            .expect("values");
+        assert!(trino["coordinator"]["annotations"].is_null());
     }
 }
