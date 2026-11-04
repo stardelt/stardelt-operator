@@ -6,10 +6,16 @@
 # the platform's own rule (stardelt-platform/Makefile, target `trino:`), because a
 # Lakehouse has no identity field of its own.
 #
-# Ported from stardelt-platform/helm-values/trino-identity.yaml. Deliberately NOT
-# here (next tickets): the `accessControl` rules, the group provider and the OPA
-# bridge — until they land, Trino's default access control admits every
-# authenticated caller and lets the `superset` account impersonate.
+# Ported from stardelt-platform/helm-values/trino-identity.yaml. What this file carries:
+# the PASSWORD+OAuth2 listener over TLS, the service account's password file (`auth`), the
+# file access control (`accessControl`, operator#229) and the resource groups plus the group
+# provider (`coordinator.additionalConfigFiles`, operator#224). Trino therefore does NOT fall
+# back to its default access control: an authenticated caller sees the engine catalogs as
+# denied and may impersonate only as `superset`.
+#
+# Deliberately NOT here: the OPA bridge (`access-control.config-files`) — it needs the catalog
+# service identity the operator cannot create yet (stardelt-operator#194). A listed but missing
+# config file stops Trino from starting, so the bridge's file arrives with the bridge.
 server:
   config:
     # PASSWORD first: a Basic header from the service account is not parsed as a
