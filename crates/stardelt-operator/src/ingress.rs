@@ -5,7 +5,7 @@
 //! Every field mirrors `stardelt-platform` `chart/templates/ingress.yaml`: Nova answers on
 //! `spec.baseDomain` itself and every other application on a subdomain (the chart's
 //! `stardelt.appHost`); the class, the cert-manager issuer annotation and the TLS block come
-//! from `spec.ingress`. The four applications built today (Nova, identity provider, Airflow, JupyterHub); Trino and Lakekeeper stay unpublished until they authenticate (see "do not").
+//! from `spec.ingress`. The five applications built today (Nova, identity provider, Airflow, JupyterHub, Superset); Trino and Lakekeeper stay unpublished until they authenticate (see "do not").
 
 use std::collections::BTreeMap;
 
@@ -100,6 +100,29 @@ pub fn jupyterhub(spec: &PlatformInstanceSpec) -> Option<Ingress> {
         "proxy-public",
         80,
         "jupyter",
+        &["/"],
+        false,
+    )
+}
+
+/// The Ingress of Superset, on `superset.<base domain>`, with the `dashboards` pillar.
+/// Superset signs in through the platform IdP (values/superset.yaml), and the realm's
+/// redirect URI `https://superset.<base domain>/oauth-authorized/keycloak`
+/// (`identity.rs`, `Hosts::superset`; substituted in `keycloak.rs`) only resolves through
+/// this host. The platform chart knows the same service and port
+/// (`chart/templates/ingress.yaml`) but publishes it only behind
+/// `ingress.exposeUnauthenticated`; the operator publishes it whenever the pillar is on,
+/// as for Airflow.
+pub fn superset(spec: &PlatformInstanceSpec) -> Option<Ingress> {
+    if !spec.pillars.dashboards {
+        return None;
+    }
+    build(
+        spec,
+        "superset",
+        "superset",
+        8088,
+        "superset",
         &["/"],
         false,
     )
@@ -375,6 +398,32 @@ mod tests {
         assert_eq!(backend.name, "proxy-public");
         assert_eq!(backend.port.expect("port").number, Some(80));
         assert!(jupyterhub(&spec(serde_json::json!({}))).is_none());
+    }
+
+    #[test]
+    fn superset_answers_on_its_subdomain_with_the_superset_service() {
+        let ingress = superset(&spec(serde_json::json!({"pillars": {"dashboards": true}})))
+            .expect("an Ingress");
+        let (host, paths) = rule_of(&ingress);
+        assert_eq!(host, "superset.data.example.com");
+        assert_eq!(paths, [("/".to_string(), "Prefix".to_string())]);
+        let inner = ingress.spec.expect("spec");
+        let backend = inner.rules.expect("rules")[0]
+            .http
+            .clone()
+            .expect("http")
+            .paths[0]
+            .backend
+            .service
+            .clone()
+            .expect("service");
+        assert_eq!(backend.name, "superset");
+        assert_eq!(backend.port.expect("port").number, Some(8088));
+    }
+
+    #[test]
+    fn superset_needs_the_dashboards_pillar() {
+        assert!(superset(&spec(serde_json::json!({}))).is_none());
     }
 
     #[test]
