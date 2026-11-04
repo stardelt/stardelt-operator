@@ -133,6 +133,10 @@ struct OverridesContext<'a> {
     /// (values/trino-identity.yaml) belongs in Trino's effective values. `false` without an
     /// identity contract.
     identity: bool,
+    /// `spec.baseDomain`, for the identity overlays that name a public host (Superset's Trino
+    /// datasources). `None` on the Lakehouse path: a Lakehouse has no base domain and its plan
+    /// contains no Superset.
+    base_domain: Option<&'a str>,
 }
 
 /// Outcome of applying (or planning) one component plan.
@@ -284,6 +288,14 @@ async fn resolve_component_values(
     } else {
         values
     };
+    // The overlays that name a public host are only merged with an IdP (above), which is also
+    // when the host exists; substitute the domain last so an override cannot smuggle a literal.
+    let mut values = values;
+    if overrides.identity
+        && let Some(domain) = overrides.base_domain
+    {
+        crate::values::substitute_base_domain(&mut values, domain);
+    }
     // The effective values are otherwise invisible until something is applied, which makes
     // "why did it plan that?" unanswerable from the cluster. Debug rather than info: this is
     // a diagnostic, not an event.
@@ -868,6 +880,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         overrides: &lh.spec.component_values,
         profile: lh.spec.profile,
         identity: identity_contract && trino_ready,
+        base_domain: None,
     };
     let previous = lh
         .status
@@ -1019,6 +1032,7 @@ async fn reconcile_platform(
         overrides: &instance.spec.component_values,
         profile: instance.spec.profile,
         identity: instance.spec.identity.mode != IdentityMode::None,
+        base_domain: instance.spec.base_domain.as_deref(),
     };
     let previous = instance
         .status
@@ -1178,6 +1192,7 @@ mod tests {
             overrides: values,
             profile: Profile::Demo,
             identity: false,
+            base_domain: Some("data.example.com"),
         }
     }
 
