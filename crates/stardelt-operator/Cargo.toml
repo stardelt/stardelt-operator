@@ -21,6 +21,7 @@ serde_yaml.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
+bcrypt.workspace = true
 
 [dev-dependencies]
 # Already in the dependency tree (kube pulls both in); used to build a mock kube

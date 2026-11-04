@@ -1374,10 +1374,150 @@ pub async fn ensure_trino_tls(
         return Some(status(
             NAME,
             false,
-            "planned (dry-run): the Trino trust anchor",
+            "planned (dry-run): the Trino TLS Issuers and Certificates",
         ));
     }
-    Some(status(NAME, true, "the Trino trust anchor is applied"))
+    Some(status(
+        NAME,
+        true,
+        "applied: the Trino TLS Issuers and Certificates",
+    ))
+}
+
+/// Secret that carries the coordinator ↔ worker shared secret (key `shared-secret`). Trino
+/// refuses to start with an authenticator and no shared secret.
+pub const TRINO_INTERNAL_SECRET: &str = "trino-internal-secret";
+const TRINO_INTERNAL: keycloak::IdentitySecret = keycloak::IdentitySecret {
+    name: TRINO_INTERNAL_SECRET,
+    fixed: &[],
+    generated: &["shared-secret"],
+    fernet: &[],
+};
+
+/// The Trino service account: Secret `trino-password-db`, keys `password.db`
+/// (`superset:<bcrypt>` — the PASSWORD authenticator's file), `password` (the plaintext, which
+/// Superset's datasource hook reads) and `username=superset`. Created with the value it needs
+/// and never rewritten; a Secret created before this step only gets the missing `password.db`.
+pub async fn ensure_trino_auth_secrets(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "trino-auth-secrets";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let internal = ensure_generated_secrets(ctx, spec, NAME, &[TRINO_INTERNAL]).await;
+    if !internal.ready && !spec.dry_run {
+        return Some(internal);
+    }
+    let namespace = &spec.namespace;
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let existing = match secrets.get_opt("trino-password-db").await {
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+        Ok(existing) => existing,
+    };
+    let plaintext = existing
+        .as_ref()
+        .and_then(|s| s.string_data.as_ref())
+        .and_then(|d| d.get("password").cloned());
+    let has_db_file = existing
+        .as_ref()
+        .and_then(|s| s.data.as_ref())
+        .is_some_and(|d| d.contains_key("password.db"))
+        || existing
+            .as_ref()
+            .and_then(|s| s.string_data.as_ref())
+            .is_some_and(|d| d.contains_key("password.db"));
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): the Trino auth Secrets",
+        ));
+    }
+    if let Some(existing) = existing {
+        if has_db_file {
+            return Some(status(NAME, true, "kept (created 0)"));
+        }
+        // The plaintext may live under `password` (this operator's key) or, for a Secret the
+        // platform made, under `superset-password`. A Secret with neither cannot be completed
+        // without rotating the service account: say so instead of guessing.
+        let password = plaintext.or_else(|| {
+            existing
+                .data
+                .as_ref()
+                .and_then(|d| d.get("superset-password"))
+                .and_then(|v| String::from_utf8(v.0.clone()).ok())
+        });
+        let password = match password {
+            Some(password) => password,
+            None => {
+                return Some(status(
+                    NAME,
+                    false,
+                    "trino-password-db exists without a password key — delete it to regenerate",
+                ));
+            }
+        };
+        // Patch only the new key; the API server keeps the others.
+        let params = PatchParams {
+            dry_run: false,
+            ..PatchParams::default()
+        };
+        if let Err(e) = secrets
+            .patch(
+                "trino-password-db",
+                &params,
+                &Patch::Merge(serde_json::json!({
+                    "stringData": { "password.db": password_db_line(&password) }
+                })),
+            )
+            .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        Some(status(NAME, true, "added password.db"))
+    } else {
+        let mut secret = match keycloak::identity_secret(
+            &keycloak::IdentitySecret {
+                name: "trino-password-db",
+                fixed: &[("username", "superset")],
+                generated: &["password"],
+                fernet: &[],
+            },
+            namespace,
+        ) {
+            Ok(s) => s,
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        };
+        let password = secret
+            .data
+            .as_ref()
+            .and_then(|d| d.get("password"))
+            .and_then(|v| String::from_utf8(v.0.clone()).ok())
+            .unwrap_or_default();
+        if secret.string_data.is_none() {
+            secret.string_data = Some(std::collections::BTreeMap::new());
+        }
+        secret
+            .string_data
+            .as_mut()
+            .unwrap()
+            .insert("password.db".to_string(), password_db_line(&password));
+        if let Err(e) = apply::<Secret>(&ctx.client, namespace, &secret, spec.dry_run).await {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        Some(status(NAME, true, "created 2 / kept 0"))
+    }
+}
+
+/// `superset:<bcrypt>`, in the format the live platform Secret uses (`$2y$10$…`). The Rust
+/// crate emits `$2b$`; `2b` and `2y` differ only in an old PHP bug for non-ASCII passwords, so
+/// the prefix is rewritten and the hash stays valid (the platform's own `htpasswd -B` output is
+/// `$2y$` and Trino accepts it — checked on the dev cluster 2026-11-04).
+fn password_db_line(password: &str) -> String {
+    let hash = bcrypt::hash(password, 10).expect("bcrypt hashing cannot fail for a short password");
+    format!("superset:{}", hash.replacen("$2b$", "$2y$", 1))
 }
 
 /// The CronJob that turns `Catalog` objects into Lakekeeper warehouses and `SqlWarehouse`
@@ -3044,8 +3184,8 @@ mod tests {
                 .expect("a status");
         assert_eq!(status.name, "superset-secrets");
         assert!(status.ready, "{status:?}");
-        assert_eq!(status.message.as_deref(), Some("ready: created 3 / kept 0"));
-        assert_eq!(patch_count(&requests), 3);
+        assert_eq!(status.message.as_deref(), Some("ready: created 2 / kept 0"));
+        assert_eq!(patch_count(&requests), 2);
     }
 
     #[tokio::test]
@@ -3633,6 +3773,94 @@ mod tests {
         let ctx = context(client);
         let spec = platform("none", false);
         assert!(ensure_trino_tls(&ctx, &spec).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn trino_auth_secrets_are_created_once() {
+        let (client, store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("platform", false);
+        let status = ensure_trino_auth_secrets(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        assert_eq!(status.name, "trino-auth-secrets");
+        let store = store.lock().expect("store poisoned");
+        let internal = store
+            .get("trino-internal-secret")
+            .expect("trino-internal-secret");
+        assert!(
+            internal
+                .get("data")
+                .and_then(|d| d.get("shared-secret"))
+                .is_some()
+        );
+        let trino_pwd = store.get("trino-password-db").expect("trino-password-db");
+        if let Some(s) = trino_pwd
+            .get("stringData")
+            .and_then(|d| d.get("password.db"))
+            .and_then(|v| v.as_str())
+        {
+            assert!(s.starts_with("superset:$2y$"));
+            assert!(s.contains("$10$"));
+        } else if let Some(s) = trino_pwd
+            .get("data")
+            .and_then(|d| d.get("password.db"))
+            .and_then(|v| v.as_str())
+        {
+            assert!(s.contains("$2") || s.starts_with("c3Vw"));
+        } else {
+            panic!("password.db not found");
+        }
+    }
+
+    #[tokio::test]
+    async fn trino_auth_secrets_complete_an_existing_password_secret() {
+        let mut initial = BTreeMap::new();
+        initial.insert(
+            "trino-password-db".to_string(),
+            serde_json::json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": { "name": "trino-password-db" },
+                "stringData": { "password": "s3cret" },
+                "data": {}
+            }),
+        );
+        let (client, _store, requests) = identity_client(initial);
+        let ctx = context(client);
+        let spec = platform("platform", false);
+        let status = ensure_trino_auth_secrets(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        assert_eq!(status.message.as_deref(), Some("added password.db"));
+        let reqs = requests.lock().expect("requests poisoned");
+        let patch_reqs: Vec<_> = reqs
+            .iter()
+            .filter(|(method, path, _)| {
+                method == "PATCH" && path.ends_with("/secrets/trino-password-db")
+            })
+            .collect();
+        assert_eq!(patch_reqs.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&patch_reqs[0].2).expect("JSON body");
+        assert!(body.get("data").is_none());
+        assert_eq!(
+            body["stringData"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["password.db"]
+        );
+    }
+
+    #[tokio::test]
+    async fn trino_auth_secrets_are_skipped_without_the_platform_identity_provider() {
+        let (client, _store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("external", false);
+        assert!(ensure_trino_auth_secrets(&ctx, &spec).await.is_none());
     }
 
     #[tokio::test]

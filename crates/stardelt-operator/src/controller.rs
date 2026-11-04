@@ -43,7 +43,7 @@ use crate::provision::{
     ensure_lakekeeper_network_policy, ensure_notebooks_bucket, ensure_nova, ensure_nova_events,
     ensure_nova_pg, ensure_nova_session, ensure_openfga_database, ensure_pg_dumps,
     ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
-    ensure_trino_config_maps, ensure_trino_tls,
+    ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -1004,6 +1004,9 @@ async fn reconcile_platform(
     }
     if let Some(tls) = ensure_trino_tls(&ctx, &instance.spec).await {
         outcome.components.push(tls);
+    }
+    if let Some(auth) = ensure_trino_auth_secrets(&ctx, &instance.spec).await {
+        outcome.components.push(auth);
     }
     if let Some(sync) = ensure_access_sync(&ctx, &instance.spec).await {
         outcome.components.push(sync);
