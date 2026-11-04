@@ -26,6 +26,36 @@ env:
       name: nova-events
       key: token
       optional: true
+# Authentication (values/trino-identity.yaml, identity mode `platform`): the OIDC
+# client `trino` of Secret stardelt-oidc-clients, the IdP issuer from the identity
+# contract, the shared secret Trino requires as soon as an authenticator is on, and
+# the PKCS12 keystore password cert-manager writes. Optional, like the query-log
+# token: without an IdP neither the Secret nor the ConfigMap exists, the overlay is
+# never applied, and Trino keeps the anonymous development default.
+- name: TRINO_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: stardelt-oidc-clients
+      key: trino
+      optional: true
+- name: TRINO_INTERNAL_SHARED_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: trino-internal-secret
+      key: shared-secret
+      optional: true
+- name: TRINO_OIDC_ISSUER
+  valueFrom:
+    configMapKeyRef:
+      name: stardelt-identity
+      key: issuerUrl
+      optional: true
+- name: TRINO_TLS_KEYSTORE_PASSWORD
+  valueFrom:
+    secretKeyRef:
+      name: trino-tls-keystore
+      key: password
+      optional: true
 # TODO(polaris): under `spec.catalog.implementation: polaris` this
 # URI is wrong; Polaris has no adapter yet, so the Lakekeeper URI
 # stays until one lands.

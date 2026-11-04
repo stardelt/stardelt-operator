@@ -27,9 +27,9 @@ use serde_json::json;
 use crate::connection::reconcile_connection;
 use crate::crd::Profile;
 use crate::crd::{
-    ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, Lakehouse,
-    LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal, StorageImpl,
-    ValuesSource,
+    ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, IdentityMode,
+    Lakehouse, LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal,
+    StorageImpl, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::objects::cnpg_cluster_resource;
@@ -45,7 +45,7 @@ use crate::provision::{
     ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
     ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
-use crate::values::{effective_values, parse_values_document};
+use crate::values::{deep_merge, effective_values, identity_values, parse_values_document};
 
 pub struct Context {
     pub client: Client,
@@ -129,6 +129,10 @@ struct OverridesContext<'a> {
     scope_namespace: Option<&'a str>,
     overrides: &'a ComponentValues,
     profile: Profile,
+    /// The platform has an IdP and Trino's key material is complete: the identity overlay
+    /// (values/trino-identity.yaml) belongs in Trino's effective values. `false` without an
+    /// identity contract.
+    identity: bool,
 }
 
 /// Outcome of applying (or planning) one component plan.
@@ -273,6 +277,13 @@ async fn resolve_component_values(
     };
     let inline = overrides.overrides.values.get(component);
     let values = effective_values(component, overrides.profile, external.as_ref(), inline);
+    // Merged last: the overlay is the security property, not a preference, so a CR cannot
+    // silently put Trino back on the anonymous development default.
+    let values = if overrides.identity {
+        deep_merge(values, identity_values(component))
+    } else {
+        values
+    };
     // The effective values are otherwise invisible until something is applied, which makes
     // "why did it plan that?" unanswerable from the cluster. Debug rather than info: this is
     // a diagnostic, not an event.
@@ -291,6 +302,52 @@ fn profile_name(profile: Profile) -> &'static str {
         Profile::Demo => "demo",
         Profile::Full => "full",
         Profile::Airgap => "airgap",
+    }
+}
+
+/// The platform's rule for its identity overlay: ConfigMap `stardelt-identity` exists in the
+/// namespace (stardelt-platform `Makefile`, target `trino:`). A `Lakehouse` has no identity
+/// field of its own.
+async fn identity_contract_present(client: &Client, namespace: &str) -> bool {
+    Api::<ConfigMap>::namespaced(client.clone(), namespace)
+        .get_opt(crate::identity::CONFIGMAP_NAME)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// The three Secrets the identity overlay reads: the PKCS12 keystore (`trino-coordinator-tls`,
+/// cert-manager writes it only once the certificate is issued), the coordinator↔worker shared
+/// secret and the PASSWORD-authenticator file. Without all three Trino would crash-loop, so
+/// their absence is a reason to wait, not to install with an authenticator.
+async fn trino_key_material_present(client: &Client, namespace: &str) -> bool {
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    for name in [
+        "trino-coordinator-tls",
+        "trino-internal-secret",
+        "trino-password-db",
+    ] {
+        if secrets.get_opt(name).await.ok().flatten().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether a component's release may be applied now. Lakekeeper and OpenFGA wait for their
+/// database; Trino waits for its key material once the platform has an IdP.
+fn release_ready(
+    component: &str,
+    database_ready: bool,
+    openfga_ready: bool,
+    trino_ready: bool,
+) -> bool {
+    match component {
+        "lakekeeper" => database_ready,
+        "openfga" => openfga_ready,
+        "trino" => trino_ready,
+        _ => true,
     }
 }
 
@@ -800,10 +857,17 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     ensure_lakehouse_finalizer(&ctx, &lh).await?;
 
     let plan = plan_lakehouse(&lh.spec);
+    // The identity contract decides whether Trino authenticates; its key material decides
+    // whether it may start with the HTTPS listener on. A dry run shows the intended state.
+    let identity_contract = identity_contract_present(&ctx.client, &namespace).await;
+    let trino_ready = lh.spec.dry_run
+        || !identity_contract
+        || trino_key_material_present(&ctx.client, &namespace).await;
     let overrides = OverridesContext {
         scope_namespace: Some(&namespace),
         overrides: &lh.spec.component_values,
         profile: lh.spec.profile,
+        identity: identity_contract && trino_ready,
     };
     let previous = lh
         .status
@@ -822,8 +886,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     let plan: Vec<ComponentPlan> = plan
         .into_iter()
         .filter(|c| {
-            (c.name != "lakekeeper" || database_ready || lh.spec.dry_run)
-                && (c.name != "openfga" || openfga_ready || lh.spec.dry_run)
+            lh.spec.dry_run || release_ready(c.name, database_ready, openfga_ready, trino_ready)
         })
         .collect();
     let mut outcome = apply_plan(
@@ -849,6 +912,18 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             name: "openfga".into(),
             ready: false,
             message: Some("waiting for the permission store's database".into()),
+            applied_hash: None,
+        });
+    }
+    if identity_contract && !trino_ready && !lh.spec.dry_run {
+        outcome.components.push(ComponentStatus {
+            name: "trino".into(),
+            ready: false,
+            message: Some(
+                "waiting for the Trino key material (trino-coordinator-tls, \
+                 trino-internal-secret, trino-password-db)"
+                    .into(),
+            ),
             applied_hash: None,
         });
     }
@@ -936,6 +1011,7 @@ async fn reconcile_platform(
         scope_namespace: None,
         overrides: &instance.spec.component_values,
         profile: instance.spec.profile,
+        identity: instance.spec.identity.mode != IdentityMode::None,
     };
     let previous = instance
         .status
@@ -1094,6 +1170,7 @@ mod tests {
             scope_namespace: Some("stardelt"),
             overrides: values,
             profile: Profile::Demo,
+            identity: false,
         }
     }
 
@@ -1465,6 +1542,16 @@ mod tests {
         let c = ready_condition("Degraded", None, Some(&p), "new");
         assert_eq!(c.status, "False");
         assert_eq!(c.last_transition_time.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_release_waits_for_what_it_reads() {
+        assert!(!release_ready("lakekeeper", false, true, true));
+        assert!(release_ready("lakekeeper", true, false, false));
+        assert!(!release_ready("openfga", true, false, true));
+        assert!(!release_ready("trino", true, true, false));
+        assert!(release_ready("trino", false, false, true));
+        assert!(release_ready("seaweedfs", false, false, false));
     }
 
     /// One request recorded by [`status_mock_client`] or [`deletion_mock_client`].

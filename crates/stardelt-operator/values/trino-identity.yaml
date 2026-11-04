@@ -1,0 +1,55 @@
+# Trino authentication — the platform's "one identity" rule on the query engine.
+#
+# The controller layers this file over values/trino.yaml only when ConfigMap
+# `stardelt-identity` exists in the Lakehouse's namespace *and* the three Secrets it
+# reads are there (trino-coordinator-tls, trino-internal-secret, trino-password-db):
+# the platform's own rule (stardelt-platform/Makefile, target `trino:`), because a
+# Lakehouse has no identity field of its own.
+#
+# Ported from stardelt-platform/helm-values/trino-identity.yaml. Deliberately NOT
+# here (next tickets): the `accessControl` rules, the group provider and the OPA
+# bridge — until they land, Trino's default access control admits every
+# authenticated caller and lets the `superset` account impersonate.
+server:
+  config:
+    # PASSWORD first: a Basic header from the service account is not parsed as a
+    # bearer token.
+    authenticationType: "PASSWORD,OAUTH2"
+    https:
+      enabled: true
+      port: 8443
+      keystore:
+        path: /etc/trino/tls/keystore.p12
+  # Coordinator-only (a worker refuses keys it does not bind). The value is a string,
+  # so it replaces the base one: the base query guards are restated here.
+  coordinatorExtraConfig: |
+    query.max-execution-time=10m
+    query.max-run-time=15m
+    http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
+    http-server.authentication.allow-insecure-over-http=false
+    web-ui.authentication.type=oauth2
+    web-ui.preview.enabled=false
+    http-server.authentication.oauth2.issuer=${ENV:TRINO_OIDC_ISSUER}
+    http-server.authentication.oauth2.client-id=trino
+    http-server.authentication.oauth2.client-secret=${ENV:TRINO_CLIENT_SECRET}
+    http-server.authentication.oauth2.principal-field=sub
+    http-server.authentication.oauth2.scopes=openid
+    http-server.authentication.oauth2.oidc.use-userinfo-endpoint=false
+# The `superset:<bcrypt>` file the PASSWORD authenticator reads; the chart mounts
+# Secret trino-password-db at /etc/trino/auth/password/password.db (operator#209).
+auth:
+  passwordAuthSecret: trino-password-db
+coordinator:
+  # The PKCS12 keystore cert-manager writes into Secret trino-coordinator-tls. A
+  # directory mount, not a subPath file: the directory appears when the Secret does
+  # and picks up a renewal.
+  secretMounts:
+    - name: trino-tls
+      secretName: trino-coordinator-tls
+      path: /etc/trino/tls
+# Rendered into the coordinator *and* worker ConfigMaps, so it replaces the base
+# list: `http-server.process-forwarded` is restated. The shared secret is required
+# as soon as an authenticator is on (Secret trino-internal-secret).
+additionalConfigProperties:
+  - http-server.process-forwarded=true
+  - internal-communication.shared-secret=${ENV:TRINO_INTERNAL_SHARED_SECRET}
