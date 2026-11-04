@@ -1,10 +1,13 @@
 # OpenFGA — the catalog's permission store (platform#302, authz 1/8). Chart:
 # openfga/openfga 0.2.62, appVersion v1.14.0, Apache-2.0.
 #
-# Deployed and backed up but not enforced yet: Lakekeeper still runs
-# `authz.backend: allowall`, so the store holds nothing that decides an access check
-# until the cut-over (platform#304). Installing it now means the cut-over is a
-# values change, not a new component.
+# Deployed, backed up and **enforced**: Lakekeeper runs `authz.backend: openfga`
+# (stardelt-platform/helm-values/lakekeeper.yaml, cut-over platform#304), so every
+# catalog operation asks this store and is denied when it cannot answer (fail-closed).
+#
+# That makes the store load-bearing, which is why the liveness probe must tolerate a
+# slow host instead of killing the process: a store restart is a catalog outage for
+# every user (stardelt-platform#516).
 #
 # The database is CloudNative-PG Cluster `openfga-pg` (not the chart's bundled Postgres
 # subchart): this install already runs CloudNative-PG and a second Postgres operator is
