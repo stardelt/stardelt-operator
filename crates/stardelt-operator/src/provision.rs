@@ -1377,7 +1377,11 @@ pub async fn ensure_trino_tls(
             "planned (dry-run): the Trino TLS Issuers and Certificates",
         ));
     }
-    Some(status(NAME, true, "applied: the Trino TLS Issuers and Certificates"))
+    Some(status(
+        NAME,
+        true,
+        "applied: the Trino TLS Issuers and Certificates",
+    ))
 }
 
 /// Secret that carries the coordinator ↔ worker shared secret (key `shared-secret`). Trino
@@ -1425,7 +1429,11 @@ pub async fn ensure_trino_auth_secrets(
             .and_then(|s| s.string_data.as_ref())
             .is_some_and(|d| d.contains_key("password.db"));
     if spec.dry_run {
-        return Some(status(NAME, false, "planned (dry-run): the Trino auth Secrets"));
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): the Trino auth Secrets",
+        ));
     }
     if let Some(existing) = existing {
         if has_db_file {
@@ -1511,7 +1519,6 @@ fn password_db_line(password: &str) -> String {
     let hash = bcrypt::hash(password, 10).expect("bcrypt hashing cannot fail for a short password");
     format!("superset:{}", hash.replacen("$2b$", "$2y$", 1))
 }
-
 
 /// The CronJob that turns `Catalog` objects into Lakekeeper warehouses and `SqlWarehouse`
 /// objects into Trino resource groups (platform#305/#306/#312). Applied only when Secret
@@ -3855,7 +3862,6 @@ mod tests {
         let spec = platform("external", false);
         assert!(ensure_trino_auth_secrets(&ctx, &spec).await.is_none());
     }
-
 
     #[tokio::test]
     async fn the_catalog_network_policy_exists_only_for_lakekeeper() {
