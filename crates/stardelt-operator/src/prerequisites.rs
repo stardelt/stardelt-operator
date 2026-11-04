@@ -18,7 +18,7 @@ use k8s_openapi::{
 use kube::core::{DynamicObject, ObjectMeta, TypeMeta};
 use serde_json::json;
 
-use crate::{crd::Profile, objects::labels};
+use crate::{crd::Profile, network_policy, objects::labels};
 
 /// Secret every object-storage consumer reads (same keys as stardelt-platform).
 pub const S3_SECRET: &str = "stardelt-s3-creds";
@@ -628,6 +628,13 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
             ttl_seconds_after_finished: Some(600),
             backoff_limit: Some(4),
             template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(BTreeMap::from([(
+                        network_policy::BOOTSTRAP_POD_LABEL.to_string(),
+                        network_policy::BOOTSTRAP_POD_VALUE.to_string(),
+                    )])),
+                    ..ObjectMeta::default()
+                }),
                 spec: Some(PodSpec {
                     restart_policy: Some("OnFailure".into()),
                     automount_service_account_token: Some(false),
@@ -664,7 +671,6 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
                     }],
                     ..Default::default()
                 }),
-                ..Default::default()
             },
             ..Default::default()
         }),

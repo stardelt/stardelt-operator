@@ -40,9 +40,9 @@ use crate::provision::{
     ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
     ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
-    ensure_notebooks_bucket, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_pg_dumps,
-    ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
-    ensure_trino_config_maps,
+    ensure_lakekeeper_network_policy, ensure_notebooks_bucket, ensure_nova, ensure_nova_pg,
+    ensure_nova_session, ensure_pg_dumps, ensure_s3_secrets, ensure_superset_group_roles,
+    ensure_superset_rbac, ensure_superset_secrets, ensure_trino_config_maps,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -863,12 +863,21 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     } else {
         None
     };
+    // The ingress policy comes after the bootstrap: the bootstrap pod is one of its peers, and
+    // the policy also applies to pods that are already running. Once the bootstrap has run, the
+    // policy can only keep callers out, never the bootstrap itself.
+    let network_policy = if bootstrap.ready || lh.spec.dry_run {
+        ensure_lakekeeper_network_policy(&ctx, &lh, &namespace).await
+    } else {
+        None
+    };
     // The discovery ConfigMap is published last: it advertises a working catalog.
     let discovery = ensure_discovery(&ctx, &lh, &namespace, bootstrap.ready).await;
     let mut components = vec![s3, database];
     components.append(&mut outcome.components);
     components.extend(notebooks_bucket);
     components.extend(archive);
+    components.extend(network_policy);
     components.push(bootstrap);
     components.push(discovery);
     outcome.components = components;
@@ -1845,8 +1854,13 @@ mod tests {
             .iter()
             .position(|n| *n == "lakekeeper-bootstrap")
             .expect("the bootstrap");
+        let policy = names
+            .iter()
+            .position(|n| *n == "lakekeeper-network-policy")
+            .expect("the network policy step");
         assert!(bucket < archive);
-        assert_eq!(archive + 1, bootstrap, "{names:?}");
+        assert_eq!(archive + 1, policy, "{names:?}");
+        assert_eq!(policy + 1, bootstrap, "{names:?}");
     }
 
     #[tokio::test]
