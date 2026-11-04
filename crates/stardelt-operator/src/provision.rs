@@ -562,9 +562,7 @@ pub async fn ensure_archive(
                     .and_then(|s| s.succeeded)
                     .unwrap_or(0)
                     >= 1 => {}
-            Ok(_) => {
-                // Fall through to apply CronJob as per ticket
-            }
+            Ok(_) => return Some(status(NAME, false, "the archive bucket Job is running")),
         }
     }
     // The CronJob is applied on every reconcile: server-side apply converges it.
@@ -3408,18 +3406,41 @@ mod tests {
         )
         .await
         .expect("a status");
-        assert!(status.ready);
+        assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
-            Some("bucket lakehouse-backup exists; archive runs at 03:15")
+            Some("the archive bucket Job is running")
         );
         let name = archive_bucket_job_name(&s3_endpoint("data"));
         assert_eq!(
             applied_paths(&requests),
-            [
-                format!("/apis/batch/v1/namespaces/data/jobs/{name}"),
-                "/apis/batch/v1/namespaces/data/cronjobs/lakehouse-backup".to_string(),
-            ]
+            [format!("/apis/batch/v1/namespaces/data/jobs/{name}")]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_archive_waits_for_the_bucket_job_before_the_cron_job() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_archive(
+            &context(client),
+            &lakehouse_with_storage("seaweedfs", false),
+            "data",
+            &[],
+        )
+        .await
+        .expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("the archive bucket Job is running")
+        );
+        let name = archive_bucket_job_name(&s3_endpoint("data"));
+        let paths = applied_paths(&requests);
+        assert!(paths.contains(&format!("/apis/batch/v1/namespaces/data/jobs/{name}")));
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.contains("/cronjobs/lakehouse-backup"))
         );
     }
 
