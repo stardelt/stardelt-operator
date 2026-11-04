@@ -5,6 +5,7 @@
 //! small set of top-level resources into per-service operators and Helm
 //! releases. See the master spec §3 and §5.
 
+pub mod access_sync;
 pub mod airflow;
 pub mod connection;
 pub mod controller;

@@ -21,7 +21,7 @@ use kube::{
 };
 
 use crate::{
-    airflow,
+    access_sync, airflow,
     controller::Context,
     crd::{ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl},
     identity, ingress, keycloak, nova,
@@ -925,6 +925,140 @@ pub async fn ensure_airflow_group_roles(
         ));
     }
     Some(status(NAME, true, "applied: airflow-group-roles"))
+}
+
+/// The two ConfigMaps the warehouse half of the access sync writes (`trino-warehouses`,
+/// `trino-group-file`): created empty when they are absent, and **never** applied over an
+/// existing one — a server-side apply with force would blank the file the sync wrote
+/// (`make trino-warehouse-configmaps` in stardelt-platform has the same rule). `None`
+/// without the platform identity: the job reads the realm.
+pub async fn ensure_trino_config_maps(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "trino-configmaps";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let config_maps: Api<ConfigMap> = Api::namespaced(ctx.client.clone(), namespace);
+    let (mut created, mut kept) = (0, 0);
+    for desired in [
+        access_sync::warehouses_config_map(namespace),
+        access_sync::group_file_config_map(namespace),
+    ] {
+        match config_maps.get_opt(&desired.name_any()).await {
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+            Ok(Some(_)) => kept += 1,
+            Ok(None) => {
+                if let Err(e) =
+                    apply::<ConfigMap>(&ctx.client, namespace, &desired, spec.dry_run).await
+                {
+                    return Some(status(NAME, false, e.to_string()));
+                }
+                created += 1;
+            }
+        }
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): the ConfigMaps trino-warehouses and trino-group-file when absent",
+        ));
+    }
+    Some(status(
+        NAME,
+        true,
+        format!("created {created} / kept {kept}"),
+    ))
+}
+
+/// The CronJob that turns `Catalog` objects into Lakekeeper warehouses and `SqlWarehouse`
+/// objects into Trino resource groups (platform#305/#306/#312). Applied only when Secret
+/// `svc-catalog-operator` exists: it is the job's Lakekeeper credential, and a tick without
+/// it fails every two minutes. `None` without the platform identity.
+pub async fn ensure_access_sync(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "access-sync";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    if !spec.dry_run {
+        let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+        match secrets.get_opt(access_sync::CLIENT_SECRET).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Some(status(
+                    NAME,
+                    false,
+                    "waiting for Secret svc-catalog-operator",
+                ));
+            }
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        }
+    }
+    if let Err(e) = apply::<ServiceAccount>(
+        &ctx.client,
+        namespace,
+        &access_sync::service_account(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<ConfigMap>(
+        &ctx.client,
+        namespace,
+        &access_sync::script_config_map(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Role>(
+        &ctx.client,
+        namespace,
+        &access_sync::role(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        &ctx.client,
+        namespace,
+        &access_sync::binding(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<CronJob>(
+        &ctx.client,
+        namespace,
+        &access_sync::cron_job(namespace, &spec.identity.admin_group),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): ServiceAccount, ConfigMap, Role, RoleBinding and CronJob access-sync",
+        ));
+    }
+    Some(status(NAME, true, "applied: access-sync"))
 }
 
 /// The build of Nova the operator installs: the one `stardelt-platform` pins in
@@ -2801,5 +2935,79 @@ mod tests {
             applied_paths(&requests),
             ["/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg"]
         );
+    }
+
+    #[tokio::test]
+    async fn access_sync_waits_for_its_catalog_client() {
+        let (client, _store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("platform", false);
+        let status = ensure_access_sync(&ctx, &spec).await.expect("a status");
+        assert!(!status.ready);
+        assert_eq!(
+            status.message.as_deref(),
+            Some("waiting for Secret svc-catalog-operator")
+        );
+        assert_eq!(patch_count(&_requests), 0);
+    }
+
+    #[tokio::test]
+    async fn access_sync_applies_its_five_objects_when_the_client_exists() {
+        let (client, store, requests) = identity_client(BTreeMap::new());
+        let mut s = store.lock().expect("store poisoned");
+        s.insert(
+            "svc-catalog-operator".to_string(),
+            serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"svc-catalog-operator"}}),
+        );
+        drop(s);
+        let ctx = context(client);
+        let spec = platform("platform", false);
+        let status = ensure_access_sync(&ctx, &spec).await.expect("a status");
+        assert!(status.ready);
+        let paths = applied_paths(&requests);
+        assert!(
+            paths[paths.len() - 5..]
+                .iter()
+                .zip([
+                    "/serviceaccounts/access-sync",
+                    "/configmaps/access-sync",
+                    "/roles/access-sync",
+                    "/rolebindings/access-sync",
+                    "/cronjobs/access-sync",
+                ])
+                .all(|(p, s)| p.ends_with(s))
+        );
+    }
+
+    #[tokio::test]
+    async fn trino_config_maps_are_created_only_when_absent() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client.clone());
+        let spec = platform("platform", false);
+        let status = ensure_trino_config_maps(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        assert_eq!(status.message.as_deref(), Some("created 2 / kept 0"));
+        let count_before = patch_count(&requests);
+        assert!(count_before >= 2);
+
+        // second call with objects now in store
+        let ctx2 = context(client);
+        let status2 = ensure_trino_config_maps(&ctx2, &spec)
+            .await
+            .expect("a status");
+        assert!(status2.ready);
+        assert_eq!(status2.message.as_deref(), Some("created 0 / kept 2"));
+        assert_eq!(patch_count(&requests), count_before);
+    }
+
+    #[tokio::test]
+    async fn access_sync_is_absent_without_the_platform_identity() {
+        let (client, _store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("external", false);
+        assert!(ensure_access_sync(&ctx, &spec).await.is_none());
+        assert!(ensure_trino_config_maps(&ctx, &spec).await.is_none());
     }
 }

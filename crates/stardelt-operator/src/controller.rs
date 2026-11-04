@@ -37,11 +37,12 @@ use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, p
 use crate::prerequisites::CATALOG_CLUSTER;
 use crate::principal::reconcile_principal;
 use crate::provision::{
-    ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets, ensure_bootstrap,
-    ensure_catalog_database, ensure_discovery, ensure_identity, ensure_identity_secrets,
-    ensure_ingress, ensure_keycloak, ensure_keycloak_pg, ensure_notebooks_bucket, ensure_nova,
-    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets, ensure_superset_group_roles,
-    ensure_superset_rbac, ensure_superset_secrets,
+    ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
+    ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
+    ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
+    ensure_notebooks_bucket, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
+    ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
+    ensure_trino_config_maps,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -961,6 +962,13 @@ async fn reconcile_platform(
     // The identity contract is published after the components it points the others to.
     if let Some(identity) = ensure_identity(&ctx, &instance.spec).await {
         outcome.components.push(identity);
+    }
+    // The catalog loop: the two ConfigMaps it writes first, then the CronJob that needs them.
+    if let Some(config_maps) = ensure_trino_config_maps(&ctx, &instance.spec).await {
+        outcome.components.push(config_maps);
+    }
+    if let Some(sync) = ensure_access_sync(&ctx, &instance.spec).await {
+        outcome.components.push(sync);
     }
     // Nova comes last: its database and its session key first, then the workload that reads
     // them, the object-store keys of the Lakehouse and the identity contract above.
