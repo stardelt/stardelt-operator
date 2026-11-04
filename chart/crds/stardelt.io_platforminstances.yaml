@@ -235,6 +235,20 @@ spec:
                 - full
                 - airgap
                 type: string
+              secrets:
+                default:
+                  mode: none
+                description: Where the credentials of `Connection` objects come from; see [`SecretsSpec`].
+                properties:
+                  mode:
+                    default: none
+                    description: Which secret store the platform uses for user credentials (decision D23).
+                    enum:
+                    - none
+                    - platform
+                    - external
+                    type: string
+                type: object
               set:
                 additionalProperties:
                   additionalProperties:

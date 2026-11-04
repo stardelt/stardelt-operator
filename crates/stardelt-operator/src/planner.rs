@@ -4,7 +4,7 @@
 
 use crate::crd::{
     CatalogImpl, IngestionDomain, IngestionSourceSpec, LakehouseSpec, PipelineEngine, PipelineSpec,
-    PlatformInstanceSpec, StorageImpl, TaskKind,
+    PlatformInstanceSpec, SecretsMode, StorageImpl, TaskKind,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,6 +24,15 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
         name: "cnpg",
         chart: Some("cnpg/cloudnative-pg"),
     }];
+    // The secrets contract (decision D23): External Secrets is the one component that talks to a
+    // store, so it comes before any component whose pods read a synced Secret. `none` installs
+    // nothing; the store itself (platform mode) is planned by the secrets ticket that follows.
+    if spec.secrets.mode != SecretsMode::None {
+        plan.push(ComponentPlan {
+            name: "external-secrets",
+            chart: Some("external-secrets/external-secrets"),
+        });
+    }
     if spec.pillars.notebooks {
         plan.push(ComponentPlan {
             name: "jupyterhub",
@@ -164,6 +173,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "apache-airflow/airflow" => Some("1.21.0"),
         "superset/superset" => Some("0.15.5"),
         "openfga/openfga" => Some("0.2.62"),
+        "external-secrets/external-secrets" => Some("2.13.0"),
         _ => None,
     }
 }
@@ -180,6 +190,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "apache-airflow/airflow" => Some("https://airflow.apache.org"),
         "superset/superset" => Some("https://apache.github.io/superset"),
         "openfga/openfga" => Some("https://openfga.github.io/helm-charts"),
+        "external-secrets/external-secrets" => Some("https://charts.external-secrets.io"),
         _ => None,
     }
 }
@@ -190,7 +201,8 @@ mod tests {
 
     use super::*;
     use crate::crd::{
-        CatalogSpec, Pillars, PipelineConcurrency, PipelineTask, PlatformInstanceSpec, StorageSpec,
+        CatalogSpec, Pillars, PipelineConcurrency, PipelineTask, PlatformInstanceSpec, SecretsMode,
+        SecretsSpec, StorageSpec,
     };
 
     fn spec(catalog: CatalogImpl, storage: StorageImpl) -> LakehouseSpec {
@@ -268,6 +280,7 @@ mod tests {
             namespace: "stardelt".into(),
             base_domain: None,
             identity: Default::default(),
+            secrets: Default::default(),
             ingress: Default::default(),
         };
         assert!(!without.pillars.notebooks, "notebooks stay opt-in");
@@ -284,6 +297,62 @@ mod tests {
     }
 
     #[test]
+    fn secrets_none_plans_no_external_secrets() {
+        let base = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            secrets: Default::default(),
+            ingress: Default::default(),
+        };
+        assert_eq!(names(&plan_platform(&base)), vec!["cnpg"]);
+    }
+
+    #[test]
+    fn external_secrets_comes_before_the_pillars() {
+        let base = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            secrets: Default::default(),
+            ingress: Default::default(),
+        };
+        for mode in [SecretsMode::Platform, SecretsMode::External] {
+            let plan = plan_platform(&PlatformInstanceSpec {
+                secrets: SecretsSpec { mode },
+                pillars: Pillars {
+                    notebooks: true,
+                    ..Default::default()
+                },
+                ..base.clone()
+            });
+            assert_eq!(
+                names(&plan),
+                vec!["cnpg", "external-secrets", "jupyterhub"],
+                "mode {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_secrets_is_pinned_at_the_platform_version_and_repo() {
+        let chart = "external-secrets/external-secrets";
+        assert_eq!(chart_version(chart), Some("2.13.0"));
+        assert_eq!(
+            chart_repo(chart),
+            Some("https://charts.external-secrets.io")
+        );
+    }
+
+    #[test]
     fn pipelines_pillar_adds_airflow_to_the_platform_plan() {
         let base = PlatformInstanceSpec {
             profile: Default::default(),
@@ -293,6 +362,7 @@ mod tests {
             namespace: "stardelt".into(),
             base_domain: None,
             identity: Default::default(),
+            secrets: Default::default(),
             ingress: Default::default(),
         };
         assert!(!base.pillars.pipelines, "pipelines stay opt-in");
@@ -335,6 +405,7 @@ mod tests {
             namespace: "stardelt".into(),
             base_domain: None,
             identity: Default::default(),
+            secrets: Default::default(),
             ingress: Default::default(),
         };
         assert!(!base.pillars.dashboards, "dashboards stay opt-in");
@@ -368,6 +439,7 @@ mod tests {
             namespace: "stardelt".into(),
             base_domain: None,
             identity: Default::default(),
+            secrets: Default::default(),
             ingress: Default::default(),
         };
         assert_eq!(names(&plan_platform(&pi)), vec!["cnpg"]);
@@ -407,6 +479,7 @@ mod tests {
             namespace: "stardelt".into(),
             base_domain: None,
             identity: Default::default(),
+            secrets: Default::default(),
             ingress: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
@@ -433,6 +506,7 @@ mod tests {
             namespace: "stardelt".into(),
             base_domain: None,
             identity: Default::default(),
+            secrets: Default::default(),
             ingress: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))

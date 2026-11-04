@@ -357,6 +357,26 @@ impl Default for IngressTls {
     }
 }
 
+/// Which secret store the platform uses for user credentials (decision D23).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretsMode {
+    /// Kubernetes Secrets by hand; a `Connection` references one. Nothing is installed.
+    #[default]
+    None,
+    /// The platform runs a store; External Secrets syncs from it.
+    Platform,
+    /// The enterprise's own store; External Secrets syncs from it. The store is the administrator's.
+    External,
+}
+
+/// `PlatformInstance.spec.secrets`: where the credentials of `Connection` objects come from.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+pub struct SecretsSpec {
+    #[serde(default)]
+    pub mode: SecretsMode,
+}
+
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -415,6 +435,9 @@ pub struct PlatformInstanceSpec {
     /// How users sign in; see [`IdentitySpec`].
     #[serde(default)]
     pub identity: IdentitySpec,
+    /// Where the credentials of `Connection` objects come from; see [`SecretsSpec`].
+    #[serde(default)]
+    pub secrets: SecretsSpec,
     /// How the applications are reached from outside the cluster; see [`IngressSettings`].
     #[serde(default)]
     pub ingress: IngressSettings,
@@ -3448,6 +3471,30 @@ mod tests {
                 .unwrap_err()
                 .contains("keyPrefix")
         );
+    }
+
+    #[test]
+    fn platform_instance_defaults_secrets_to_none() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {}
+        }))
+        .expect("deserialize PlatformInstance");
+        assert_eq!(pi.spec.secrets.mode, SecretsMode::None, "a CR without spec.secrets installs no secret store");
+    }
+
+    #[test]
+    fn platform_instance_parses_the_secrets_mode() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": { "secrets": { "mode": "external" } }
+        }))
+        .expect("deserialize PlatformInstance");
+        assert_eq!(pi.spec.secrets.mode, SecretsMode::External);
     }
 
     #[test]
