@@ -40,7 +40,8 @@ pub struct Pillars {
     #[serde(default)]
     pub pipelines: bool,
     /// BI dashboards (Superset). Off by default: it brings a metadata database, Redis and
-    /// three long-running pods; until O7b it signs in the local administrator only.
+    /// three long-running pods. People sign in through the platform IdP, with the local
+    /// administrator kept as break-glass; each group sees the dashboards its catalog role allows.
     #[serde(default)]
     pub dashboards: bool,
     #[serde(default)]

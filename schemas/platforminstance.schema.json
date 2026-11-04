@@ -221,7 +221,7 @@
             },
             "dashboards": {
               "default": false,
-              "description": "BI dashboards (Superset). Off by default: it brings a metadata database, Redis and\nthree long-running pods; until O7b it signs in the local administrator only.",
+              "description": "BI dashboards (Superset). Off by default: it brings a metadata database, Redis and\nthree long-running pods. People sign in through the platform IdP, with the local\nadministrator kept as break-glass; each group sees the dashboards its catalog role allows.",
               "type": "boolean"
             },
             "lakehouse": {
