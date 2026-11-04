@@ -40,8 +40,8 @@ use crate::provision::{
     ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
     ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
-    ensure_notebooks_bucket, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_s3_secrets,
-    ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
+    ensure_notebooks_bucket, ensure_nova, ensure_nova_pg, ensure_nova_session, ensure_pg_dumps,
+    ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
     ensure_trino_config_maps,
 };
 use crate::values::{effective_values, parse_values_document};
@@ -941,6 +941,10 @@ async fn reconcile_platform(
     }
     if let Some(job) = ensure_airflow_group_roles(&ctx, &instance.spec).await {
         outcome.components.push(job);
+    }
+    // The app databases' dumps: they read the releases' Secrets and upload with the Lakehouse keys.
+    if let Some(dumps) = ensure_pg_dumps(&ctx, &instance.spec).await {
+        outcome.components.push(dumps);
     }
     if let Some(job) = ensure_superset_group_roles(&ctx, &instance.spec).await {
         outcome.components.push(job);

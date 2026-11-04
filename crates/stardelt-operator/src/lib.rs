@@ -17,6 +17,7 @@ pub mod ingress;
 pub mod keycloak;
 pub mod nova;
 pub mod objects;
+pub mod pg_dump;
 pub mod planner;
 pub mod prerequisites;
 pub mod principal;

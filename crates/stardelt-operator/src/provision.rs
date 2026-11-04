@@ -29,6 +29,7 @@ use crate::{
         apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
         owner_reference,
     },
+    pg_dump,
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, NOVA_CLUSTER, S3_CONFIG_SECRET, S3_SECRET, S3Keys,
         S3Location, bootstrap_job, bootstrap_job_name, catalog_cluster, catalog_pg_backup,
@@ -724,6 +725,63 @@ pub async fn ensure_superset_secrets(
         return None;
     }
     Some(ensure_generated_secrets(ctx, spec, "superset-secrets", &superset::SECRETS).await)
+}
+
+/// The nightly dumps of the Airflow and Superset databases (O8). Each CronJob needs its
+/// pillar; the whole step needs the `lakehouse` pillar, because the dump is uploaded to the
+/// `backups` bucket with the Lakehouse's S3 keys ([`S3_SECRET`]). No waiting: a job that fires
+/// while the chart is still starting fails once, and the next window is a day away.
+pub async fn ensure_pg_dumps(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "pg-dumps";
+    if !spec.pillars.lakehouse {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let mut applied = Vec::new();
+    if spec.pillars.dashboards {
+        if let Err(e) = apply::<CronJob>(
+            &ctx.client,
+            namespace,
+            &pg_dump::superset_cron_job(namespace),
+            spec.dry_run,
+        )
+        .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        applied.push(pg_dump::SUPERSET_JOB);
+    }
+    if spec.pillars.pipelines {
+        if let Err(e) = apply::<CronJob>(
+            &ctx.client,
+            namespace,
+            &pg_dump::airflow_cron_job(namespace),
+            spec.dry_run,
+        )
+        .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        applied.push(pg_dump::AIRFLOW_JOB);
+    }
+    if applied.is_empty() {
+        return None;
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): {}", applied.join(", ")),
+        ));
+    }
+    Some(status(
+        NAME,
+        true,
+        format!("applied: {}", applied.join(", ")),
+    ))
 }
 
 /// The `superset` ServiceAccount, the Catalogs read Role and its binding. **Must be applied
@@ -2608,6 +2666,65 @@ mod tests {
         assert!(status.ready, "{status:?}");
         assert_eq!(status.message.as_deref(), Some("ready: created 3 / kept 0"));
         assert_eq!(patch_count(&requests), 3);
+    }
+
+    #[tokio::test]
+    async fn pg_dumps_follow_the_two_pillars() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let ctx = context(client);
+        assert!(
+            ensure_pg_dumps(&ctx, &platform_with_dashboards(false, false))
+                .await
+                .is_none()
+        );
+        let (client, requests) = keycloak_client(&[], None);
+        let mut spec = platform_with_apps(false, false, false);
+        spec.pillars.dashboards = true;
+        let status = ensure_pg_dumps(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert_eq!(status.message.as_deref(), Some("applied: superset-pg-dump"));
+        assert!(status.ready, "{status:?}");
+        assert_eq!(
+            applied_paths(&requests),
+            vec!["/apis/batch/v1/namespaces/stardelt/cronjobs/superset-pg-dump".to_string()]
+        );
+        let (client, requests) = keycloak_client(&[], None);
+        let mut spec = platform_with_apps(true, false, false);
+        spec.pillars.dashboards = true;
+        let status = ensure_pg_dumps(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert_eq!(
+            status.message.as_deref(),
+            Some("applied: superset-pg-dump, airflow-pg-dump")
+        );
+        assert!(status.ready, "{status:?}");
+        assert_eq!(
+            applied_paths(&requests),
+            vec![
+                "/apis/batch/v1/namespaces/stardelt/cronjobs/superset-pg-dump".to_string(),
+                "/apis/batch/v1/namespaces/stardelt/cronjobs/airflow-pg-dump".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn pg_dumps_dry_run_applies_with_dry_run_and_writes_nothing() {
+        let (client, _requests) = keycloak_client(&[], None);
+        let mut spec = platform_with_apps(true, false, true);
+        spec.pillars.dashboards = true;
+        let status = ensure_pg_dumps(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .unwrap()
+                .starts_with("planned (dry-run):")
+        );
+        assert!(!status.ready);
     }
 
     #[tokio::test]
