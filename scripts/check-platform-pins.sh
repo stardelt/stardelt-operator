@@ -6,6 +6,7 @@
 #
 #   bash scripts/check-platform-pins.sh                     # compares against platform main
 #   PLATFORM_MAKEFILE=../stardelt-platform/Makefile bash scripts/check-platform-pins.sh
+# The platform Makefile mixes := and ?=; both are read.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -29,13 +30,15 @@ declare -A PREFIX_OF=(
   [trino/trino]=TRINO
   [jupyterhub/jupyterhub]=JUPYTERHUB
   [apache-airflow/airflow]=AIRFLOW
+  [superset/superset]=SUPERSET
+  [openfga/openfga]=OPENFGA
 )
 
 status=0
 while IFS= read -r chart; do
   prefix="${PREFIX_OF[$chart]}"
   planner_version="$(sed -n "s|^[[:space:]]*\"${chart}\"[[:space:]]*=>[[:space:]]*Some(\"\([^\"]*\)\").*|\1|p" "$PLANNER" | head -n 1)"
-  make_version="$(sed -n "s/^${prefix}_VERSION[[:space:]]*:=[[:space:]]*\([^[:space:]#]*\).*/\1/p" "$makefile")"
+  make_version="$(sed -n "s/^${prefix}_VERSION[[:space:]]*[^[:space:]=]*=[[:space:]]*\([^[:space:]#]*\).*/\1/p" "$makefile")"
   if [[ -z "$planner_version" || -z "$make_version" ]]; then
     echo "✗ $chart: missing pin (planner='${planner_version}', platform Makefile='${make_version}')" >&2
     status=1
