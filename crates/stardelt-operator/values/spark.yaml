@@ -1,0 +1,53 @@
+# The Spark Connect endpoint (stardelt-platform/manifests/spark.yaml). Not Helm values: Spark has
+# no chart in the operator, so this file is the single source for the image digest and the
+# ConfigMap body. `spark.rs` parses it and replaces the namespace placeholder in the defaults.
+image: ghcr.io/stardelt/spark:dev@sha256:a36a9a8f1a8aff53c4e35b71902e78a8d4d2f71c87abd9448e2c6b2c9c987e61
+defaults: |
+  spark.master                                            k8s://https://kubernetes.default.svc
+  spark.kubernetes.namespace                              __NAMESPACE__
+  # Executors are built from the same image as the driver: Spark 4.1 plus the
+  # Iceberg runtime and AWS bundle (images/spark/Dockerfile).
+  # Single space before the digest: the pinned reference is 136 characters,
+  # just inside the 140 the YAML lint allows.
+  spark.kubernetes.container.image ghcr.io/stardelt/spark:dev@sha256:a36a9a8f1a8aff53c4e35b71902e78a8d4d2f71c87abd9448e2c6b2c9c987e61
+  spark.kubernetes.container.image.pullPolicy             IfNotPresent
+  spark.kubernetes.container.image.pullSecrets            ghcr-creds
+  spark.kubernetes.authenticate.executor.serviceAccountName spark-connect
+  # The driver needs permission to create/delete executor pods and services; the Role
+  # is bound to ServiceAccount spark-connect. RBAC is namespaced.
+  spark.kubernetes.driver.pod.name                       spark-connect
+  spark.kubernetes.driver.label.app.kubernetes.io/name   spark-connect
+  spark.kubernetes.executor.label.app.kubernetes.io/name spark-connect
+  spark.kubernetes.executor.podNamePrefix                spark-connect-exec
+  spark.kubernetes.namespace.labels                      app.kubernetes.io/part-of=stardelt
+  spark.sql.extensions                                   org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+  spark.sql.catalog.spark_catalog                        org.apache.iceberg.spark.SparkCatalog
+  spark.sql.catalog.spark_catalog.type                   hive
+  spark.sql.catalog.spark_catalog.uri                    thrift://hive-metastore:9083
+  spark.sql.catalog.spark_catalog.warehouse              s3a://warehouse/
+  spark.sql.catalog.spark_catalog.io-impl                org.apache.iceberg.aws.s3.S3FileIO
+  spark.sql.catalog.spark_catalog.s3.endpoint            http://seaweedfs-s3:8333
+  spark.sql.catalog.spark_catalog.s3.path-style-access   true
+  spark.sql.catalog.spark_catalog.s3.ssl.enabled         false
+  spark.sql.defaultCatalog                               spark_catalog
+  spark.hadoop.fs.s3a.endpoint                           http://seaweedfs-s3:8333
+  spark.hadoop.fs.s3a.path.style.access                  true
+  spark.hadoop.fs.s3a.connection.ssl.enabled             false
+  spark.hadoop.fs.s3a.impl                               org.apache.hadoop.fs.s3a.S3AFileSystem
+  spark.hadoop.fs.s3a.aws.credentials.provider           org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider
+  spark.hadoop.fs.s3a.access.key                         ${env:AWS_ACCESS_KEY_ID}
+  spark.hadoop.fs.s3a.secret.key                         ${env:AWS_SECRET_ACCESS_KEY}
+  spark.eventLog.enabled                                 true
+  spark.eventLog.dir                                     s3a://spark-events/
+  spark.history.fs.logDirectory                          s3a://spark-events/
+  spark.sql.adaptive.enabled                             true
+  spark.sql.adaptive.coalescePartitions.enabled          true
+  spark.driver.memory                                    1g
+  spark.executor.instances                               2
+  spark.executor.cores                                   2
+  spark.executor.memory                                  2g
+  spark.driver.bindAddress                               0.0.0.0
+  spark.driver.host                                      ${env:POD_IP}
+  spark.ui.enabled                                       false
+  spark.connect.grpc.binding.host                        0.0.0.0
+  spark.connect.grpc.binding.port                         15002
