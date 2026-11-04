@@ -357,11 +357,13 @@ pub fn discovery_config_map_name(lakehouse: &str) -> String {
 /// `<lakehouse>-discovery`: the connection contract of a Lakehouse. Consumers (notebooks,
 /// jobs, dashboards, external tools) read these keys instead of hard-coding hostnames.
 /// The URLs are fully qualified, so they resolve from any namespace. No credentials:
-/// those stay in Secret `stardelt-s3-creds`.
+/// those stay in Secret `stardelt-s3-creds`. `trino_url` comes from `identity::trino_url`:
+/// the HTTPS listener when Trino authenticates, the plain endpoint otherwise.
 pub fn discovery_config_map(
     lakehouse: &str,
     namespace: &str,
     s3: &S3Location,
+    trino_url: &str,
     owner: OwnerReference,
 ) -> ConfigMap {
     let mut metadata = meta(
@@ -383,10 +385,7 @@ pub fn discovery_config_map(
             ("s3Endpoint", s3.endpoint.clone()),
             ("s3Bucket", s3.bucket.clone()),
             ("s3Region", s3.region.clone()),
-            (
-                "trinoUrl",
-                format!("http://trino.{namespace}.svc.cluster.local:8080"),
-            ),
+            ("trinoUrl", trino_url.to_string()),
             ("trinoCatalog", WAREHOUSE.to_string()),
         ]),
         ..Default::default()
@@ -1273,7 +1272,13 @@ mod tests {
             name: "main".into(),
             ..Default::default()
         };
-        let cm = discovery_config_map("main", "data", &location(), owner);
+        let cm = discovery_config_map(
+            "main",
+            "data",
+            &location(),
+            "https://trino.data.svc.cluster.local:8443",
+            owner,
+        );
         assert_eq!(cm.metadata.name.as_deref(), Some("main-discovery"));
         assert_eq!(cm.metadata.namespace.as_deref(), Some("data"));
         let labels = cm.metadata.labels.as_ref().unwrap();
@@ -1294,7 +1299,7 @@ mod tests {
             ),
             ("s3Bucket", "lakehouse"),
             ("s3Region", "us-east-1"),
-            ("trinoUrl", "http://trino.data.svc.cluster.local:8080"),
+            ("trinoUrl", "https://trino.data.svc.cluster.local:8443"),
             ("trinoCatalog", "warehouse"),
         ];
         assert_eq!(data.len(), expected.len(), "unexpected keys: {data:?}");
@@ -1305,7 +1310,13 @@ mod tests {
 
     #[test]
     fn discovery_config_map_holds_no_credential() {
-        let cm = discovery_config_map("main", "data", &location(), OwnerReference::default());
+        let cm = discovery_config_map(
+            "main",
+            "data",
+            &location(),
+            "https://trino.data.svc.cluster.local:8443",
+            OwnerReference::default(),
+        );
         for key in cm.data.unwrap().keys() {
             let key = key.to_lowercase();
             assert!(

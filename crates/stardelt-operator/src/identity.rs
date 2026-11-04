@@ -159,6 +159,18 @@ pub(crate) fn hosts(domain: &str) -> Hosts {
     }
 }
 
+/// The in-cluster Trino URL components read. With an authenticator on (`operator#215`) the
+/// only endpoint that answers is the HTTPS listener; without one, Trino keeps the plain
+/// development endpoint. The name is in the coordinator certificate's SANs
+/// (`provision.rs::trino_coordinator_certificate`) and Nova mounts Secret `trino-ca`.
+pub fn trino_url(namespace: &str, authenticated: bool) -> String {
+    if authenticated {
+        format!("https://trino.{namespace}.svc.cluster.local:8443")
+    } else {
+        format!("http://trino.{namespace}.svc.cluster.local:8080")
+    }
+}
+
 /// The data of ConfigMap `stardelt-identity`, or `None` when sign-in is off (no ConfigMap exists
 /// then; components read its absence as "no identity provider").
 pub fn contract(
@@ -180,6 +192,9 @@ pub fn contract(
         // Nova answers on the base domain itself; every other application on a subdomain.
         ("publicUrl".to_string(), format!("https://{domain}")),
     ]);
+    // A contract exists only when sign-in is on, which is exactly when Trino's identity
+    // overlay (`values/trino-identity.yaml`) is applied — so this is the HTTPS listener.
+    data.insert("trinoUrl".to_string(), trino_url(&spec.namespace, true));
     if spec.identity.mode == IdentityMode::External {
         let provider = match spec.identity.provider {
             IdentityProvider::Oidc => "oidc",
@@ -200,7 +215,9 @@ pub fn contract(
 ///
 /// It carries no owner reference: uninstalling the platform keeps the contract (decision D18,
 /// `deletionPolicy: Retain`), and the chart or `scripts/identity-bootstrap.sh` may already own
-/// other keys of the same object (for example `trinoUrl`), which server-side apply leaves alone.
+/// other keys of the same object, which server-side apply leaves alone;
+/// `trinoUrl` is the operator's own field and is taken over on a namespace cut over from the
+/// platform's scripts.
 pub fn config_map(
     spec: &PlatformInstanceSpec,
     namespace: &str,
@@ -517,6 +534,23 @@ mod tests {
         assert_eq!(data["authMode"], "oidc");
         assert_eq!(data["groupClaim"], "groups");
         assert_eq!(data["adminGroup"], "stardelt-admins");
+    }
+
+    #[test]
+    fn contract_points_nova_at_the_tls_endpoint() {
+        let s: PlatformInstanceSpec = serde_json::from_value(serde_json::json!({
+            "namespace": "data",
+            "baseDomain": "alpha.example.com",
+            "identity": {"mode": "platform"},
+        }))
+        .expect("a PlatformInstanceSpec");
+        let data = contract(&s).unwrap().unwrap();
+        assert_eq!(
+            data["trinoUrl"],
+            "https://trino.data.svc.cluster.local:8443"
+        );
+        // Without sign-in there is no contract, so Nova keeps its development default.
+        assert_eq!(contract(&spec(IdentitySpec::default(), None)), Ok(None));
     }
 
     #[test]

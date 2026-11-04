@@ -625,6 +625,7 @@ pub async fn ensure_discovery(
     lh: &Lakehouse,
     namespace: &str,
     bootstrapped: bool,
+    identity: bool,
 ) -> ComponentStatus {
     const NAME: &str = "discovery";
     if lh.spec.dry_run {
@@ -649,7 +650,14 @@ pub async fn ensure_discovery(
         Err(e) => return status(NAME, false, e.to_string()),
     };
     let lakehouse = lh.name_any();
-    let config_map = discovery_config_map(&lakehouse, namespace, &location, owner_reference(lh));
+    let trino_url = crate::identity::trino_url(namespace, identity);
+    let config_map = discovery_config_map(
+        &lakehouse,
+        namespace,
+        &location,
+        &trino_url,
+        owner_reference(lh),
+    );
     match apply::<ConfigMap>(&ctx.client, namespace, &config_map, false).await {
         Ok(_) => status(
             NAME,
@@ -1974,7 +1982,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_is_published_once_the_warehouse_is_bootstrapped() {
         let (client, requests) = mock_client(true);
-        let status = ensure_discovery(&context(client), &lakehouse(), "data", true).await;
+        let status = ensure_discovery(&context(client), &lakehouse(), "data", true, false).await;
         assert!(status.ready, "{status:?}");
         assert_eq!(status.name, "discovery");
         assert_eq!(
@@ -2006,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_waits_for_the_bootstrap_and_touches_nothing() {
         let (client, requests) = mock_client(true);
-        let status = ensure_discovery(&context(client), &lakehouse(), "data", false).await;
+        let status = ensure_discovery(&context(client), &lakehouse(), "data", false, false).await;
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -2018,7 +2026,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_waits_for_the_s3_secret() {
         let (client, requests) = mock_client(false);
-        let status = ensure_discovery(&context(client), &lakehouse(), "data", true).await;
+        let status = ensure_discovery(&context(client), &lakehouse(), "data", true, false).await;
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
