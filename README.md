@@ -63,6 +63,23 @@ spec:
   dryRun: true                      # plan first; flip to apply
 ```
 
+### Secrets
+
+`PlatformInstance.spec.secrets.mode` says where the credentials of `Connection` objects come from
+(decision D23): `none` (default — Kubernetes Secrets by hand), `platform` (the platform runs a
+store) or `external` (the enterprise's own store). Every mode but `none` installs External Secrets
+Operator (`external-secrets/external-secrets`, pinned like every other chart); it is the one
+component that talks to a store, and it renders each `Connection` into the Secret `conn-<name>`.
+
+```yaml
+spec:
+  secrets:
+    mode: external        # none (default) | platform | external
+```
+
+Platform mode also installs the store itself; until that lands, `platform` installs External
+Secrets only and the store is the administrator's.
+
 A complete Entra instance is in
 [`examples/platforminstance-external-entra.yaml`](examples/platforminstance-external-entra.yaml):
 all ids are fake, and nothing in it is a secret value — `clientSecretRef` names a Secret in the

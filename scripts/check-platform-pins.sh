@@ -32,6 +32,7 @@ declare -A PREFIX_OF=(
   [apache-airflow/airflow]=AIRFLOW
   [superset/superset]=SUPERSET
   [openfga/openfga]=OPENFGA
+  [external-secrets/external-secrets]=EXTERNAL_SECRETS
 )
 
 status=0

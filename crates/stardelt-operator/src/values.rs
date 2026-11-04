@@ -69,6 +69,11 @@ pub fn golden_values(component: &str) -> Value {
         // it has no namespace-qualified address (the DSN comes from Secret `openfga-pg-app`).
         "openfga" => serde_yaml::from_str(include_str!("../values/openfga.yaml"))
             .expect("values/openfga.yaml is not valid YAML"),
+        // The secrets contract (decision D23): External Secrets Operator, verbatim from
+        // stardelt-platform/helm-values/external-secrets.yaml — its three workloads are small and the
+        // resource requests are the platform's.
+        "external-secrets" => serde_yaml::from_str(include_str!("../values/external-secrets.yaml"))
+            .expect("values/external-secrets.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }
