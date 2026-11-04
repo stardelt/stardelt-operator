@@ -51,8 +51,16 @@ pub fn golden_values(component: &str) -> Value {
         // addresses and no Reloader annotation (see the header of the file).
         "airflow" => serde_yaml::from_str(include_str!("../values/airflow.yaml"))
             .expect("values/airflow.yaml is not valid YAML"),
-        "superset" => serde_yaml::from_str(include_str!("../values/superset.yaml"))
-            .expect("values/superset.yaml is not valid YAML"),
+        // The `dashboards` pillar: the platform's helm-values/superset.yaml with short in-cluster
+        // addresses and no Reloader. The OIDC/login snippet is injected here because it is a Python
+        // file, like `jupyterhub_oidc.py` (values/superset.yaml deliberately omits it).
+        "superset" => {
+            let mut values: Value = serde_yaml::from_str(include_str!("../values/superset.yaml"))
+                .expect("values/superset.yaml is not valid YAML");
+            values["configOverrides"]["oauth"] =
+                Value::String(include_str!("superset_oidc.py").into());
+            values
+        }
         _ => Value::Object(Map::new()),
     }
 }
@@ -691,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn the_golden_superset_values_pin_the_image_and_stay_admin_only() {
+    fn superset_golden_values_pin_the_image_and_carry_sign_in() {
         let values = golden_values("superset");
         assert_eq!(
             values["image"]["repository"],
@@ -705,14 +713,37 @@ mod tests {
         );
         let config_overrides = values["configOverrides"].as_object().unwrap();
         assert!(config_overrides.contains_key("iframe_embedding"));
-        assert!(config_overrides.contains_key("password_store"));
-        assert!(!config_overrides.contains_key("oauth"));
+        assert!(!config_overrides.contains_key("password_store"));
+        let oauth = values["configOverrides"]["oauth"].as_str().unwrap();
+        assert_eq!(oauth, include_str!("superset_oidc.py"));
+        assert!(oauth.contains("AUTH_TYPE = AUTH_OAUTH"));
+        assert!(oauth.contains("_AuthRolesMapping"));
+        assert!(oauth.contains("CUSTOM_SECURITY_MANAGER"));
+        assert!(oauth.contains("STARDELT_SUPERSET_CLIENT_SECRET"));
+        assert!(oauth.contains("CACHE_IMPERSONATION"));
+        assert!(oauth.contains("SQLALCHEMY_CUSTOM_PASSWORD_STORE = _stardelt_password_store"));
         let text = include_str!("../values/superset.yaml");
+        assert!(!text.contains("password_store"));
         assert!(!text.contains("AUTH_TYPE"));
-        assert!(!text.contains("OAUTH_PROVIDERS"));
-        assert!(!text.contains("AUTH_USER_REGISTRATION"));
-        assert!(!text.contains("_AuthRolesMapping"));
-        assert!(!text.contains("stardelt-identity"));
+        let extra_env = values["extraEnvRaw"].as_array().unwrap();
+        let issuer = extra_env
+            .iter()
+            .find(|e| e["name"] == "STARDELT_OIDC_ISSUER")
+            .unwrap();
+        assert_eq!(
+            issuer["valueFrom"]["configMapKeyRef"]["name"],
+            "stardelt-identity"
+        );
+        assert_eq!(issuer["valueFrom"]["configMapKeyRef"]["key"], "issuerUrl");
+        let secret = extra_env
+            .iter()
+            .find(|e| e["name"] == "STARDELT_SUPERSET_CLIENT_SECRET")
+            .unwrap();
+        assert_eq!(
+            secret["valueFrom"]["secretKeyRef"]["name"],
+            "stardelt-oidc-clients"
+        );
+        assert_eq!(secret["valueFrom"]["secretKeyRef"]["key"], "superset");
         assert!(!text.contains("superset-analyst-role.py"));
         assert!(!text.contains("superset-group-roles.py"));
         let init_script = values["init"]["initscript"].as_str().unwrap();

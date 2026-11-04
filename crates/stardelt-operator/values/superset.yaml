@@ -1,8 +1,9 @@
 # Apache Superset — BI / dashboards.
 # Chart: superset/superset 0.15.5, appVersion 5.0.0.
 #
-# Curated by the operator for admin-only install (O7a): OIDC and group scoping
-# are added by O7b. The pod reads credentials from Secrets via extraEnvRaw.
+# Curated by the operator for the dashboards pillar: the local administrator stays as
+# break-glass; people sign in through the platform IdP (O7b). Group roles come from
+# `src/superset.rs` (O7b, part 2). The pod reads credentials from Secrets via extraEnvRaw.
 
 image:
   repository: ghcr.io/stardelt/superset
@@ -28,23 +29,7 @@ configOverrides:
     SESSION_COOKIE_SAMESITE = "Lax"
     ENABLE_PROXY_FIX = True
 
-  password_store: |
-    import os
-    from superset.config import SECRET_KEY
 
-
-    def AUTH_DB_PASSWORD_STORE(url):
-        # Superset calls this only when the URI lacks a password. The Trino
-        # service account password is stored in Secret trino-password-db and
-        # injected as TRINO_SUPERSET_PASSWORD via extraEnvRaw.
-        if url.drivername == "trino":
-            password = os.environ.get("TRINO_SUPERSET_PASSWORD")
-            if password:
-                url = url.set(password=password)
-        return url
-
-
-    SQLALCHEMY_CUSTOM_PASSWORD_STORE = AUTH_DB_PASSWORD_STORE
 
 extraEnvRaw:
   - name: SUPERSET_SECRET_KEY
@@ -62,6 +47,30 @@ extraEnvRaw:
       secretKeyRef:
         name: trino-password-db
         key: password
+        optional: true
+  - name: STARDELT_PUBLIC_URL
+    valueFrom:
+      configMapKeyRef:
+        name: stardelt-identity
+        key: publicUrl
+        optional: true
+  - name: STARDELT_OIDC_ISSUER
+    valueFrom:
+      configMapKeyRef:
+        name: stardelt-identity
+        key: issuerUrl
+        optional: true
+  - name: STARDELT_ADMIN_GROUP
+    valueFrom:
+      configMapKeyRef:
+        name: stardelt-identity
+        key: adminGroup
+        optional: true
+  - name: STARDELT_SUPERSET_CLIENT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: stardelt-oidc-clients
+        key: superset
         optional: true
 
 extraConfigs:
