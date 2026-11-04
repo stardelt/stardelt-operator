@@ -1048,6 +1048,9 @@ pub async fn ensure_ingress(ctx: &Context, spec: &PlatformInstanceSpec) -> Optio
     if spec.pillars.notebooks {
         objects.extend(ingress::jupyterhub(spec));
     }
+    if spec.pillars.dashboards {
+        objects.extend(ingress::superset(spec));
+    }
     if objects.is_empty() {
         return Some(status(
             NAME,
@@ -2269,6 +2272,49 @@ mod tests {
                 "/apis/networking.k8s.io/v1/namespaces/stardelt/ingresses/jupyterhub".to_string(),
             ]
         );
+    }
+
+    fn platform_with_dashboards_ingress(dashboards: bool, dry_run: bool) -> PlatformInstanceSpec {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "namespace": "stardelt",
+                "baseDomain": "example.com",
+                "dryRun": dry_run,
+                "identity": { "mode": "none" },
+                "pillars": { "lakehouse": true, "dashboards": dashboards },
+                "ingress": { "enabled": true, "className": "traefik" },
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        instance.spec
+    }
+
+    #[tokio::test]
+    async fn ingress_publishes_superset_with_the_dashboards_pillar() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_dashboards_ingress(true, false),
+        )
+        .await
+        .expect("a status");
+        assert_eq!(status.message.as_deref(), Some("applied: nova, superset"));
+        assert_eq!(
+            applied_paths(&requests),
+            vec![format!("{INGRESSES}/nova"), format!("{INGRESSES}/superset"),]
+        );
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_dashboards_ingress(false, false),
+        )
+        .await
+        .expect("a status");
+        assert_eq!(status.message.as_deref(), Some("applied: nova"));
+        assert_eq!(applied_paths(&requests), vec![format!("{INGRESSES}/nova")]);
     }
 
     #[tokio::test]
