@@ -29,9 +29,12 @@ datastore:
   # (the chart default pulls k8s-wait-for from Docker Hub) and no cross-Job ordering.
   migrationType: initContainer
 
+# 512 Mi, not 192 Mi: the store was OOMKilled (exit 137) at 2026-11-04 21:05:26Z with a 38 Mi
+# steady state — the burst was every client reconnecting after a node-wide restart
+# (stardelt-platform#516, stardelt-platform#544). A killed store denies every catalogue read.
 resources:
-  requests: { cpu: "20m", memory: "64Mi" }
-  limits:   { cpu: "500m", memory: "192Mi" }
+  requests: { cpu: "20m", memory: "128Mi" }
+  limits:   { cpu: "500m", memory: "512Mi" }
 
 # Probe budget (stardelt-platform#516): the chart's defaults (timeout 5 s, failureThreshold 12)
 # kill the store after 120 s of a node-wide stall — every pod on the host times out at once, so
