@@ -32,6 +32,12 @@ hub:
           key: issuerUrl
           name: stardelt-identity
           optional: true
+    STARDELT_TRINO_URL:
+      valueFrom:
+        configMapKeyRef:
+          name: stardelt-identity
+          key: trinoUrl
+          optional: true
   resources:
     limits:
       cpu: 500m
@@ -64,11 +70,44 @@ singleuser:
     limit: 1
   defaultUrl: /lab
   image:
-    name: quay.io/jupyter/scipy-notebook
-    tag: 2024-10-07
+    # The digest is a copy of the platform's pin and must be bumped in both repos; the platform's
+    # `scripts/check-notebook-image-pin.sh` cannot see this crate.
+    name: ghcr.io/stardelt/jupyter-singleuser
+    tag: "dev@sha256:c3d45ec43d871b58f3bf88b3831e93ff20d355d65b27ca7a0cd337f06bce1b39"
+    pullSecrets:
+      - name: ghcr-creds
   memory:
     guarantee: 256M
     limit: 1G
   startTimeout: 300
   storage:
     type: none
+    extraVolumes:
+      - name: trino-ca
+        secret:
+          secretName: trino-ca
+          optional: true
+          items:
+            - key: tls.crt
+              path: ca.crt
+    extraVolumeMounts:
+      - name: trino-ca
+        mountPath: /etc/stardelt/trino-ca
+        readOnly: true
+  lifecycleHooks:
+    postStart:
+      exec:
+        command:
+          - bash
+          - -c
+          - 'cp -n /opt/stardelt/notebooks/*.ipynb "$HOME/" || true'
+  networkPolicy:
+    egress:
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: trino
+                app.kubernetes.io/component: coordinator
+        ports:
+          - port: 8443
+            protocol: TCP
