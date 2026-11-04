@@ -287,6 +287,15 @@ mod tests {
         // cannot read the other repository; it only states the shape the two must share.
         let o = golden_values("openfga");
         assert_eq!(o["livenessProbe"]["enabled"], serde_json::json!(false));
+        assert_eq!(
+            o["resources"]["limits"]["memory"],
+            serde_json::json!("512Mi"),
+            "192 Mi was OOMKilled on the dev cluster (stardelt-platform#544); the platform carries the same"
+        );
+        assert_eq!(
+            o["resources"]["requests"]["memory"],
+            serde_json::json!("128Mi")
+        );
     }
 
     #[test]
