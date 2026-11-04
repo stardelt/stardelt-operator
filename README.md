@@ -34,8 +34,10 @@ the master spec §5).
 | Pillar | Default | What it plans |
 |---|---|---|
 | `lakehouse` | `true` | nothing by itself — the storage + catalog + query components hang off each `Lakehouse` |
-| `batch` | `false` | reserved for the `Pipeline`/Airflow work |
+| `batch` | `false` | reserved for Spark compute (stardelt-operator#4); nothing plans from it yet |
 | `notebooks` | `false` | JupyterHub (chart `jupyterhub/jupyterhub`, pinned like every other component) |
+| `pipelines` | `false` | Airflow (chart `apache-airflow/airflow`, pinned like every other component) — scheduled pipelines and jobs; Nova's Pipelines page needs it |
+| `dashboards` | `false` | Superset (chart `superset/superset`, pinned like every other component) — BI dashboards over Trino, sign-in through the platform IdP |
 | `streaming` | `false` | reserved for Kafka + Flink |
 | `ml` | `false` | reserved for the ML plugs |
 
