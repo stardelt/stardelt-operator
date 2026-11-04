@@ -2954,29 +2954,26 @@ mod tests {
     #[tokio::test]
     async fn access_sync_applies_its_five_objects_when_the_client_exists() {
         let (client, store, requests) = identity_client(BTreeMap::new());
-        let mut s = store.lock().expect("store poisoned");
-        s.insert(
-            "svc-catalog-operator".to_string(),
-            serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"svc-catalog-operator"}}),
-        );
-        drop(s);
+        {
+            let mut s = store.lock().expect("store poisoned");
+            s.insert(
+                "svc-catalog-operator".to_string(),
+                serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"svc-catalog-operator"}}),
+            );
+        }
         let ctx = context(client);
         let spec = platform("platform", false);
         let status = ensure_access_sync(&ctx, &spec).await.expect("a status");
         assert!(status.ready);
         let paths = applied_paths(&requests);
-        assert!(
-            paths[paths.len() - 5..]
-                .iter()
-                .zip([
-                    "/serviceaccounts/access-sync",
-                    "/configmaps/access-sync",
-                    "/roles/access-sync",
-                    "/rolebindings/access-sync",
-                    "/cronjobs/access-sync",
-                ])
-                .all(|(p, s)| p.ends_with(s))
-        );
+        assert!(paths[paths.len() - 5..].iter().zip([
+            "/serviceaccounts/access-sync",
+            "/configmaps/access-sync",
+            "/roles/access-sync",
+            "/rolebindings/access-sync",
+            "/cronjobs/access-sync",
+        ])
+        .all(|(p, suffix)| p.ends_with(suffix)));
     }
 
     #[tokio::test]
