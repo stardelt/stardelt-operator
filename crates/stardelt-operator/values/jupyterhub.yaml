@@ -69,6 +69,9 @@ singleuser:
     guarantee: 0.1
     limit: 1
   defaultUrl: /lab
+  extraEnv:
+    SPARK_REMOTE: sc://spark-connect.__NAMESPACE__.svc.cluster.local:15002
+    STARDELT_SECRET_STORE_URL: http://openbao.__NAMESPACE__.svc.cluster.local:8200
   image:
     # The digest is a copy of the platform's pin and must be bumped in both repos; the platform's
     # `scripts/check-notebook-image-pin.sh` cannot see this crate.
@@ -110,4 +113,18 @@ singleuser:
                 app.kubernetes.io/component: coordinator
         ports:
           - port: 8443
+            protocol: TCP
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: spark-connect
+        ports:
+          - port: 15002
+            protocol: TCP
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: openbao
+        ports:
+          - port: 8200
             protocol: TCP
