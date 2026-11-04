@@ -5,9 +5,8 @@
 
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, KeyToPath,
-    PodSpec, PodTemplateSpec, ResourceRequirements, SecretKeySelector, SecurityContext,
-    Volume, VolumeMount,
+    Capabilities, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, KeyToPath, PodSpec,
+    PodTemplateSpec, ResourceRequirements, SecretKeySelector, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -34,8 +33,14 @@ fn meta(name: &str, namespace: &str) -> ObjectMeta {
     let mut labels = BTreeMap::new();
     labels.insert("app.kubernetes.io/name".to_string(), name.to_string());
     labels.insert("app.kubernetes.io/instance".to_string(), name.to_string());
-    labels.insert("app.kubernetes.io/part-of".to_string(), "stardelt".to_string());
-    labels.insert("app.kubernetes.io/managed-by".to_string(), "stardelt-operator".to_string());
+    labels.insert(
+        "app.kubernetes.io/part-of".to_string(),
+        "stardelt".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "stardelt-operator".to_string(),
+    );
     ObjectMeta {
         name: Some(name.to_string()),
         namespace: Some(namespace.to_string()),
@@ -268,9 +273,18 @@ fn pod_security_context() -> k8s_openapi::api::core::v1::PodSecurityContext {
 
 pub fn superset_cron_job(namespace: &str) -> CronJob {
     let mut labels = BTreeMap::new();
-    labels.insert("app.kubernetes.io/name".to_string(), SUPERSET_JOB.to_string());
-    labels.insert("app.kubernetes.io/part-of".to_string(), "stardelt".to_string());
-    labels.insert("app.kubernetes.io/managed-by".to_string(), "stardelt-operator".to_string());
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        SUPERSET_JOB.to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/part-of".to_string(),
+        "stardelt".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "stardelt-operator".to_string(),
+    );
 
     CronJob {
         metadata: meta(SUPERSET_JOB, namespace),
@@ -342,9 +356,18 @@ pub fn superset_cron_job(namespace: &str) -> CronJob {
 
 pub fn airflow_cron_job(namespace: &str) -> CronJob {
     let mut labels = BTreeMap::new();
-    labels.insert("app.kubernetes.io/name".to_string(), AIRFLOW_JOB.to_string());
-    labels.insert("app.kubernetes.io/part-of".to_string(), "stardelt".to_string());
-    labels.insert("app.kubernetes.io/managed-by".to_string(), "stardelt-operator".to_string());
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        AIRFLOW_JOB.to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/part-of".to_string(),
+        "stardelt".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        "stardelt-operator".to_string(),
+    );
 
     CronJob {
         metadata: meta(AIRFLOW_JOB, namespace),
@@ -436,7 +459,13 @@ mod tests {
         let init = &pod.init_containers.as_ref().unwrap()[0];
         assert_eq!(init.image.as_deref(), Some(SUPERSET_PG_IMAGE));
         let env = init.env.as_ref().unwrap();
-        let get = |name: &str| env.iter().find(|e| e.name == name).unwrap().value.as_deref();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .value
+                .as_deref()
+        };
         assert_eq!(get("PGHOST"), Some("superset-postgresql"));
         assert_eq!(get("PGDATABASE"), Some("superset"));
         assert_eq!(get("PGUSER"), Some("superset"));
@@ -457,12 +486,22 @@ mod tests {
         );
         let up = &pod.containers[0];
         let uenv = up.env.as_ref().unwrap();
-        let uget =
-            |name: &str| uenv.iter().find(|e| e.name == name).unwrap().value.as_deref();
+        let uget = |name: &str| {
+            uenv.iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .value
+                .as_deref()
+        };
         assert_eq!(uget("APP"), Some("superset"));
         assert_eq!(uget("BACKUP_BUCKET"), Some(BACKUP_BUCKET));
         let uenv = up.env.as_ref().unwrap();
-        let names = ["AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION"];
+        let names = [
+            "AWS_ENDPOINT_URL",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_DEFAULT_REGION",
+        ];
         for n in names {
             let ev = uenv.iter().find(|e| e.name == n).unwrap();
             assert_eq!(
@@ -476,10 +515,30 @@ mod tests {
                 "stardelt-s3-creds"
             );
         }
-        assert_eq!(uenv.iter().position(|e| e.name == "AWS_ENDPOINT_URL").unwrap(), 3);
-        assert_eq!(uenv.iter().position(|e| e.name == "AWS_ACCESS_KEY_ID").unwrap(), 4);
-        assert_eq!(uenv.iter().position(|e| e.name == "AWS_SECRET_ACCESS_KEY").unwrap(), 5);
-        assert_eq!(uenv.iter().position(|e| e.name == "AWS_DEFAULT_REGION").unwrap(), 6);
+        assert_eq!(
+            uenv.iter()
+                .position(|e| e.name == "AWS_ENDPOINT_URL")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            uenv.iter()
+                .position(|e| e.name == "AWS_ACCESS_KEY_ID")
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            uenv.iter()
+                .position(|e| e.name == "AWS_SECRET_ACCESS_KEY")
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            uenv.iter()
+                .position(|e| e.name == "AWS_DEFAULT_REGION")
+                .unwrap(),
+            6
+        );
     }
 
     #[test]
@@ -498,7 +557,13 @@ mod tests {
             .unwrap();
         let init = &pod.init_containers.as_ref().unwrap()[0];
         let env = init.env.as_ref().unwrap();
-        let get = |name: &str| env.iter().find(|e| e.name == name).unwrap().value.as_deref();
+        let get = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .value
+                .as_deref()
+        };
         assert_eq!(get("PGDATABASE"), Some("postgres"));
         assert_eq!(get("PGUSER"), Some("postgres"));
         let vol = pod
