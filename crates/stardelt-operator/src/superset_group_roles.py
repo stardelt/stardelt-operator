@@ -1,5 +1,5 @@
-# Copy of stardelt-platform/scripts/superset-group-roles.py (platform#494/#508/#513), embedded by
-# crates/stardelt-operator/src/superset.rs and mounted at /opt/scripts/sync.py.
+# Copy of stardelt-platform/scripts/superset-group-roles.py (platform#494/#508/#513/#515),
+# embedded by crates/stardelt-operator/src/superset.rs and mounted at /opt/scripts/sync.py.
 # Edit the platform file first, then re-copy.
 #!/usr/bin/env python3
 """Create an Superset role per Catalog grant group (platform#494).
@@ -97,6 +97,13 @@ def converge(current, want, granted):
     return sorted(keep - current), sorted(current - keep)
 
 
+def accumulate(desired, role_name, granted_all):
+    """Add one catalog's grants to a role's wanted set. Every catalog a group owns must
+    contribute; converging per catalog instead kept only the last one (platform#514)."""
+    desired.setdefault(role_name, set()).update(granted_all)
+    return desired
+
+
 def database_perms(granted):
     """The database perm strings in a `grants(...)` set (datasource perms dropped).
 
@@ -148,6 +155,8 @@ def main():
         names_fn = lambda r: {(p.permission.name, p.view_menu.name) for p in r.permissions}
 
         role_databases = {}
+        desired = {}  # role_name -> {(permission, view_menu)} the role must hold across ALL its catalogs
+        roles = {}    # role_name -> role object, so the convergence below needs no second lookup
         for cat in catalogs:
             meta = cat.get("metadata") or {}
             spec = cat.get("spec") or {}
@@ -183,21 +192,30 @@ def main():
             tables = db.session.query(SqlaTable).filter(SqlaTable.database_id == db_obj.id).all()
             granted_all = grants([db_obj.perm], [t.perm for t in tables])
             granted = database_perms(granted_all)
-            want = set()  # per-group roles only get what's granted for this catalog; they also get Gamma/stardelt-analyst via mapping? The ticket says "stardelt-analyst keeps Gamma + SQL Lab but loses the blanket..." and group roles carry catalogs. Also in mapping we add the group role to users in that group - so the role itself needs the permissions.
             for grp in sorted(groups):
                 role_name = f"stardelt-group-{grp}"
                 role = sm.find_role(role_name) or sm.add_role(role_name)
-                add, remove = converge(names_fn(role), want, granted_all)
-                for n, v in add:
-                    pv = sm.find_permission_view_menu(n, v)
-                    if pv:
-                        sm.add_permission_role(role, pv)
-                for n, v in remove:
-                    pv = sm.find_permission_view_menu(n, v)
-                    if pv:
-                        sm.del_permission_role(role, pv)
+                roles[role_name] = role
+                accumulate(desired, role_name, granted_all)
                 role_databases.setdefault(role_name, set()).update(granted)
-                print(f"role {role_name}: {len(role.permissions)} permissions (db {db_obj.database_name})")
+        # Converge once per role, after every catalog has contributed its grants: a
+        # per-catalog convergence removes the previous catalog's permissions again, which
+        # left each group with the empty `<group>ref` catalog only (platform#514).
+        for role_name in sorted(desired):
+            role = roles[role_name]
+            add, remove = converge(names_fn(role), desired[role_name], set())
+            for n, v in add:
+                pv = sm.find_permission_view_menu(n, v)
+                if pv:
+                    sm.add_permission_role(role, pv)
+            for n, v in remove:
+                pv = sm.find_permission_view_menu(n, v)
+                if pv:
+                    sm.del_permission_role(role, pv)
+            print(
+                f"role {role_name}: {len(desired[role_name])} permissions "
+                f"({len(role_databases[role_name])} database(s))"
+            )
         from superset.models.dashboard import Dashboard
 
         for dashboard in db.session.query(Dashboard).filter(Dashboard.published.is_(True)).all():

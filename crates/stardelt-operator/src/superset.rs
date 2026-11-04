@@ -104,12 +104,16 @@ pub fn catalog_reader_binding(namespace: &str) -> RoleBinding {
     }
 }
 
+/// The group-roles script, a copy of `stardelt-platform/scripts/superset-group-roles.py`
+/// (the platform keeps the original; copy it, never edit the copy).
+pub const SCRIPT: &str = include_str!("superset_group_roles.py");
+
 pub fn group_roles_config_map(namespace: &str) -> ConfigMap {
     ConfigMap {
         metadata: meta(GROUP_ROLES_JOB, namespace),
         data: Some(BTreeMap::from([(
             "sync.py".to_string(),
-            include_str!("superset_group_roles.py").to_string(),
+            SCRIPT.to_string(),
         )])),
         ..ConfigMap::default()
     }
@@ -291,6 +295,29 @@ mod tests {
             container.command.as_ref().unwrap(),
             &vec!["python".to_string(), "/opt/scripts/sync.py".to_string()]
         );
+    }
+
+    /// platform#514/#515: a group role must hold the grants of every catalog the group owns.
+    /// Converging once per catalog left each role with only the last catalog's permissions
+    /// (in practice the empty `<group>ref` one), so members saw the dashboard but no charts.
+    /// The script accumulates into `desired` and converges once, after every catalog.
+    #[test]
+    fn the_group_roles_script_accumulates_grants_across_catalogs() {
+        assert!(SCRIPT.contains("def accumulate(desired, role_name, granted_all)"));
+        assert!(
+            SCRIPT.contains("accumulate(desired, role_name, granted_all)"),
+            "every catalog contributes to the role's wanted set"
+        );
+        assert!(
+            SCRIPT.contains("for role_name in sorted(desired):"),
+            "convergence happens once per role, after the catalog loop"
+        );
+        assert!(
+            !SCRIPT.contains("converge(names_fn(role), want, granted_all)"),
+            "the per-catalog convergence of platform#514 must not come back"
+        );
+        let cm = group_roles_config_map("stardelt");
+        assert_eq!(cm.data.unwrap()["sync.py"], SCRIPT);
     }
 
     #[test]
