@@ -252,7 +252,10 @@ mod tests {
     #[test]
     fn default_plan_is_storage_then_catalog_then_query() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
-        assert_eq!(names(&plan), vec!["seaweedfs", "openfga", "lakekeeper", "trino"]);
+        assert_eq!(
+            names(&plan),
+            vec!["seaweedfs", "openfga", "lakekeeper", "trino"]
+        );
     }
 
     #[test]
@@ -382,7 +385,10 @@ mod tests {
     #[test]
     fn the_lakehouse_plan_installs_openfga_before_the_catalog() {
         assert_eq!(
-            names(&plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))),
+            names(&plan_lakehouse(&spec(
+                CatalogImpl::Lakekeeper,
+                StorageImpl::Seaweedfs
+            ))),
             vec!["seaweedfs", "openfga", "lakekeeper", "trino"]
         );
     }

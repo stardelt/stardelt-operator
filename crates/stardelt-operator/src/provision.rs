@@ -38,8 +38,7 @@ use crate::{
         bootstrap_job_name, catalog_cluster, catalog_pg_backup, discovery_config_map,
         discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, notebooks_bucket_job,
         notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, openfga_pg_backup,
-        openfga_pg_cluster, s3_creds_secret, s3_endpoint,
-        seaweedfs_config_secret,
+        openfga_pg_cluster, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
     },
     superset,
 };
