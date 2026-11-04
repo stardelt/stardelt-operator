@@ -37,7 +37,8 @@ use crate::{
         S3Location, archive_bucket_job, archive_bucket_job_name, archive_cron_job, bootstrap_job,
         bootstrap_job_name, catalog_cluster, catalog_pg_backup, discovery_config_map,
         discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, notebooks_bucket_job,
-        notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, s3_creds_secret, s3_endpoint,
+        notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, openfga_pg_backup,
+        openfga_pg_cluster, s3_creds_secret, s3_endpoint,
         seaweedfs_config_secret,
     },
     superset,
@@ -218,6 +219,57 @@ pub async fn ensure_catalog_database(
         namespace,
         &cnpg_scheduled_backup_resource(),
         &catalog_pg_backup(&lh.name_any(), namespace),
+        false,
+    )
+    .await
+    {
+        return status(NAME, false, e.to_string());
+    }
+    if cluster_ready(&applied) {
+        status(NAME, true, "database ready")
+    } else {
+        status(NAME, false, "waiting for the database to become Ready")
+    }
+}
+
+/// The permission store's database and its daily base backup (O5), applied by the `Lakehouse`
+/// controller like the catalog database. The store is empty and unenforced until the cut-over
+/// (platform#304); a missing CloudNative-PG operator is reported the same way.
+pub async fn ensure_openfga_database(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> ComponentStatus {
+    const NAME: &str = "openfga-database";
+    let dry_run = lh.spec.dry_run;
+    let cluster = openfga_pg_cluster(namespace);
+    let applied = match apply_dynamic(
+        &ctx.client,
+        namespace,
+        &cnpg_cluster_resource(),
+        &cluster,
+        dry_run,
+    )
+    .await
+    {
+        Err(kube::Error::Api(e)) if e.code == 404 => {
+            return status(
+                NAME,
+                false,
+                "CloudNative-PG is not installed: create a PlatformInstance first",
+            );
+        }
+        Err(e) => return status(NAME, false, e.to_string()),
+        Ok(applied) => applied,
+    };
+    if dry_run {
+        return status(NAME, false, "planned (dry-run): Cluster openfga-pg");
+    }
+    if let Err(e) = apply_dynamic(
+        &ctx.client,
+        namespace,
+        &cnpg_scheduled_backup_resource(),
+        &openfga_pg_backup(namespace),
         false,
     )
     .await
@@ -3187,6 +3239,42 @@ mod tests {
         assert_eq!(
             applied_paths(&requests),
             ["/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/lakekeeper-pg"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_openfga_database_applies_its_cluster_and_backup() {
+        let (client, requests) = keycloak_client(&[], None);
+        let lh = lakehouse();
+        let status = ensure_openfga_database(&context(client), &lh, "stardelt").await;
+        assert_eq!(status.name, "openfga-database");
+        assert_eq!(
+            applied_paths(&requests),
+            [
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/openfga-pg",
+                "/apis/postgresql.cnpg.io/v1/namespaces/stardelt/scheduledbackups/openfga-pg-daily",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_openfga_database_dry_run_plans_only_the_cluster() {
+        let (client, requests) = keycloak_client(&[], None);
+        let mut lh = lakehouse();
+        lh.spec.dry_run = true;
+        let status = ensure_openfga_database(&context(client), &lh, "stardelt").await;
+        assert_eq!(status.name, "openfga-database");
+        assert!(!status.ready);
+        assert!(
+            status
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("planned (dry-run):")
+        );
+        assert_eq!(
+            applied_paths(&requests),
+            ["/apis/postgresql.cnpg.io/v1/namespaces/stardelt/clusters/openfga-pg"]
         );
     }
 

@@ -61,6 +61,13 @@ pub fn plan_lakehouse(spec: &LakehouseSpec) -> Vec<ComponentPlan> {
         });
     }
 
+    // The permission store of the catalog (O5): installed before the catalog that will use
+    // it at the cut-over, independent of which catalog implementation is chosen.
+    plan.push(ComponentPlan {
+        name: "openfga",
+        chart: Some("openfga/openfga"),
+    });
+
     match spec.catalog.implementation {
         CatalogImpl::Lakekeeper => plan.push(ComponentPlan {
             name: "lakekeeper",
@@ -156,6 +163,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "jupyterhub/jupyterhub" => Some("4.4.3"),
         "apache-airflow/airflow" => Some("1.21.0"),
         "superset/superset" => Some("0.15.5"),
+        "openfga/openfga" => Some("0.2.62"),
         _ => None,
     }
 }
@@ -171,6 +179,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "jupyterhub/jupyterhub" => Some("https://jupyterhub.github.io/helm-chart/"),
         "apache-airflow/airflow" => Some("https://airflow.apache.org"),
         "superset/superset" => Some("https://apache.github.io/superset"),
+        "openfga/openfga" => Some("https://openfga.github.io/helm-charts"),
         _ => None,
     }
 }
@@ -243,7 +252,7 @@ mod tests {
     #[test]
     fn default_plan_is_storage_then_catalog_then_query() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
-        assert_eq!(names(&plan), vec!["seaweedfs", "lakekeeper", "trino"]);
+        assert_eq!(names(&plan), vec!["seaweedfs", "openfga", "lakekeeper", "trino"]);
     }
 
     #[test]
@@ -367,7 +376,15 @@ mod tests {
     #[test]
     fn byos3_skips_seaweedfs_and_polaris_replaces_lakekeeper() {
         let plan = plan_lakehouse(&spec(CatalogImpl::Polaris, StorageImpl::ByoS3));
-        assert_eq!(names(&plan), vec!["polaris", "trino"]);
+        assert_eq!(names(&plan), vec!["openfga", "polaris", "trino"]);
+    }
+
+    #[test]
+    fn the_lakehouse_plan_installs_openfga_before_the_catalog() {
+        assert_eq!(
+            names(&plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))),
+            vec!["seaweedfs", "openfga", "lakekeeper", "trino"]
+        );
     }
 
     #[test]

@@ -1,0 +1,38 @@
+# OpenFGA — the catalog's permission store (platform#302, authz 1/8). Chart:
+# openfga/openfga 0.2.62, appVersion v1.14.0, Apache-2.0.
+#
+# Deployed and backed up but not enforced yet: Lakekeeper still runs
+# `authz.backend: allowall`, so the store holds nothing that decides an access check
+# until the cut-over (platform#304). Installing it now means the cut-over is a
+# values change, not a new component.
+#
+# The database is CloudNative-PG Cluster `openfga-pg` (not the chart's bundled Postgres
+# subchart): this install already runs CloudNative-PG and a second Postgres operator is
+# the wrong shape for one node. CNPG creates Secret `openfga-pg-app`; the chart reads the
+# DSN from its `uri` key.
+image:
+  repository: openfga/openfga
+  # Explicit, so a chart bump cannot silently move the application: Lakekeeper 0.12.2
+  # requires OpenFGA >= 1.11 and is tested against 1.14.
+  tag: v1.14.0
+
+replicaCount: 1
+
+datastore:
+  engine: postgres
+  # Secret name, not a URI: the chart renders a secretKeyRef on key `uri`.
+  uriSecret: openfga-pg-app
+  # `openfga migrate` as an init container of the serving pod: no second registry
+  # (the chart default pulls k8s-wait-for from Docker Hub) and no cross-Job ordering.
+  migrationType: initContainer
+
+resources:
+  requests: { cpu: "20m", memory: "64Mi" }
+  limits:   { cpu: "500m", memory: "192Mi" }
+
+# No tracing, no metrics: nothing scrapes this release yet.
+telemetry:
+  trace:
+    enabled: false
+  metrics:
+    enabled: false
