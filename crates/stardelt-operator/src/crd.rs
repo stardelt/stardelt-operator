@@ -3482,7 +3482,11 @@ mod tests {
             "spec": {}
         }))
         .expect("deserialize PlatformInstance");
-        assert_eq!(pi.spec.secrets.mode, SecretsMode::None, "a CR without spec.secrets installs no secret store");
+        assert_eq!(
+            pi.spec.secrets.mode,
+            SecretsMode::None,
+            "a CR without spec.secrets installs no secret store"
+        );
     }
 
     #[test]
