@@ -115,6 +115,11 @@ init:
       echo "Importing database connections.... "
       superset import_datasources -p {{ .Values.extraConfigMountPath }}/import_datasources.yaml
     fi
+    # The role the IdP mapping gives every member of stardelt-users ("Gamma", "stardelt-analyst");
+    # it must exist before the first sign-in. Needs the "Trino Shared" database that
+    # import_datasources.yaml above created. Idempotent: converges the exact permission set.
+    echo "Converging the analyst role..."
+    python "{{ .Values.extraConfigMountPath }}/superset-analyst-role.py"
   loadExamples: false
 
 supersetNode:
