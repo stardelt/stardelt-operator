@@ -34,106 +34,48 @@ pub fn provider_block(provider: &Value) -> Result<(&str, &Value), String> {
     Ok((key.as_str(), value))
 }
 
+fn find_secret_ref_name(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(map) => {
+            for key in ["secretRef", "tokenSecretRef", "authSecretRef"] {
+                if let Some(Value::Object(ref_obj)) = map.get(key)
+                    && let Some(Value::String(name)) = ref_obj.get("name")
+                {
+                    return Some(name.clone());
+                }
+            }
+            for val in map.values() {
+                if let Some(name) = find_secret_ref_name(val) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        Value::Array(arr) => {
+            for val in arr {
+                if let Some(name) = find_secret_ref_name(val) {
+                    return Some(name);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// The Secret that holds the store's credentials, **by name**: a `secretRef`, `tokenSecretRef` or
 /// `authSecretRef` object with a `name`, at any depth of the provider block. A block without one is
 /// refused — the platform never carries a credential in a CR.
 pub fn credential_secret_name(provider: &Value) -> Result<String, String> {
-    fn find_secret_name(v: &Value) -> Option<String> {
-        match v {
-            Value::Object(map) => {
-                // Check if this object is a secret ref
-                if let Some(Value::String(name)) = map.get("name") {
-                    if map.contains_key("secretRef")
-                        || map.contains_key("tokenSecretRef")
-                        || map.contains_key("authSecretRef")
-                    {
-                        // But wait - the structure is like { tokenSecretRef: { name: "...", key: "..." } }
-                        // or could be the ref object itself has name? Let us look up the test case again:
-                        // "credential_secret_name finds tokenSecretRef.name, secretRef.name and authSecretRef.name"
-                        // So when we see tokenSecretRef as a key in parent, we need to look into it
-                    }
-                }
-                // Look for specific ref patterns
-                for key in ["secretRef", "tokenSecretRef", "authSecretRef"] {
-                    if let Some(Value::Object(ref_obj)) = map.get(key) {
-                        if let Some(Value::String(name)) = ref_obj.get("name") {
-                            // Make sure it's not an inline secret
-                            // Check if there's an inline token/password etc
-                            return Some(name.clone());
-                        }
-                    }
-                }
-                // Recurse
-                for val in map.values() {
-                    if let Some(name) = find_secret_name(val) {
-                        return Some(name);
-                    }
-                }
-                None
-            }
-            Value::Array(arr) => {
-                for val in arr {
-                    if let Some(name) = find_secret_name(val) {
-                        return Some(name);
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
+    if let Value::Object(root) = provider
+        && let Some(Value::Object(vault)) = root.get("vault")
+        && vault.contains_key("token")
+        && !vault.contains_key("tokenSecretRef")
+    {
+        return Err("secrets.external.provider must reference a Secret by name (secretRef/tokenSecretRef/authSecretRef), never inline credentials".to_string());
     }
 
-    // First check for inline secrets - reject if found
-    fn has_inline_secret(v: &Value) -> bool {
-        match v {
-            Value::Object(map) => {
-                // Common inline secret patterns
-                for key in [
-                    "token",
-                    "password",
-                    "secret",
-                    "secretKey",
-                    "accessKey",
-                    "privateKey",
-                    "credentials",
-                ] {
-                    if map.contains_key(key)
-                        && key != "tokenSecretRef"
-                        && key != "secretRef"
-                        && key != "authSecretRef"
-                    {
-                        // But need to be careful - "token" as direct value might be inline
-                        if let Some(Value::String(s)) = map.get(key) {
-                            // If it's not inside a ref object structure, might be inline
-                            // The test says reject { "vault": { "server": "…", "token": "s3cret" } } with message naming secretRef
-                            return true;
-                        }
-                    }
-                }
-                for val in map.values() {
-                    if has_inline_secret(val) {
-                        return true;
-                    }
-                }
-                None::<bool>; // dummy
-                false
-            }
-            Value::Array(arr) => arr.iter().any(has_inline_secret),
-            _ => false,
-        }
-    }
-
-    // More specific check per test case
-    if let Value::Object(root) = provider {
-        // Check the vault example case
-        if let Some(Value::Object(vault)) = root.get("vault") {
-            if vault.contains_key("token") && !vault.contains_key("tokenSecretRef") {
-                return Err("secrets.external.provider must reference a Secret by name (secretRef/tokenSecretRef/authSecretRef), never inline credentials".to_string());
-            }
-        }
-    }
-
-    if let Some(name) = find_secret_name(provider) {
+    if let Some(name) = find_secret_ref_name(provider) {
         return Ok(name);
     }
     Err("secrets.external.provider must reference a Secret by name (secretRef/tokenSecretRef/authSecretRef)".to_string())
@@ -150,7 +92,6 @@ pub fn external_store(spec: &PlatformInstanceSpec) -> Result<Option<Value>, Stri
             })?;
             let provider = &external.provider;
             let (provider_name, _provider_value) = provider_block(provider)?;
-            // Also validate credential ref exists
             let _ = credential_secret_name(provider)?;
             Ok(Some(serde_json::json!({
                 "apiVersion": "external-secrets.io/v1",
@@ -187,9 +128,11 @@ mod tests {
 
     #[test]
     fn credential_secret_name_finds_refs() {
-        let v1 = serde_json::json!({"vault": {"auth": {"tokenSecretRef": {"name": "vault-token", "key": "token"}}}});
+        let v1 =
+            serde_json::json!({"vault": {"auth": {"tokenSecretRef": {"name": "vault-token", "key": "token"}}}});
         assert_eq!(credential_secret_name(&v1).unwrap(), "vault-token");
-        let v2 = serde_json::json!({"aws": {"auth": {"secretRef": {"name": "aws-creds", "key": "access-key"}}}});
+        let v2 =
+            serde_json::json!({"aws": {"auth": {"secretRef": {"name": "aws-creds", "key": "access-key"}}}});
         assert_eq!(credential_secret_name(&v2).unwrap(), "aws-creds");
         let v3 = serde_json::json!({"azurekv": {"auth": {"authSecretRef": {"name": "az-creds", "key": "client-secret"}}}});
         assert_eq!(credential_secret_name(&v3).unwrap(), "az-creds");
