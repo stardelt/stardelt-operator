@@ -41,9 +41,10 @@ use crate::provision::{
     ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery, ensure_identity,
     ensure_identity_secrets, ensure_ingress, ensure_keycloak, ensure_keycloak_pg,
     ensure_lakekeeper_network_policy, ensure_notebooks_bucket, ensure_nova, ensure_nova_events,
-    ensure_nova_pg, ensure_nova_session, ensure_openfga_database, ensure_openfga_network_policy,
-    ensure_pg_dumps, ensure_s3_secrets, ensure_superset_group_roles, ensure_superset_rbac,
-    ensure_superset_secrets, ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
+    ensure_nova_pg, ensure_nova_session, ensure_openbao_seal_key, ensure_openfga_database,
+    ensure_openfga_network_policy, ensure_pg_dumps, ensure_s3_secrets, ensure_superset_group_roles,
+    ensure_superset_rbac, ensure_superset_secrets, ensure_trino_auth_secrets,
+    ensure_trino_config_maps, ensure_trino_tls,
 };
 use crate::values::{deep_merge, effective_values, identity_values, parse_values_document};
 
@@ -1081,6 +1082,9 @@ async fn reconcile_platform(
     // Superset's Secrets come before its release.
     let superset_secrets = ensure_superset_secrets(&ctx, &instance.spec).await;
     let superset_rbac = ensure_superset_rbac(&ctx, &instance.spec).await;
+    // The store's seal key comes before its release: the pod mounts Secret openbao-seal-key and the
+    // static seal is what lets it unseal itself after a restart.
+    let openbao_seal = ensure_openbao_seal_key(&ctx, &instance.spec).await;
     let mut outcome = apply_plan(
         &ctx,
         &instance.spec.namespace,
@@ -1091,6 +1095,9 @@ async fn reconcile_platform(
         previous,
     )
     .await;
+    if let Some(seal) = openbao_seal {
+        outcome.components.push(seal);
+    }
     if let Some(secrets) = airflow_secrets {
         outcome.components.push(secrets);
     }

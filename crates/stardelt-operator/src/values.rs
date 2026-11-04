@@ -74,6 +74,11 @@ pub fn golden_values(component: &str) -> Value {
         // resource requests are the platform's.
         "external-secrets" => serde_yaml::from_str(include_str!("../values/external-secrets.yaml"))
             .expect("values/external-secrets.yaml is not valid YAML"),
+        // The sandbox secret store (decision D23, platform mode): the platform's
+        // helm-values/openbao.yaml verbatim — standalone on one volume, auto-unseal by the static key
+        // in Secret openbao-seal-key, audit to stdout.
+        "openbao" => serde_yaml::from_str(include_str!("../values/openbao.yaml"))
+            .expect("values/openbao.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }
@@ -1193,5 +1198,16 @@ mod tests {
             single["networkPolicy"]["egress"][0]["ports"][0],
             serde_json::json!({"port": 8443, "protocol": "TCP"})
         );
+    }
+
+    #[test]
+    fn openbao_values_mount_the_seal_key_secret() {
+        let values = golden_values("openbao");
+        assert_eq!(
+            values["server"]["extraVolumes"][0]["name"],
+            "openbao-seal-key"
+        );
+        assert_eq!(values["server"]["extraVolumes"][0]["path"], "/openbao/seal");
+        assert_eq!(values["injector"]["enabled"], false);
     }
 }

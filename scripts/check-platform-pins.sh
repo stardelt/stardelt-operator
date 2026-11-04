@@ -33,6 +33,7 @@ declare -A PREFIX_OF=(
   [superset/superset]=SUPERSET
   [openfga/openfga]=OPENFGA
   [external-secrets/external-secrets]=EXTERNAL_SECRETS
+  [openbao/openbao]=OPENBAO
 )
 
 status=0

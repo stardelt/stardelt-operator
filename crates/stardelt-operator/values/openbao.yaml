@@ -1,0 +1,60 @@
+# OpenBao (MPL-2.0, the one documented non-permissive component) as the sandbox secret store
+# (decision D23, platform#160). Opt-in: `make openbao`. Production installs use the customer's own
+# store through External Secrets and never run this.
+#
+# Standalone, embedded `pebbledb` storage on one volume. The chart's default volume request is
+# 10 GiB, the minimum of the dev cluster's volume class. Auto-unseal with a static key mounted from
+# Secret `openbao-seal-key` (scripts/openbao-seal-key.sh): after a restart or a pod replacement the
+# store opens itself, which was verified by deleting the pod. That key protects the data at rest
+# only as well as the cluster protects its Secrets: fine for a sandbox, not for anything else.
+injector:
+  enabled: false
+csi:
+  enabled: false
+server:
+  # The chart puts a checksum of the server config on the pod template only with this flag; without
+  # it a changed config (the audit device of D27) would wait for the next restart before taking
+  # effect. With it, `make openbao` rolls the pod and the static seal opens it again by itself.
+  configAnnotation: true
+  # The chart defaults to OnDelete, so a changed pod template (the config checksum above) would not
+  # replace the pod. One sandbox store can roll normally, and the static seal opens it again.
+  updateStrategyType: RollingUpdate
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+  dataStorage:
+    enabled: true
+    size: 10Gi
+  extraVolumes:
+    # The chart mounts a Secret at <path>/<name>: /openbao/seal/openbao-seal-key/key
+    - { type: secret, name: openbao-seal-key, path: /openbao/seal }
+  standalone:
+    enabled: true
+    config: |
+      ui = false
+
+      listener "tcp" {
+        tls_disable = 1
+        address = "[::]:8200"
+        cluster_address = "[::]:8201"
+      }
+
+      storage "pebbledb" {
+        path = "/openbao/data/pebbledb"
+      }
+
+      seal "static" {
+        current_key_id = "key1"
+        current_key    = "file:///openbao/seal/openbao-seal-key/key"
+      }
+
+      # OpenBao 2.7 refuses to enable an audit device through the API ("use declarative, config-based audit
+      # device management instead"), so it is declared here. Every request and response is written to the pod's
+      # standard output as one JSON line; values are salted hashes, never plain text. Decision D27: sign-ins
+      # to the break-glass role and every read of a group value are recorded with the person.
+      audit "file" "to-stdout" {
+        description = "Write audit information to standard output."
+        options {
+          file_path = "stdout"
+        }
+      }

@@ -26,11 +26,20 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
     }];
     // The secrets contract (decision D23): External Secrets is the one component that talks to a
     // store, so it comes before any component whose pods read a synced Secret. `none` installs
-    // nothing; the store itself (platform mode) is planned by the secrets ticket that follows.
+    // nothing; the store itself (platform mode) is planned below.
     if spec.secrets.mode != SecretsMode::None {
         plan.push(ComponentPlan {
             name: "external-secrets",
             chart: Some("external-secrets/external-secrets"),
+        });
+    }
+    // The store itself, only in platform mode (decision D23): External Secrets syncs from it, so it
+    // is planned after the operator that talks to it. `external` mode installs no store — the
+    // enterprise runs one — and `none` installs neither.
+    if spec.secrets.mode == SecretsMode::Platform {
+        plan.push(ComponentPlan {
+            name: "openbao",
+            chart: Some("openbao/openbao"),
         });
     }
     if spec.pillars.notebooks {
@@ -174,6 +183,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "superset/superset" => Some("0.15.5"),
         "openfga/openfga" => Some("0.2.62"),
         "external-secrets/external-secrets" => Some("2.13.0"),
+        "openbao/openbao" => Some("0.30.4"),
         _ => None,
     }
 }
@@ -191,6 +201,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "superset/superset" => Some("https://apache.github.io/superset"),
         "openfga/openfga" => Some("https://openfga.github.io/helm-charts"),
         "external-secrets/external-secrets" => Some("https://charts.external-secrets.io"),
+        "openbao/openbao" => Some("https://openbao.github.io/openbao-helm"),
         _ => None,
     }
 }
@@ -325,21 +336,34 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
         };
-        for mode in [SecretsMode::Platform, SecretsMode::External] {
-            let plan = plan_platform(&PlatformInstanceSpec {
-                secrets: SecretsSpec { mode },
-                pillars: Pillars {
-                    notebooks: true,
-                    ..Default::default()
-                },
-                ..base.clone()
-            });
-            assert_eq!(
-                names(&plan),
-                vec!["cnpg", "external-secrets", "jupyterhub"],
-                "mode {mode:?}"
-            );
-        }
+        let plan_external = plan_platform(&PlatformInstanceSpec {
+            secrets: SecretsSpec {
+                mode: SecretsMode::External,
+            },
+            pillars: Pillars {
+                notebooks: true,
+                ..Default::default()
+            },
+            ..base.clone()
+        });
+        assert_eq!(
+            names(&plan_external),
+            vec!["cnpg", "external-secrets", "jupyterhub"]
+        );
+        let plan_platform_mode = plan_platform(&PlatformInstanceSpec {
+            secrets: SecretsSpec {
+                mode: SecretsMode::Platform,
+            },
+            pillars: Pillars {
+                notebooks: true,
+                ..Default::default()
+            },
+            ..base
+        });
+        assert_eq!(
+            names(&plan_platform_mode),
+            vec!["cnpg", "external-secrets", "openbao", "jupyterhub"]
+        );
     }
 
     #[test]
@@ -349,6 +373,57 @@ mod tests {
         assert_eq!(
             chart_repo(chart),
             Some("https://charts.external-secrets.io")
+        );
+    }
+
+    #[test]
+    fn platform_mode_plans_the_store_after_external_secrets() {
+        let base = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            secrets: SecretsSpec {
+                mode: SecretsMode::Platform,
+            },
+            ingress: Default::default(),
+        };
+        assert_eq!(
+            names(&plan_platform(&base)),
+            vec!["cnpg", "external-secrets", "openbao"]
+        );
+    }
+
+    #[test]
+    fn external_mode_plans_no_store() {
+        let base = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            secrets: SecretsSpec {
+                mode: SecretsMode::External,
+            },
+            ingress: Default::default(),
+        };
+        assert_eq!(
+            names(&plan_platform(&base)),
+            vec!["cnpg", "external-secrets"]
+        );
+    }
+
+    #[test]
+    fn openbao_is_pinned_at_the_platform_version_and_repo() {
+        assert_eq!(chart_version("openbao/openbao"), Some("0.30.4"));
+        assert_eq!(
+            chart_repo("openbao/openbao"),
+            Some("https://openbao.github.io/openbao-helm")
         );
     }
 
