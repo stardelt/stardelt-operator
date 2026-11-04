@@ -17,10 +17,10 @@ use kube::api::ObjectMeta;
 
 use crate::keycloak::IdentitySecret;
 
-/// The Secrets Superset reads before its release: the Flask secret, the local
-/// administrator (the only sign-in until O7b) and the Trino service account the
-/// datasource hook reads. Names and keys mirror stardelt-platform/scripts/app-secrets.sh.
-pub const SECRETS: [IdentitySecret; 3] = [
+/// The Secrets Superset reads before its release: the Flask secret and the local
+/// administrator (the only sign-in until O7b). The Trino service account Secret
+/// is owned by the Trino step now.
+pub const SECRETS: [IdentitySecret; 2] = [
     IdentitySecret {
         name: "superset-secret-key",
         fixed: &[],
@@ -30,12 +30,6 @@ pub const SECRETS: [IdentitySecret; 3] = [
     IdentitySecret {
         name: "superset-admin",
         fixed: &[("username", "admin")],
-        generated: &["password"],
-        fernet: &[],
-    },
-    IdentitySecret {
-        name: "trino-password-db",
-        fixed: &[("username", "superset")],
         generated: &["password"],
         fernet: &[],
     },
