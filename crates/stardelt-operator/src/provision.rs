@@ -25,8 +25,8 @@ use crate::{
     access_sync, airflow,
     controller::Context,
     crd::{
-        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec,
-        SecretsMode, StorageImpl,
+        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, SecretsMode,
+        StorageImpl,
     },
     identity, ingress, keycloak, network_policy, nova,
     objects::{

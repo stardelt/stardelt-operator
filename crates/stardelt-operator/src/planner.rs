@@ -346,7 +346,10 @@ mod tests {
             },
             ..base.clone()
         });
-        assert_eq!(names(&plan_external), vec!["cnpg", "external-secrets", "jupyterhub"]);
+        assert_eq!(
+            names(&plan_external),
+            vec!["cnpg", "external-secrets", "jupyterhub"]
+        );
         let plan_platform_mode = plan_platform(&PlatformInstanceSpec {
             secrets: SecretsSpec {
                 mode: SecretsMode::Platform,
@@ -388,7 +391,10 @@ mod tests {
             },
             ingress: Default::default(),
         };
-        assert_eq!(names(&plan_platform(&base)), vec!["cnpg", "external-secrets", "openbao"]);
+        assert_eq!(
+            names(&plan_platform(&base)),
+            vec!["cnpg", "external-secrets", "openbao"]
+        );
     }
 
     #[test]
@@ -406,13 +412,19 @@ mod tests {
             },
             ingress: Default::default(),
         };
-        assert_eq!(names(&plan_platform(&base)), vec!["cnpg", "external-secrets"]);
+        assert_eq!(
+            names(&plan_platform(&base)),
+            vec!["cnpg", "external-secrets"]
+        );
     }
 
     #[test]
     fn openbao_is_pinned_at_the_platform_version_and_repo() {
         assert_eq!(chart_version("openbao/openbao"), Some("0.30.4"));
-        assert_eq!(chart_repo("openbao/openbao"), Some("https://openbao.github.io/openbao-helm"));
+        assert_eq!(
+            chart_repo("openbao/openbao"),
+            Some("https://openbao.github.io/openbao-helm")
+        );
     }
 
     #[test]

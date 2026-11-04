@@ -1203,7 +1203,10 @@ mod tests {
     #[test]
     fn openbao_values_mount_the_seal_key_secret() {
         let values = golden_values("openbao");
-        assert_eq!(values["server"]["extraVolumes"][0]["name"], "openbao-seal-key");
+        assert_eq!(
+            values["server"]["extraVolumes"][0]["name"],
+            "openbao-seal-key"
+        );
         assert_eq!(values["server"]["extraVolumes"][0]["path"], "/openbao/seal");
         assert_eq!(values["injector"]["enabled"], false);
     }
