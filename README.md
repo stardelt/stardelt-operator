@@ -77,8 +77,10 @@ spec:
     mode: external        # none (default) | platform | external
 ```
 
-Platform mode also installs the store itself; until that lands, `platform` installs External
-Secrets only and the store is the administrator's.
+In `secrets.mode: platform` the operator installs OpenBao (`openbao/openbao` 0.30.4, standalone,
+`pebbledb` on one 10 GiB volume) and generates Secret `openbao-seal-key` once; the store is
+**not initialised** by this step, so it reports `Running 0/1` until the bootstrap ticket lands;
+`external` mode installs no store.
 
 A complete Entra instance is in
 [`examples/platforminstance-external-entra.yaml`](examples/platforminstance-external-entra.yaml):

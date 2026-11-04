@@ -116,6 +116,16 @@ pub const IDENTITY_SECRETS: [IdentitySecret; 3] = [
     },
 ];
 
+/// A random hex string of `len` random bytes (two lower-case hex characters each). The 24-byte
+/// case is [`generate_secret`]; OpenBao's static seal key needs 32 bytes (64 hex characters),
+/// the same size `openssl rand -hex 32` produces in `scripts/openbao-seal-key.sh`.
+pub fn generate_hex(len: usize) -> Result<String, IdentityError> {
+    let mut bytes = vec![0u8; len];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| IdentityError(format!("cannot generate a credential: {e}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// One generated credential: 48 lower-case hex chars (`openssl rand -hex 24` equivalent), from
 /// the same `getrandom` the S3 keys use. A failure is returned, never panicked on: the caller
 /// reports it as a status message.
@@ -995,5 +1005,15 @@ mod tests {
         let data = secret.data.expect("data");
         assert_eq!(data["fernet-key"].0.len(), 44);
         assert_eq!(data["password"].0.len(), 48, "a plain credential stays hex");
+    }
+
+    #[test]
+    fn generate_hex_produces_the_requested_length_and_differs() {
+        let key = generate_hex(32).expect("a key");
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!key.chars().any(|c| c.is_ascii_uppercase()));
+        assert_ne!(key, generate_hex(32).expect("a second key"));
+        assert_eq!(generate_secret().expect("secret").len(), 48);
     }
 }

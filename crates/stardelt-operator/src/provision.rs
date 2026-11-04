@@ -25,7 +25,8 @@ use crate::{
     access_sync, airflow,
     controller::Context,
     crd::{
-        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, StorageImpl,
+        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec,
+        SecretsMode, StorageImpl,
     },
     identity, ingress, keycloak, network_policy, nova,
     objects::{
@@ -912,6 +913,51 @@ async fn ensure_generated_secrets(
         true,
         format!("ready: created {created} / kept {kept}"),
     )
+}
+
+/// The static auto-unseal key of the sandbox secret store (`scripts/openbao-seal-key.sh`):
+/// Secret `openbao-seal-key`, key `key`, 64 hex characters, generated once and **never rotated** —
+/// changing it makes the store's data unreadable. The chart mounts it at /openbao/seal (step 2).
+pub async fn ensure_openbao_seal_key(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    if spec.secrets.mode != SecretsMode::Platform {
+        return None;
+    }
+    const NAME: &str = "openbao-seal-key";
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &spec.namespace);
+    let existing = match secrets.get_opt(NAME).await {
+        Ok(existing) => existing,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    if existing.is_some() {
+        return Some(status(NAME, true, "ready: kept"));
+    }
+    let key = match keycloak::generate_hex(32) {
+        Ok(key) => key,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    let secret = Secret {
+        metadata: ObjectMeta {
+            name: Some(NAME.into()),
+            namespace: Some(spec.namespace.clone()),
+            labels: Some(labels(&spec.namespace, "openbao")),
+            ..ObjectMeta::default()
+        },
+        data: Some(BTreeMap::from([(
+            "key".to_string(),
+            ByteString(key.into_bytes()),
+        )])),
+        ..Secret::default()
+    };
+    if let Err(e) = apply::<Secret>(&ctx.client, &spec.namespace, &secret, spec.dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    Some(status(NAME, true, "ready: created"))
 }
 
 /// The key names of a Secret. Values are never read: the operator only decides which keys are
