@@ -491,6 +491,11 @@ async fn apply_plan(
             }
         };
 
+        // In-cluster addresses in the values name the namespace the release goes to; fill it in here,
+        // where the namespace is known (a values file cannot know spec.namespace).
+        let mut values = values;
+        crate::values::substitute_namespace(&mut values, namespace);
+
         let release = HelmRelease {
             name: component.name.to_string(),
             chart: chart.to_string(),

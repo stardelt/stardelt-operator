@@ -114,6 +114,22 @@ pub fn substitute_base_domain(values: &mut Value, domain: &str) {
     }
 }
 
+/// Replace every `__NAMESPACE__` in the strings of a values document. The values files are static
+/// but `spec.namespace` is not (operator#37), so an in-cluster address that must follow the
+/// namespace carries the placeholder and is filled in when the plan is applied.
+pub fn substitute_namespace(values: &mut Value, namespace: &str) {
+    match values {
+        Value::String(text) => *text = text.replace("__NAMESPACE__", namespace),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| substitute_namespace(item, namespace)),
+        Value::Object(map) => map
+            .values_mut()
+            .for_each(|item| substitute_namespace(item, namespace)),
+        _ => {}
+    }
+}
+
 /// Sizing for one profile, applied between the golden values and anything the CR asks for.
 ///
 /// The platform already thinks this way: `make install-core SLIM=1` layers
@@ -1158,6 +1174,44 @@ mod tests {
         assert_eq!(values["a"], serde_json::json!("x.example.com"));
         assert_eq!(values["b"][0], serde_json::json!("y.example.com"));
         assert_eq!(values["n"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn namespace_placeholder_is_substituted_in_strings_only() {
+        let mut v = serde_json::json!({"a": "x.__NAMESPACE__", "b": ["y.__NAMESPACE__"], "n": 1});
+        substitute_namespace(&mut v, "lab");
+        assert_eq!(v["a"], serde_json::json!("x.lab"));
+        assert_eq!(v["b"][0], serde_json::json!("y.lab"));
+        assert_eq!(v["n"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn the_notebook_reaches_spark_and_the_store_in_its_own_namespace() {
+        let mut values = effective_values("jupyterhub", Profile::Full, None, None);
+        substitute_namespace(&mut values, "data");
+        let single = &values["singleuser"];
+        assert_eq!(
+            single["extraEnv"]["SPARK_REMOTE"],
+            serde_json::json!("sc://spark-connect.data.svc.cluster.local:15002")
+        );
+        assert_eq!(
+            single["extraEnv"]["STARDELT_SECRET_STORE_URL"],
+            serde_json::json!("http://openbao.data.svc.cluster.local:8200")
+        );
+        let rules = single["networkPolicy"]["egress"]
+            .as_array()
+            .expect("egress rules");
+        assert_eq!(rules.len(), 3);
+        assert_eq!(
+            rules[1]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            serde_json::json!("spark-connect")
+        );
+        assert_eq!(rules[1]["ports"][0]["port"], serde_json::json!(15002));
+        assert_eq!(
+            rules[2]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            serde_json::json!("openbao")
+        );
+        assert_eq!(rules[2]["ports"][0]["port"], serde_json::json!(8200));
     }
 
     #[test]
