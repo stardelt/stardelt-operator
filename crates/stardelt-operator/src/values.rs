@@ -748,6 +748,8 @@ mod tests {
             "stardelt-oidc-clients"
         );
         assert_eq!(secret["valueFrom"]["secretKeyRef"]["key"], "superset");
+        assert!(!text.contains("superset-analyst-role.py"));
+        assert!(!text.contains("superset-group-roles.py"));
         let init_script = values["init"]["initscript"].as_str().unwrap();
         assert!(!init_script.contains("superset-group-roles.py"));
         let import = values["extraConfigs"]["import_datasources.yaml"]

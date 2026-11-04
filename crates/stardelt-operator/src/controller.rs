@@ -40,7 +40,8 @@ use crate::provision::{
     ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets, ensure_bootstrap,
     ensure_catalog_database, ensure_discovery, ensure_identity, ensure_identity_secrets,
     ensure_ingress, ensure_keycloak, ensure_keycloak_pg, ensure_notebooks_bucket, ensure_nova,
-    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets, ensure_superset_secrets,
+    ensure_nova_pg, ensure_nova_session, ensure_s3_secrets, ensure_superset_group_roles,
+    ensure_superset_rbac, ensure_superset_secrets,
 };
 use crate::values::{effective_values, parse_values_document};
 
@@ -913,6 +914,7 @@ async fn reconcile_platform(
     let airflow_secrets = ensure_airflow_secrets(&ctx, &instance.spec).await;
     // Superset's Secrets come before its release.
     let superset_secrets = ensure_superset_secrets(&ctx, &instance.spec).await;
+    let superset_rbac = ensure_superset_rbac(&ctx, &instance.spec).await;
     let mut outcome = apply_plan(
         &ctx,
         &instance.spec.namespace,
@@ -929,10 +931,17 @@ async fn reconcile_platform(
     if let Some(secrets) = superset_secrets {
         outcome.components.push(secrets);
     }
+    if let Some(rbac) = superset_rbac {
+        // Applied before the release (the pods run as its ServiceAccount); reported with the other Superset steps.
+        outcome.components.push(rbac);
+    }
     if let Some(rbac) = ensure_airflow_rbac(&ctx, &instance.spec).await {
         outcome.components.push(rbac);
     }
     if let Some(job) = ensure_airflow_group_roles(&ctx, &instance.spec).await {
+        outcome.components.push(job);
+    }
+    if let Some(job) = ensure_superset_group_roles(&ctx, &instance.spec).await {
         outcome.components.push(job);
     }
     // The identity database comes before the contract that points the components at it.
