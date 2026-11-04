@@ -75,12 +75,23 @@ component that talks to a store, and it renders each `Connection` into the Secre
 spec:
   secrets:
     mode: external        # none (default) | platform | external
+    external:
+      provider:           # the ClusterSecretStore provider block, verbatim
+        vault:
+          server: https://vault.example.com
+          path: secret
+          version: "v2"
+          auth:
+            tokenSecretRef: { name: vault-token, key: token }
 ```
 
 In `secrets.mode: platform` the operator installs OpenBao (`openbao/openbao` 0.30.4, standalone,
 `pebbledb` on one 10 GiB volume) and generates Secret `openbao-seal-key` once; the store is
-**not initialised** by this step, so it reports `Running 0/1` until the bootstrap ticket lands;
-`external` mode installs no store.
+**not initialised** by this step, so it reports `Running 0/1` until the bootstrap ticket lands.
+In `secrets.mode: external` the operator publishes `ClusterSecretStore` `enterprise` from
+`spec.secrets.external.provider` verbatim; exactly one provider key; credentials must be referenced
+by Secret name (`secretRef`/`tokenSecretRef`/`authSecretRef`), never inline; the store is the
+enterprise's, so the operator installs nothing else.
 
 A complete Entra instance is in
 [`examples/platforminstance-external-entra.yaml`](examples/platforminstance-external-entra.yaml):

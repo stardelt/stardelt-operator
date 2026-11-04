@@ -265,6 +265,19 @@
           },
           "description": "Where the credentials of `Connection` objects come from; see [`SecretsSpec`].",
           "properties": {
+            "external": {
+              "description": "The enterprise's store; required for `external`, refused for the other modes.",
+              "nullable": true,
+              "properties": {
+                "provider": {
+                  "description": "The `provider` block of the `ClusterSecretStore` (`vault`, `aws`, `azurekv`, …), passed to\nExternal Secrets verbatim. Exactly one provider key; credentials are referenced by Secret\nname inside the block, never inline."
+                }
+              },
+              "required": [
+                "provider"
+              ],
+              "type": "object"
+            },
             "mode": {
               "default": "none",
               "description": "Which secret store the platform uses for user credentials (decision D23).",
@@ -372,6 +385,14 @@
         {
           "message": "ingress needs baseDomain (the hosts are built from it)",
           "rule": "!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || has(self.baseDomain)"
+        },
+        {
+          "message": "secrets.mode external needs secrets.external.provider (the ClusterSecretStore provider block)",
+          "rule": "!has(self.secrets) || !has(self.secrets.mode) || self.secrets.mode != 'external' || (has(self.secrets.external) && has(self.secrets.external.provider))"
+        },
+        {
+          "message": "secrets.external is only allowed with secrets.mode external",
+          "rule": "!has(self.secrets) || !has(self.secrets.external) || (has(self.secrets.mode) && self.secrets.mode == 'external')"
         }
       ]
     },

@@ -370,11 +370,23 @@ pub enum SecretsMode {
     External,
 }
 
+/// The enterprise's own store, used only in `secrets.mode: external` (decision D23).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+pub struct ExternalSecretsSpec {
+    /// The `provider` block of the `ClusterSecretStore` (`vault`, `aws`, `azurekv`, …), passed to
+    /// External Secrets verbatim. Exactly one provider key; credentials are referenced by Secret
+    /// name inside the block, never inline.
+    pub provider: serde_json::Value,
+}
+
 /// `PlatformInstance.spec.secrets`: where the credentials of `Connection` objects come from.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
 pub struct SecretsSpec {
     #[serde(default)]
     pub mode: SecretsMode,
+    /// The enterprise's store; required for `external`, refused for the other modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<ExternalSecretsSpec>,
 }
 
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
@@ -403,6 +415,14 @@ pub struct SecretsSpec {
     {
         "rule": "!has(self.ingress) || !has(self.ingress.enabled) || !self.ingress.enabled || has(self.baseDomain)",
         "message": "ingress needs baseDomain (the hosts are built from it)"
+    },
+    {
+        "rule": "!has(self.secrets) || !has(self.secrets.mode) || self.secrets.mode != 'external' || (has(self.secrets.external) && has(self.secrets.external.provider))",
+        "message": "secrets.mode external needs secrets.external.provider (the ClusterSecretStore provider block)"
+    },
+    {
+        "rule": "!has(self.secrets) || !has(self.secrets.external) || (has(self.secrets.mode) && self.secrets.mode == 'external')",
+        "message": "secrets.external is only allowed with secrets.mode external"
     }
 ]))]
 pub struct PlatformInstanceSpec {
@@ -2245,6 +2265,53 @@ mod tests {
         assert!(crd.contains(
             "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)"
         ));
+    }
+
+    #[test]
+    fn external_secrets_mode_deserializes_and_crd_has_cel_rules() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "secrets": {
+                    "mode": "external",
+                    "external": {
+                        "provider": {
+                            "vault": {
+                                "server": "https://vault.example.com",
+                                "path": "secret",
+                                "version": "v2",
+                                "auth": { "tokenSecretRef": { "name": "vault-token", "key": "token" } }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        assert!(pi.spec.secrets.external.is_some());
+        // external without mode still deserializes (CEL rejects it on the server, not serde)
+        let pi2: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "secrets": {
+                    "external": {
+                        "provider": { "vault": { "server": "https://vault.example.com" } }
+                    }
+                }
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        assert!(pi2.spec.secrets.external.is_some());
+
+        let crd = PlatformInstance::crd();
+        let crd_json = serde_json::to_value(&crd).unwrap();
+        let crd_str = serde_json::to_string(&crd_json).unwrap();
+        assert!(crd_str.contains("secrets.mode external needs secrets.external.provider"));
+        assert!(crd_str.contains("secrets.external is only allowed with secrets.mode external"));
     }
 
     #[test]

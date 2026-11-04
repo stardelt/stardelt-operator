@@ -339,6 +339,7 @@ mod tests {
         let plan_external = plan_platform(&PlatformInstanceSpec {
             secrets: SecretsSpec {
                 mode: SecretsMode::External,
+                external: None,
             },
             pillars: Pillars {
                 notebooks: true,
@@ -353,6 +354,7 @@ mod tests {
         let plan_platform_mode = plan_platform(&PlatformInstanceSpec {
             secrets: SecretsSpec {
                 mode: SecretsMode::Platform,
+                external: None,
             },
             pillars: Pillars {
                 notebooks: true,
@@ -388,6 +390,7 @@ mod tests {
             identity: Default::default(),
             secrets: SecretsSpec {
                 mode: SecretsMode::Platform,
+                external: None,
             },
             ingress: Default::default(),
         };
@@ -409,6 +412,7 @@ mod tests {
             identity: Default::default(),
             secrets: SecretsSpec {
                 mode: SecretsMode::External,
+                external: None,
             },
             ingress: Default::default(),
         };

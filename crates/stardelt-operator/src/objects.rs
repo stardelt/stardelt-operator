@@ -82,6 +82,18 @@ pub async fn apply_dynamic(
         .await
 }
 
+/// Same for a cluster-scoped object (the `ClusterSecretStore`).
+pub async fn apply_dynamic_cluster(
+    client: &Client,
+    resource: &ApiResource,
+    object: &DynamicObject,
+    dry_run: bool,
+) -> Result<DynamicObject, kube::Error> {
+    Api::<DynamicObject>::all_with(client.clone(), resource)
+        .patch(&object.name_any(), &params(dry_run), &Patch::Apply(object))
+        .await
+}
+
 /// The CloudNative-PG `Cluster` resource (`clusters.postgresql.cnpg.io/v1`).
 pub fn cnpg_cluster_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
