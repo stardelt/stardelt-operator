@@ -39,13 +39,15 @@ resources:
 # one: Lakekeeper is fail-closed, so while openfga is gone every table read answers 503.
 # Readiness stays at the chart's values on purpose: a store that cannot answer should leave the
 # Service, so Lakekeeper fails fast instead of waiting on a socket.
+# No liveness probe (platform#516, matching stardelt-platform/helm-values/openfga.yaml). The
+# failure mode is a node-wide stall: every pod times out at once and the process is starved, not
+# hung. The probe cannot tell the two apart, so it kills a store that would have recovered — and
+# Lakekeeper is fail-closed, so the restart denies every read until the new process is up.
+# Measured on the dev cluster 2026-11-04 16:18:47Z with the 5-minute budget in place (exit 137).
+# A crash or an OOM kill still restarts through the kubelet and the memory limit; for a hang,
+# readiness already takes the store out of the Service.
 livenessProbe:
-  enabled: true
-  initialDelaySeconds: 60
-  periodSeconds: 10
-  timeoutSeconds: 10
-  failureThreshold: 30
-  successThreshold: 1
+  enabled: false
 
 # No tracing, no metrics: nothing scrapes this release yet.
 telemetry:
