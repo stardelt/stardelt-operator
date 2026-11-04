@@ -1995,9 +1995,14 @@ mod tests {
             .iter()
             .position(|n| *n == "lakekeeper-network-policy")
             .expect("the network policy step");
+        let openfga_policy = names
+            .iter()
+            .position(|n| *n == "openfga-network-policy")
+            .expect("the openfga network policy step");
         assert!(bucket < archive);
         assert_eq!(archive + 1, policy, "{names:?}");
-        assert_eq!(policy + 1, bootstrap, "{names:?}");
+        assert_eq!(policy + 1, openfga_policy, "{names:?}");
+        assert_eq!(openfga_policy + 1, bootstrap, "{names:?}");
     }
 
     #[tokio::test]
