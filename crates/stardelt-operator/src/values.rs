@@ -1101,6 +1101,45 @@ mod tests {
     }
 
     #[test]
+    fn trino_identity_values_carry_the_file_access_control_rules() {
+        let values = identity_values("trino");
+        assert_eq!(values["accessControl"]["type"], "configmap");
+        let rules: serde_json::Value = serde_json::from_str(
+            values["accessControl"]["rules"]["rules.json"]
+                .as_str()
+                .expect("rules.json"),
+        )
+        .expect("rules.json is a JSON document");
+        let catalogs = rules["catalogs"].as_array().expect("catalogs");
+        assert!(
+            catalogs
+                .iter()
+                .any(|r| r["group"] == "stardelt-admins" && r["allow"] == "all")
+        );
+        assert!(
+            catalogs
+                .iter()
+                .any(|r| r["catalog"] == "(system|tpch|tpcds)" && r["allow"] == "none")
+        );
+        assert!(
+            rules["impersonation"]
+                .as_array()
+                .expect("impersonation")
+                .iter()
+                .any(|r| {
+                    r["original_user"] == "superset"
+                        && r["allow"] == serde_json::json!(true)
+                        && r["new_user"].as_str().unwrap().contains("[0-9a-f]{8}-")
+                })
+        );
+        // The OPA bridge file does not exist in this crate: listing it would stop Trino.
+        let extra = values["server"]["coordinatorExtraConfig"].as_str().unwrap();
+        assert!(!extra.contains("access-control.config-files"));
+        // The no-IdP path stays without access control (the overlay is merged last).
+        assert!(effective_values("trino", Profile::Full, None, None)["accessControl"].is_null());
+    }
+
+    #[test]
     fn superset_identity_values_name_the_public_trino_host() {
         let values = identity_values("superset");
         let import = values["extraConfigs"]["import_datasources.yaml"]

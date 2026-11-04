@@ -39,6 +39,35 @@ server:
 # Secret trino-password-db at /etc/trino/auth/password/password.db (operator#209).
 auth:
   passwordAuthSecret: trino-password-db
+# The file rules (stardelt-platform/helm-values/trino-identity.yaml): query visibility,
+# the three engine catalogs, table guards and the one impersonation grant. The chart renders
+# `access-control.properties` for `type: configmap` and mounts rules.json at
+# /etc/trino/access-control. Deliberately NOT copied: `access-control.config-files` — the
+# platform lists two files there because it also loads the OPA bridge; the operator has no
+# bridge yet, and a listed but missing file stops Trino from starting.
+accessControl:
+  type: configmap
+  rules:
+    rules.json: |-
+      {
+        "catalogs": [
+          {"group": "stardelt-admins", "allow": "all"},
+          {"catalog": "(system|tpch|tpcds)", "allow": "none"},
+          {"allow": "all"}
+        ],
+        "queries": [
+          {"group": "stardelt-admins", "allow": ["execute", "kill", "view"]},
+          {"allow": ["execute"]}
+        ],
+        "impersonation": [
+          {"original_user": "superset", "new_user": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "allow": true}
+        ],
+        "tables": [
+          {"group": "stardelt-admins", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]},
+          {"catalog": "system", "schema": "runtime", "table": "(tasks|transactions|optimizer_rule_stats)", "privileges": []},
+          {"privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]}
+        ]
+      }
 coordinator:
   # The PKCS12 keystore cert-manager writes into Secret trino-coordinator-tls. A
   # directory mount, not a subPath file: the directory appears when the Secret does
