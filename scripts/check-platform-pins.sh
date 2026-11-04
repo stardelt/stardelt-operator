@@ -51,4 +51,15 @@ while IFS= read -r chart; do
     echo "✓ $chart $planner_version"
   fi
 done < <(printf '%s\n' "${!PREFIX_OF[@]}" | sort)
+
+# Reverse coverage: every chart `chart_version` pins must also be checked here. A chart added to
+# the planner and forgotten in PREFIX_OF would otherwise be skipped without a word.
+while IFS= read -r chart; do
+  if [[ -z "${PREFIX_OF[$chart]:-}" ]]; then
+    echo "✗ $chart: pinned in chart_version but missing from PREFIX_OF in this script" >&2
+    status=1
+  fi
+done < <(awk '/^pub fn chart_version/,/^}/' "$PLANNER" \
+         | sed -n 's/^[[:space:]]*\"\([^\"]*\)\"[[:space:]]*=>[[:space:]]*Some(.*/\1/p' | sort -u)
+
 exit "$status"
