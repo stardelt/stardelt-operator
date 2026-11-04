@@ -3,7 +3,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use stardelt_operator::crd::{PlatformInstanceSpec, Profile};
 use stardelt_operator::identity_checklist;
-use stardelt_operator::values::effective_values;
+use stardelt_operator::values::{
+    deep_merge, effective_values, identity_values, substitute_base_domain,
+};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
@@ -23,19 +25,30 @@ fn main() -> anyhow::Result<()> {
     run_controller()
 }
 
-/// `stardelt-operator values <component> <demo|full|airgap>`.
+/// `stardelt-operator values <component> <demo|full|airgap> [--identity <baseDomain>]`.
+///
+/// With `--identity` the identity overlay is merged last and `__BASE_DOMAIN__` is replaced,
+/// in the controller's order (controller.rs:286-298), so the document can be diffed against
+/// stardelt-platform/helm-values/<component>-identity.yaml.
 ///
 /// An unknown component is not an error: it prints `{}`, like
 /// [`stardelt_operator::values::golden_values`]. Missing arguments and an
 /// unknown profile are usage errors (exit 2).
 fn values_command(args: Vec<String>) -> anyhow::Result<()> {
-    let (component, profile) = match args.as_slice() {
-        [component, profile] => (component.as_str(), profile.as_str()),
+    let (component, profile, identity_domain) = match args.as_slice() {
+        [component, profile] => (component.as_str(), profile.as_str(), None),
+        [component, profile, flag, domain] if flag == "--identity" && !domain.is_empty() => {
+            (component.as_str(), profile.as_str(), Some(domain.as_str()))
+        }
         _ => usage(),
     };
     let profile: Profile = serde_yaml::from_str(profile).unwrap_or_else(|_| usage());
 
-    let values = effective_values(component, profile, None, None);
+    let mut values = effective_values(component, profile, None, None);
+    if let Some(domain) = identity_domain {
+        values = deep_merge(values, identity_values(component));
+        substitute_base_domain(&mut values, domain);
+    }
     let mut document = serde_yaml::to_string(&values)?;
     if !document.ends_with('\n') {
         document.push('\n');
@@ -46,7 +59,9 @@ fn values_command(args: Vec<String>) -> anyhow::Result<()> {
 
 /// A CLI misuse: print the usage line on stderr and exit 2.
 fn usage() -> ! {
-    eprintln!("usage: stardelt-operator values <component> <demo|full|airgap>");
+    eprintln!(
+        "usage: stardelt-operator values <component> <demo|full|airgap> [--identity <baseDomain>]"
+    );
     std::process::exit(2)
 }
 
@@ -97,7 +112,9 @@ fn checklist_usage() -> ! {
 
 /// `stardelt-operator --help`.
 fn print_usage() {
-    println!("usage: stardelt-operator values <component> <demo|full|airgap>");
+    println!(
+        "usage: stardelt-operator values <component> <demo|full|airgap> [--identity <baseDomain>]"
+    );
     println!("       stardelt-operator identity-checklist <platforminstance.yaml> [--format json]");
 }
 

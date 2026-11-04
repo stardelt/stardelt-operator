@@ -80,3 +80,52 @@ fn an_unknown_profile_is_a_usage_error() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn the_identity_overlay_replaces_the_public_host() {
+    let output = run(&[
+        "values",
+        "superset",
+        "full",
+        "--identity",
+        "alpha.dev.stardelt.io",
+    ]);
+    assert!(
+        output.status.success(),
+        "values superset full --identity failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let parsed = parse_stdout(&output);
+    let serialized = serde_yaml::to_string(&parsed).unwrap();
+    assert!(!serialized.contains("__BASE_DOMAIN__"));
+    assert!(serialized.contains("trino://superset@trino.alpha.dev.stardelt.io:443/warehouse"));
+}
+
+#[test]
+fn trino_gains_access_control_only_with_the_flag() {
+    let output = run(&["values", "trino", "full"]);
+    assert!(output.status.success());
+    let parsed = parse_stdout(&output);
+    assert!(parsed["accessControl"].is_null());
+
+    let output = run(&["values", "trino", "full", "--identity", "example.com"]);
+    assert!(output.status.success());
+    let parsed = parse_stdout(&output);
+    assert_eq!(
+        parsed["accessControl"]["type"],
+        serde_json::json!("configmap")
+    );
+}
+
+#[test]
+fn an_empty_identity_domain_is_a_usage_error() {
+    let output = run(&["values", "trino", "full", "--identity"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn an_unknown_flag_is_a_usage_error() {
+    let output = run(&["values", "trino", "full", "--nope", "x"]);
+    assert_eq!(output.status.code(), Some(2));
+}
