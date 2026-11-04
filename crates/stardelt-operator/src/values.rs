@@ -52,13 +52,17 @@ pub fn golden_values(component: &str) -> Value {
         "airflow" => serde_yaml::from_str(include_str!("../values/airflow.yaml"))
             .expect("values/airflow.yaml is not valid YAML"),
         // The `dashboards` pillar: the platform's helm-values/superset.yaml with short in-cluster
-        // addresses and no Reloader. The OIDC/login snippet is injected here because it is a Python
-        // file, like `jupyterhub_oidc.py` (values/superset.yaml deliberately omits it).
+        // addresses. The analyst-role script is injected from src/ because the chart mounts
+        // `extraConfigs` as a ConfigMap and the init Job runs what is there, exactly like the
+        // platform's `--set-file` in its Makefile. The OIDC/login snippet is injected here
+        // because it is a Python file, like `jupyterhub_oidc.py`.
         "superset" => {
             let mut values: Value = serde_yaml::from_str(include_str!("../values/superset.yaml"))
                 .expect("values/superset.yaml is not valid YAML");
             values["configOverrides"]["oauth"] =
                 Value::String(include_str!("superset_oidc.py").into());
+            values["extraConfigs"]["superset-analyst-role.py"] =
+                Value::String(include_str!("superset_analyst_role.py").into());
             values
         }
         _ => Value::Object(Map::new()),
@@ -745,7 +749,6 @@ mod tests {
         );
         assert_eq!(secret["valueFrom"]["secretKeyRef"]["key"], "superset");
         let init_script = values["init"]["initscript"].as_str().unwrap();
-        assert!(!init_script.contains("superset-analyst-role.py"));
         assert!(!init_script.contains("superset-group-roles.py"));
         let import = values["extraConfigs"]["import_datasources.yaml"]
             .as_str()
@@ -753,6 +756,31 @@ mod tests {
         assert!(import.contains("trino://superset@trino:8080/"));
         assert!(import.contains("warehouse"));
         assert!(import.contains("shared"));
+    }
+
+    #[test]
+    fn superset_init_converges_the_analyst_role() {
+        let values = golden_values("superset");
+        assert_eq!(
+            values["extraConfigs"]["superset-analyst-role.py"],
+            include_str!("superset_analyst_role.py")
+        );
+        let script = include_str!("superset_analyst_role.py");
+        assert!(script.contains("catalog_from_uri"));
+        assert!(script.contains("\"shared\""));
+        assert!(script.contains("stardelt-analyst"));
+        let init_script = values["init"]["initscript"].as_str().unwrap();
+        assert!(
+            init_script
+                .contains("python \"{{ .Values.extraConfigMountPath }}/superset-analyst-role.py\"")
+        );
+        assert!(init_script.contains("Converging the analyst role"));
+        let text = include_str!("../values/superset.yaml");
+        assert!(!text.contains("catalog_from_uri"));
+        let import = values["extraConfigs"]["import_datasources.yaml"]
+            .as_str()
+            .unwrap();
+        assert!(import.contains("trino://superset@trino:8080/shared"));
     }
 
     #[test]
