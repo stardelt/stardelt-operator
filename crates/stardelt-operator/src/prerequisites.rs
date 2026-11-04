@@ -671,7 +671,6 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
                     }],
                     ..Default::default()
                 }),
-                ..Default::default()
             },
             ..Default::default()
         }),
