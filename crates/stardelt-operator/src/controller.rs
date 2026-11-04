@@ -962,7 +962,14 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         None
     };
     // The discovery ConfigMap is published last: it advertises a working catalog.
-    let discovery = ensure_discovery(&ctx, &lh, &namespace, bootstrap.ready).await;
+    let discovery = ensure_discovery(
+        &ctx,
+        &lh,
+        &namespace,
+        bootstrap.ready,
+        identity_contract && trino_ready,
+    )
+    .await;
     let mut components = vec![s3, openfga_database, database];
     components.append(&mut outcome.components);
     components.extend(notebooks_bucket);
