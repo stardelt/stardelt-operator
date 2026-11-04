@@ -20,6 +20,12 @@ env:
     secretKeyRef:
       name: stardelt-s3-creds
       key: secret-key
+- name: NOVA_EVENTS_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: nova-events
+      key: token
+      optional: true
 # TODO(polaris): under `spec.catalog.implementation: polaris` this
 # URI is wrong; Polaris has no adapter yet, so the Lakekeeper URI
 # stays until one lands.
@@ -151,3 +157,15 @@ worker:
     mountPath: /var/trino/cache
   - name: trino-dumps
     mountPath: /dumps
+
+# Query log feed (stardelt-nova#116, decision D25): Trino's HTTP event listener posts every
+# query-created and query-completed event to Nova's internal port, where the collector turns
+# them into rows of the user-facing query log. The token comes from Secret `nova-events`
+# through `NOVA_EVENTS_TOKEN`, so it never appears in a ConfigMap.
+eventListenerProperties:
+  - event-listener.name=http
+  - http-event-listener.log-created=true
+  - http-event-listener.log-completed=true
+  - http-event-listener.connect-ingest-uri=http://nova:8081/internal/trino-events
+  - http-event-listener.connect-http-headers=Authorization:Bearer ${ENV:NOVA_EVENTS_TOKEN},X-Stardelt-Warehouse:default
+  - http-event-listener.connect-retry-count=2
