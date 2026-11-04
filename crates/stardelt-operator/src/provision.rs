@@ -1726,6 +1726,7 @@ pub async fn ensure_ingress(ctx: &Context, spec: &PlatformInstanceSpec) -> Optio
     let mut objects = Vec::new();
     if spec.pillars.lakehouse {
         objects.extend(ingress::nova(spec));
+        objects.extend(ingress::trino(spec));
     }
     objects.extend(ingress::keycloak(spec));
     if spec.pillars.pipelines {
@@ -2892,11 +2893,15 @@ mod tests {
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
-            Some("planned (dry-run): Ingress nova, keycloak")
+            Some("planned (dry-run): Ingress nova, trino, keycloak")
         );
         assert_eq!(
             applied_paths(&requests),
-            [format!("{INGRESSES}/nova"), format!("{INGRESSES}/keycloak")]
+            [
+                format!("{INGRESSES}/nova"),
+                format!("{INGRESSES}/trino"),
+                format!("{INGRESSES}/keycloak")
+            ]
         );
     }
 
@@ -2910,7 +2915,10 @@ mod tests {
         .await
         .expect("a status");
         assert!(status.ready, "{status:?}");
-        assert_eq!(status.message.as_deref(), Some("applied: nova, keycloak"));
+        assert_eq!(
+            status.message.as_deref(),
+            Some("applied: nova, trino, keycloak")
+        );
         let requests = requests.lock().expect("requests poisoned");
         let body = |name: &str| -> serde_json::Value {
             let found = requests
