@@ -65,6 +65,10 @@ pub fn golden_values(component: &str) -> Value {
                 Value::String(include_str!("superset_analyst_role.py").into());
             values
         }
+        // The catalog's permission store (O5): the platform's helm-values/openfga.yaml, verbatim —
+        // it has no namespace-qualified address (the DSN comes from Secret `openfga-pg-app`).
+        "openfga" => serde_yaml::from_str(include_str!("../values/openfga.yaml"))
+            .expect("values/openfga.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }
@@ -195,6 +199,24 @@ mod tests {
             seaweedfs["global"]["seaweedfs"]["createClusterRole"],
             serde_json::json!(false)
         );
+    }
+
+    #[test]
+    fn openfga_golden_values_mirror_the_platform_shape() {
+        let o = golden_values("openfga");
+        assert_eq!(
+            o["datastore"]["uriSecret"],
+            serde_json::json!("openfga-pg-app")
+        );
+        assert_eq!(
+            o["datastore"]["migrationType"],
+            serde_json::json!("initContainer")
+        );
+        assert_eq!(
+            o["image"]["repository"],
+            serde_json::json!("openfga/openfga")
+        );
+        assert_eq!(o["image"]["tag"], serde_json::json!("v1.14.0"));
     }
 
     #[test]

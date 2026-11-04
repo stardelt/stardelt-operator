@@ -227,6 +227,49 @@ pub fn keycloak_pg_backup(namespace: &str) -> DynamicObject {
     }
 }
 
+/// The CloudNative-PG `Cluster` of the catalog's permission store (O5). Mirrors
+/// `stardelt-platform/manifests/openfga-pg.yaml`.
+pub fn openfga_pg_cluster(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "Cluster".into(),
+        }),
+        metadata: platform_meta("openfga-pg", namespace, "openfga-pg"),
+        data: json!({"spec": {
+            "instances": 1,
+            "imageName": "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
+            "storage": {"size": "1Gi"},
+            "backup": continuous_backup(namespace),
+            "bootstrap": {"initdb": {"database": "openfga", "owner": "openfga"}},
+            "resources": {
+                "requests": {"cpu": "50m", "memory": "256Mi"},
+                "limits": {"cpu": "1", "memory": "2Gi"},
+            },
+            "postgresql": {"parameters": {"max_connections": "150"}},
+            "probes": {"startup": {"failureThreshold": 120}},
+        }}),
+    }
+}
+
+/// The daily base backup of the permission store; same window as the catalog's.
+pub fn openfga_pg_backup(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "postgresql.cnpg.io/v1".into(),
+            kind: "ScheduledBackup".into(),
+        }),
+        metadata: platform_meta("openfga-pg-daily", namespace, "openfga-pg"),
+        data: json!({"spec": {
+            "schedule": "0 30 2 * * *",
+            "immediate": true,
+            "backupOwnerReference": "self",
+            "method": "barmanObjectStore",
+            "cluster": {"name": "openfga-pg"},
+        }}),
+    }
+}
+
 /// The daily base backup of the catalog database. Mirrors the platform manifest.
 pub fn catalog_pg_backup(lakehouse: &str, namespace: &str) -> DynamicObject {
     DynamicObject {
@@ -801,6 +844,23 @@ mod tests {
         assert_eq!(spec["backupOwnerReference"], "self");
         assert_eq!(spec["method"], "barmanObjectStore");
         assert_eq!(spec["cluster"]["name"], "keycloak-pg");
+    }
+
+    #[test]
+    fn the_openfga_cluster_uses_its_own_database_and_backup() {
+        let cluster = openfga_pg_cluster("data");
+        assert_eq!(
+            cluster.data["spec"]["bootstrap"]["initdb"]["database"],
+            "openfga"
+        );
+        assert_eq!(cluster.data["spec"]["storage"]["size"], "1Gi");
+        assert_eq!(
+            cluster.data["spec"]["backup"]["barmanObjectStore"]["destinationPath"],
+            "s3://backups/"
+        );
+        let backup = openfga_pg_backup("data");
+        assert_eq!(backup.data["spec"]["cluster"]["name"], "openfga-pg");
+        assert_eq!(backup.data["spec"]["schedule"], "0 30 2 * * *");
     }
 
     #[test]
