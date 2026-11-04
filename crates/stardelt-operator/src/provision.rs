@@ -17,8 +17,9 @@ use k8s_openapi::{
 use kube::{
     Api, ResourceExt,
     api::{Patch, PatchParams},
-    core::DynamicObject,
+    core::{DynamicObject, ObjectMeta, TypeMeta},
 };
+use serde_json::json;
 
 use crate::{
     access_sync, airflow,
@@ -28,8 +29,8 @@ use crate::{
     },
     identity, ingress, keycloak, network_policy, nova,
     objects::{
-        apply, apply_dynamic, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
-        owner_reference,
+        apply, apply_dynamic, cert_manager_certificate_resource, cert_manager_issuer_resource,
+        cnpg_cluster_resource, cnpg_scheduled_backup_resource, labels, owner_reference,
     },
     pg_dump,
     prerequisites::{
@@ -56,6 +57,136 @@ fn status(name: &str, ready: bool, message: impl Into<String>) -> ComponentStatu
 fn text(secret: &Secret, key: &str) -> Option<String> {
     let ByteString(bytes) = secret.data.as_ref()?.get(key)?;
     String::from_utf8(bytes.clone()).ok()
+}
+
+/// The self-signed root of the Trino trust anchor (manifests/trino-tls.yaml, object 1).
+pub fn trino_selfsigned_issuer(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "cert-manager.io/v1".into(),
+            kind: "Issuer".into(),
+        }),
+        metadata: ObjectMeta {
+            name: Some("trino-selfsigned".into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels(namespace, "trino-tls")),
+            ..Default::default()
+        },
+        data: json!({
+            "spec": {
+                "selfSigned": {}
+            }
+        }),
+    }
+}
+
+/// The namespace-local CA certificate (object 2): isCA true, commonName
+/// "stardelt internal CA (trino)", secretName "trino-ca", duration "43800h",
+/// renewBefore "8760h", usages ["cert sign", "crl sign"], privateKey {algorithm: RSA, size: 2048},
+/// issuerRef {name: "trino-selfsigned", kind: "Issuer"}.
+pub fn trino_ca_certificate(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "cert-manager.io/v1".into(),
+            kind: "Certificate".into(),
+        }),
+        metadata: ObjectMeta {
+            name: Some("trino-ca".into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels(namespace, "trino-tls")),
+            ..Default::default()
+        },
+        data: json!({
+            "spec": {
+                "isCA": true,
+                "commonName": "stardelt internal CA (trino)",
+                "secretName": "trino-ca",
+                "duration": "43800h",
+                "renewBefore": "8760h",
+                "usages": ["cert sign", "crl sign"],
+                "privateKey": {
+                    "algorithm": "RSA",
+                    "size": 2048
+                },
+                "issuerRef": {
+                    "name": "trino-selfsigned",
+                    "kind": "Issuer"
+                }
+            }
+        }),
+    }
+}
+
+/// The CA issuer that signs the coordinator certificate (object 3): spec.ca.secretName "trino-ca".
+pub fn trino_ca_issuer(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "cert-manager.io/v1".into(),
+            kind: "Issuer".into(),
+        }),
+        metadata: ObjectMeta {
+            name: Some("trino-ca".into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels(namespace, "trino-tls")),
+            ..Default::default()
+        },
+        data: json!({
+            "spec": {
+                "ca": {
+                    "secretName": "trino-ca"
+                }
+            }
+        }),
+    }
+}
+
+/// The coordinator certificate (object 4), including the PKCS12 keystore Trino loads:
+/// secretName "trino-coordinator-tls", duration "2160h", renewBefore "720h",
+/// usages ["server auth"], dnsNames ["trino", "trino.<ns>", "trino.<ns>.svc",
+/// "trino.<ns>.svc.cluster.local"], keystores.pkcs12 {create: true, profile: "Modern2023",
+/// passwordSecretRef {name: "trino-tls-keystore", key: "password"}},
+/// issuerRef {name: "trino-ca", kind: "Issuer"}.
+pub fn trino_coordinator_certificate(namespace: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "cert-manager.io/v1".into(),
+            kind: "Certificate".into(),
+        }),
+        metadata: ObjectMeta {
+            name: Some("trino-coordinator-tls".into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels(namespace, "trino-tls")),
+            ..Default::default()
+        },
+        data: json!({
+            "spec": {
+                "secretName": "trino-coordinator-tls",
+                "duration": "2160h",
+                "renewBefore": "720h",
+                "usages": ["server auth"],
+                "dnsNames": [
+                    "trino",
+                    format!("trino.{}", namespace),
+                    format!("trino.{}.svc", namespace),
+                    format!("trino.{}.svc.cluster.local", namespace)
+                ],
+                "keystores": {
+                    "pkcs12": {
+                        "create": true,
+                        "profile": "Modern2023",
+                        "passwordSecretRef": {
+                            "name": "trino-tls-keystore",
+                            "key": "password"
+                        }
+                    }
+                },
+                "issuerRef": {
+                    "name": "trino-ca",
+                    "kind": "Issuer"
+                }
+            }
+        }),
+    }
 }
 
 /// The key pair of an existing `stardelt-s3-creds`, if it has both keys.
@@ -1189,6 +1320,64 @@ pub async fn ensure_trino_config_maps(
         true,
         format!("created {created} / kept {kept}"),
     ))
+}
+
+/// Secret that holds the PKCS12 keystore password of the coordinator certificate. Generated
+/// once and kept: a re-issue with a different password needs a new Certificate as well
+/// (stardelt-platform/scripts/trino-tls-secret.sh documents the rotation).
+pub const TRINO_KEYSTORE_SECRET: &str = "trino-tls-keystore";
+const TRINO_KEYSTORE: keycloak::IdentitySecret = keycloak::IdentitySecret {
+    name: TRINO_KEYSTORE_SECRET,
+    fixed: &[],
+    generated: &["password"],
+    fernet: &[],
+};
+
+/// The Trino trust anchor for `identity.mode: platform`: the keystore password Secret first
+/// (cert-manager never issues a certificate whose keystore password Secret is missing), then
+/// the two Issuers and the two Certificates of manifests/trino-tls.yaml.
+pub async fn ensure_trino_tls(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "trino-tls";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    let secret = ensure_generated_secrets(ctx, spec, NAME, &[TRINO_KEYSTORE]).await;
+    if !secret.ready && !spec.dry_run {
+        return Some(secret);
+    }
+    for (resource, object) in [
+        (
+            cert_manager_issuer_resource(),
+            trino_selfsigned_issuer(namespace),
+        ),
+        (
+            cert_manager_certificate_resource(),
+            trino_ca_certificate(namespace),
+        ),
+        (cert_manager_issuer_resource(), trino_ca_issuer(namespace)),
+        (
+            cert_manager_certificate_resource(),
+            trino_coordinator_certificate(namespace),
+        ),
+    ] {
+        if let Err(e) =
+            apply_dynamic(&ctx.client, namespace, &resource, &object, spec.dry_run).await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): the Trino trust anchor",
+        ));
+    }
+    Some(status(NAME, true, "the Trino trust anchor is applied"))
 }
 
 /// The CronJob that turns `Catalog` objects into Lakekeeper warehouses and `SqlWarehouse`
@@ -3394,6 +3583,56 @@ mod tests {
         let spec = platform("external", false);
         assert!(ensure_access_sync(&ctx, &spec).await.is_none());
         assert!(ensure_trino_config_maps(&ctx, &spec).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn trino_tls_creates_the_anchor_once_identity_is_platform() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("platform", false);
+        let status = ensure_trino_tls(&ctx, &spec).await.expect("a status");
+        assert!(status.ready);
+        let paths = applied_paths(&requests);
+        let cert_paths: Vec<String> = paths
+            .into_iter()
+            .filter(|p| p.contains("/apis/cert-manager.io/v1/"))
+            .collect();
+        assert_eq!(cert_paths.len(), 4);
+        assert!(cert_paths[0].contains("/issuers/"));
+        assert!(cert_paths[1].contains("/certificates/"));
+        assert!(cert_paths[2].contains("/issuers/"));
+        assert!(cert_paths[3].contains("/certificates/"));
+        let reqs = requests.lock().expect("requests poisoned");
+        let cert_reqs: Vec<_> = reqs
+            .iter()
+            .filter(|(_, p, _)| p.contains("/apis/cert-manager.io/v1/"))
+            .cloned()
+            .collect();
+        let kinds: Vec<String> = (0..4)
+            .map(|i| {
+                let body: serde_json::Value = serde_json::from_str(&cert_reqs[i].2).expect("json");
+                body["kind"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["Issuer", "Certificate", "Issuer", "Certificate"]
+        );
+        let coord: serde_json::Value = serde_json::from_str(&cert_reqs[3].2).expect("json");
+        assert_eq!(
+            coord["spec"]["keystores"]["pkcs12"]["passwordSecretRef"]["name"],
+            "trino-tls-keystore"
+        );
+        let dns = coord["spec"]["dnsNames"].as_array().expect("dnsNames");
+        assert_eq!(dns.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn trino_tls_is_skipped_without_the_platform_identity_provider() {
+        let (client, _store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("none", false);
+        assert!(ensure_trino_tls(&ctx, &spec).await.is_none());
     }
 
     #[tokio::test]

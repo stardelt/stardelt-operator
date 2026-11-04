@@ -98,6 +98,22 @@ pub fn cnpg_scheduled_backup_resource() -> ApiResource {
     )
 }
 
+/// A cert-manager `Issuer` (`issuers.cert-manager.io/v1`).
+pub fn cert_manager_issuer_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("cert-manager.io", "v1", "Issuer"),
+        "issuers",
+    )
+}
+
+/// A cert-manager `Certificate` (`certificates.cert-manager.io/v1`).
+pub fn cert_manager_certificate_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("cert-manager.io", "v1", "Certificate"),
+        "certificates",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,6 +141,24 @@ mod tests {
         assert_eq!(
             (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
             ("postgresql.cnpg.io", "v1", "scheduledbackups")
+        );
+    }
+
+    #[test]
+    fn issuer_resource_points_at_cert_manager() {
+        let r = cert_manager_issuer_resource();
+        assert_eq!(
+            (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
+            ("cert-manager.io", "v1", "issuers")
+        );
+    }
+
+    #[test]
+    fn certificate_resource_points_at_cert_manager() {
+        let r = cert_manager_certificate_resource();
+        assert_eq!(
+            (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
+            ("cert-manager.io", "v1", "certificates")
         );
     }
 
