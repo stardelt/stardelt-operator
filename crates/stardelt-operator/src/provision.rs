@@ -43,7 +43,7 @@ use crate::{
         notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, openfga_pg_backup,
         openfga_pg_cluster, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
     },
-    secrets, superset,
+    secrets, spark, superset,
 };
 use k8s_openapi::api::batch::v1::CronJob;
 
@@ -524,6 +524,87 @@ pub async fn ensure_notebooks_bucket(
             })
         }
         Ok(_) => Some(status(NAME, false, "the bucket Job is running")),
+    }
+}
+
+/// The Spark Connect endpoint (operator#239's builders, O8 part 4b): applied only with
+/// `spec.compute.spark.enabled`. It reads the Lakehouse's own Secret `stardelt-s3-creds`, so the
+/// step waits for it like the bucket Jobs do.
+pub async fn ensure_spark(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Option<ComponentStatus> {
+    const NAME: &str = spark::NAME;
+    if !lh.spec.compute.spark.enabled {
+        return None;
+    }
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    match secrets.get_opt(S3_SECRET).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Some(status(NAME, false, "waiting for Secret stardelt-s3-creds")),
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    }
+    let dry_run = lh.spec.dry_run;
+    let client = &ctx.client;
+    if let Err(e) = apply::<ServiceAccount>(
+        client,
+        namespace,
+        &spark::service_account(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Role>(client, namespace, &spark::role(namespace), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) =
+        apply::<RoleBinding>(client, namespace, &spark::role_binding(namespace), dry_run).await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) =
+        apply::<ConfigMap>(client, namespace, &spark::config_map(namespace), dry_run).await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Service>(client, namespace, &spark::service(namespace), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    let applied = match apply::<Deployment>(
+        client,
+        namespace,
+        &spark::deployment(namespace),
+        dry_run,
+    )
+    .await
+    {
+        Ok(applied) => applied,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    if dry_run {
+        return Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): Deployment {}", spark::NAME),
+        ));
+    }
+    if applied
+        .status
+        .as_ref()
+        .and_then(|s| s.available_replicas)
+        .unwrap_or(0)
+        >= 1
+    {
+        Some(status(NAME, true, "running"))
+    } else {
+        Some(status(
+            NAME,
+            false,
+            "waiting for the Deployment to become ready",
+        ))
     }
 }
 
@@ -4074,5 +4155,41 @@ mod tests {
             paths.last().cloned().unwrap_or_default(),
             "/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/openfga-ingress"
         );
+    }
+
+    #[tokio::test]
+    async fn spark_is_not_applied_unless_compute_spark_is_enabled() {
+        let (client, requests) = mock_client(true);
+        let lh = lakehouse();
+        assert!(ensure_spark(&context(client), &lh, "data").await.is_none());
+        assert!(requests.lock().expect("requests poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn spark_applies_the_six_objects_and_reports_the_deployment() {
+        let (client, requests) = mock_client(true);
+        let mut lh = lakehouse();
+        lh.spec.compute.spark.enabled = true;
+        let status = ensure_spark(&context(client), &lh, "data")
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "spark-connect");
+        assert!(!status.ready, "the mock Deployment has no status");
+        let paths: Vec<String> = requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|(method, _, _)| method == "PATCH")
+            .map(|(_, path, _)| path.clone())
+            .collect();
+        let expected = [
+            "/api/v1/namespaces/data/serviceaccounts/spark-connect",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-connect",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-connect",
+            "/api/v1/namespaces/data/configmaps/spark-connect-config",
+            "/api/v1/namespaces/data/services/spark-connect",
+            "/apis/apps/v1/namespaces/data/deployments/spark-connect",
+        ];
+        assert_eq!(paths, expected);
     }
 }
