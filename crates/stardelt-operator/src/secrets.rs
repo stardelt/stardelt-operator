@@ -2,13 +2,53 @@
 //! `ClusterSecretStore` named [`ENTERPRISE_STORE`], rendered from the CR's verbatim provider block.
 //! The decisions are pure functions so they are tested without a cluster.
 
-use kube::core::{ApiResource, GroupVersionKind};
+use std::collections::BTreeMap;
+
+use k8s_openapi::api::core::v1::ConfigMap;
+use kube::{
+    api::ObjectMeta,
+    core::{ApiResource, GroupVersionKind},
+};
 use serde_json::Value;
 
 use crate::crd::{PlatformInstanceSpec, SecretsMode};
 
 /// The name every external-mode `ExternalSecret` references.
 pub const ENTERPRISE_STORE: &str = "enterprise";
+
+/// The ConfigMap a namespace's `Connection` objects read to learn where their store is. Same shape
+/// as `stardelt-identity`: the platform publishes it, the controllers read it and default to `none`.
+pub const MODE_CONFIGMAP: &str = "stardelt-secrets";
+
+/// Value of the `stardelt.io/secrets-mode` label and the `mode` key.
+pub fn mode_label(mode: SecretsMode) -> &'static str {
+    match mode {
+        SecretsMode::None => "none",
+        SecretsMode::Platform => "platform",
+        SecretsMode::External => "external",
+    }
+}
+
+/// ConfigMap `stardelt-secrets` for `spec.namespace`: key `mode` is `none`, `platform` or `external`.
+pub fn mode_config_map(spec: &PlatformInstanceSpec, namespace: &str) -> ConfigMap {
+    let mode = mode_label(spec.secrets.mode);
+    ConfigMap {
+        metadata: ObjectMeta {
+            name: Some(MODE_CONFIGMAP.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                (
+                    "app.kubernetes.io/part-of".to_string(),
+                    "stardelt".to_string(),
+                ),
+                ("stardelt.io/secrets-mode".to_string(), mode.to_string()),
+            ])),
+            ..ObjectMeta::default()
+        },
+        data: Some(BTreeMap::from([("mode".to_string(), mode.to_string())])),
+        ..ConfigMap::default()
+    }
+}
 
 /// The External Secrets `ClusterSecretStore` resource (`clustersecretstores.external-secrets.io/v1`).
 pub fn cluster_secret_store_resource() -> ApiResource {
@@ -143,6 +183,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("secretRef"));
+    }
+
+    #[test]
+    fn mode_config_map_carries_the_mode_for_each_kind() {
+        use crate::crd::{ComponentValues, IdentitySpec, IngressSettings, Pillars, Profile};
+        let base = PlatformInstanceSpec {
+            profile: Profile::Demo,
+            pillars: Pillars::default(),
+            dry_run: true,
+            component_values: ComponentValues::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: IdentitySpec::default(),
+            secrets: crate::crd::SecretsSpec {
+                mode: SecretsMode::None,
+                external: None,
+            },
+            ingress: IngressSettings::default(),
+        };
+        for (mode, label) in [
+            (SecretsMode::None, "none"),
+            (SecretsMode::Platform, "platform"),
+            (SecretsMode::External, "external"),
+        ] {
+            let mut spec = base.clone();
+            spec.secrets.mode = mode;
+            let cm = mode_config_map(&spec, "stardelt");
+            assert_eq!(cm.metadata.name.as_deref(), Some("stardelt-secrets"));
+            assert_eq!(cm.metadata.namespace.as_deref(), Some("stardelt"));
+            let labels = cm.metadata.labels.as_ref().unwrap();
+            assert_eq!(labels.get("stardelt.io/secrets-mode").unwrap(), label);
+            assert_eq!(labels.get("app.kubernetes.io/part-of").unwrap(), "stardelt");
+            let data = cm.data.as_ref().unwrap();
+            assert_eq!(data.get("mode").unwrap(), label);
+        }
     }
 
     #[test]

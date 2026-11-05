@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Api, ResourceExt,
     api::{DynamicObject, Patch, PatchParams},
@@ -18,9 +19,10 @@ use serde_json::{Value, json};
 
 use crate::controller::Context;
 use crate::crd::{
-    Condition, Connection, ConnectionScope, ConnectionSpec, ConnectionStatus,
+    Condition, Connection, ConnectionScope, ConnectionSpec, ConnectionStatus, SecretsMode,
     connection_secret_name,
 };
+use crate::secrets;
 
 /// The External Secrets `ExternalSecret` resource (`externalsecrets.external-secrets.io/v1`).
 pub fn external_secret_resource() -> ApiResource {
@@ -70,31 +72,52 @@ pub fn store_name(spec: &ConnectionSpec) -> Result<String, String> {
 }
 
 /// Decide what to apply for the connection `name` in `namespace` (owner `uid`).
-pub fn plan(spec: &ConnectionSpec, name: &str, namespace: &str, uid: &str) -> Plan {
+pub fn plan(
+    spec: &ConnectionSpec,
+    name: &str,
+    namespace: &str,
+    uid: &str,
+    mode: SecretsMode,
+) -> Plan {
     if let Err(message) = spec.validate(name) {
         return Plan::Invalid {
             reason: "InvalidSpec",
             message,
         };
     }
-    // The author must not choose the path: it would let a group read another group's secret. A path
-    // of one's own is for the customer's store (`spec.secrets` mode external), which does not exist yet.
-    if spec.secret.remote_ref.is_some() {
-        return Plan::Invalid {
-            reason: "RemoteRefNotAllowed",
-            message: "secret.remoteRef is only allowed with an external secret store, which is not available yet; remove it and the path is derived from the scope".to_string(),
-        };
-    }
-    let store = match store_name(spec) {
-        Ok(store) => store,
-        Err(message) => {
+    // The enterprise's store (decision D23, `secrets.mode: external`): the author names the path,
+    // because the path is the enterprise's convention and the platform cannot derive it. Every
+    // other mode derives the path from the scope, so a group cannot read another group's secret.
+    let (store, store_kind, path) = if mode == SecretsMode::External {
+        let Some(remote_ref) = spec.secret.remote_ref.as_deref() else {
             return Plan::Invalid {
-                reason: "GroupNameNotSupported",
-                message,
+                reason: "RemoteRefRequired",
+                message: "secrets.mode external: set secret.remoteRef to the path in the enterprise store (for example `apps/crm/db`)".to_string(),
+            };
+        };
+        (
+            secrets::ENTERPRISE_STORE.to_string(),
+            "ClusterSecretStore",
+            remote_ref.to_string(),
+        )
+    } else {
+        if spec.secret.remote_ref.is_some() {
+            return Plan::Invalid {
+                reason: "RemoteRefNotAllowed",
+                message: "secret.remoteRef is only allowed with an external secret store; remove it and the path is derived from the scope".to_string(),
             };
         }
+        let store = match store_name(spec) {
+            Ok(store) => store,
+            Err(message) => {
+                return Plan::Invalid {
+                    reason: "GroupNameNotSupported",
+                    message,
+                };
+            }
+        };
+        (store, "SecretStore", spec.derived_remote_ref(name))
     };
-    let path = spec.derived_remote_ref(name);
     let secret = connection_secret_name(name);
     let data: Vec<Value> = spec
         .secret
@@ -123,7 +146,7 @@ pub fn plan(spec: &ConnectionSpec, name: &str, namespace: &str, uid: &str) -> Pl
         },
         "spec": {
             "refreshInterval": spec.refresh_interval,
-            "secretStoreRef": { "kind": "SecretStore", "name": store },
+            "secretStoreRef": { "kind": store_kind, "name": store },
             "target": { "name": secret, "creationPolicy": "Owner", "deletionPolicy": "Delete" },
             "data": data,
         },
@@ -210,8 +233,30 @@ pub async fn reconcile_connection(
     let namespace = conn.namespace().unwrap_or_else(|| "default".into());
     let uid = conn.metadata.uid.clone().unwrap_or_default();
 
+    // Where the store is (decision D23): ConfigMap `stardelt-secrets` in the connection's own
+    // namespace, published by the PlatformInstance controller. Absent means `none` — today the
+    // platform is one namespace; a connection in another namespace keeps the derived path.
+    let mode = match Api::<ConfigMap>::namespaced(ctx.client.clone(), &namespace)
+        .get_opt(secrets::MODE_CONFIGMAP)
+        .await
+    {
+        Ok(Some(config_map)) => match config_map
+            .data
+            .as_ref()
+            .and_then(|data| data.get("mode"))
+            .map(String::as_str)
+        {
+            Some("platform") => SecretsMode::Platform,
+            Some("external") => SecretsMode::External,
+            _ => SecretsMode::None,
+        },
+        Ok(None) => SecretsMode::None,
+        Err(e) => return Err(e),
+    };
+
     // (ready, reason, message, last_sync)
-    let (ready, reason, message, last_sync) = match plan(&conn.spec, &name, &namespace, &uid) {
+    let (ready, reason, message, last_sync) = match plan(&conn.spec, &name, &namespace, &uid, mode)
+    {
         Plan::Invalid { reason, message } => (false, reason, Some(message), None),
         Plan::Apply(external_secret) => {
             let api: Api<DynamicObject> =
@@ -283,6 +328,7 @@ pub async fn reconcile_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crd::SecretsMode;
 
     fn spec(value: serde_json::Value) -> ConnectionSpec {
         let mut base = json!({
@@ -318,7 +364,13 @@ mod tests {
 
     #[test]
     fn a_group_connection_syncs_its_group_path_through_its_groups_store() {
-        let es = applied(plan(&spec(json!({})), "crm-db", "stardelt", "uid-1"));
+        let es = applied(plan(
+            &spec(json!({})),
+            "crm-db",
+            "stardelt",
+            "uid-1",
+            SecretsMode::None,
+        ));
         assert_eq!(es["metadata"]["name"], "conn-crm-db");
         assert_eq!(es["metadata"]["namespace"], "stardelt");
         assert_eq!(es["metadata"]["ownerReferences"][0]["uid"], "uid-1");
@@ -342,7 +394,7 @@ mod tests {
         let s = spec(
             json!({ "scope": "managed", "ownerGroup": null, "usableBy": ["analytics", "finance"] }),
         );
-        let es = applied(plan(&s, "crm-db", "stardelt", "uid-1"));
+        let es = applied(plan(&s, "crm-db", "stardelt", "uid-1", SecretsMode::None));
         assert_eq!(es["spec"]["secretStoreRef"]["name"], "openbao-managed");
         assert_eq!(
             es["spec"]["data"][0]["remoteRef"]["key"],
@@ -355,7 +407,7 @@ mod tests {
         let s = spec(
             json!({ "secret": { "keys": ["user", "password"], "remoteRef": "connections/group/finance/x" } }),
         );
-        let (reason, message) = invalid(plan(&s, "crm-db", "stardelt", "uid-1"));
+        let (reason, message) = invalid(plan(&s, "crm-db", "stardelt", "uid-1", SecretsMode::None));
         assert_eq!(reason, "RemoteRefNotAllowed");
         assert!(message.contains("remoteRef"));
     }
@@ -364,7 +416,7 @@ mod tests {
     fn a_group_name_that_cannot_name_a_store_is_reported_not_guessed() {
         for group in ["Analytics", "data.team", "data_team"] {
             let s = spec(json!({ "ownerGroup": group }));
-            let (reason, _) = invalid(plan(&s, "crm-db", "stardelt", "uid-1"));
+            let (reason, _) = invalid(plan(&s, "crm-db", "stardelt", "uid-1", SecretsMode::None));
             assert_eq!(reason, "GroupNameNotSupported", "{group}");
         }
     }
@@ -372,10 +424,16 @@ mod tests {
     #[test]
     fn an_invalid_spec_applies_nothing() {
         let s = spec(json!({ "config": { "port": "1433" } }));
-        let (reason, message) = invalid(plan(&s, "crm-db", "stardelt", "uid-1"));
+        let (reason, message) = invalid(plan(&s, "crm-db", "stardelt", "uid-1", SecretsMode::None));
         assert_eq!(reason, "InvalidSpec");
         assert!(message.contains("config.host"));
-        let (reason, _) = invalid(plan(&spec(json!({})), "Crm_Db", "stardelt", "uid-1"));
+        let (reason, _) = invalid(plan(
+            &spec(json!({})),
+            "Crm_Db",
+            "stardelt",
+            "uid-1",
+            SecretsMode::None,
+        ));
         assert_eq!(reason, "InvalidSpec");
     }
 
@@ -426,5 +484,65 @@ mod tests {
         assert_eq!(again.last_transition_time.as_deref(), Some("t1"));
         let flipped = ready_condition(true, "Synced", None, Some(1), Some(&first), "t3");
         assert_eq!(flipped.last_transition_time.as_deref(), Some("t3"));
+    }
+
+    #[test]
+    fn external_mode_uses_the_enterprise_store_and_the_authors_path() {
+        let s =
+            spec(json!({ "secret": { "keys": ["user", "password"], "remoteRef": "apps/crm/db" } }));
+        let es = applied(plan(
+            &s,
+            "crm-db",
+            "stardelt",
+            "uid-1",
+            SecretsMode::External,
+        ));
+        assert_eq!(es["spec"]["secretStoreRef"]["kind"], "ClusterSecretStore");
+        assert_eq!(es["spec"]["secretStoreRef"]["name"], "enterprise");
+        let data = es["spec"]["data"].as_array().unwrap();
+        assert_eq!(data[0]["remoteRef"]["key"], "apps/crm/db");
+        assert_eq!(data[1]["remoteRef"]["key"], "apps/crm/db");
+    }
+
+    #[test]
+    fn external_mode_without_a_remote_ref_is_invalid() {
+        let s = spec(json!({}));
+        let (reason, message) = invalid(plan(
+            &s,
+            "crm-db",
+            "stardelt",
+            "uid-1",
+            SecretsMode::External,
+        ));
+        assert_eq!(reason, "RemoteRefRequired");
+        assert!(message.contains("remoteRef"));
+    }
+
+    #[test]
+    fn platform_mode_still_refuses_a_remote_ref() {
+        let s = spec(
+            json!({ "secret": { "keys": ["user", "password"], "remoteRef": "connections/group/finance/x" } }),
+        );
+        let (reason, _) = invalid(plan(
+            &s,
+            "crm-db",
+            "stardelt",
+            "uid-1",
+            SecretsMode::Platform,
+        ));
+        assert_eq!(reason, "RemoteRefNotAllowed");
+    }
+
+    #[test]
+    fn none_mode_keeps_the_derived_path_and_the_namespaced_store() {
+        let es = applied(plan(
+            &spec(json!({})),
+            "crm-db",
+            "stardelt",
+            "uid-1",
+            SecretsMode::None,
+        ));
+        assert_eq!(es["spec"]["secretStoreRef"]["kind"], "SecretStore");
+        assert_eq!(es["spec"]["secretStoreRef"]["name"], "openbao-analytics");
     }
 }

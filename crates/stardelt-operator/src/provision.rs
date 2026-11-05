@@ -1950,6 +1950,38 @@ pub async fn ensure_identity(
     )
 }
 
+/// The secrets contract (decision D23): ConfigMap `stardelt-secrets` tells a namespace's
+/// `Connection` objects which store to sync from. Published for every mode, `none` included, so
+/// the value is never stale.
+pub async fn ensure_secrets_mode(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    let mode = secrets::mode_label(spec.secrets.mode);
+    Some(
+        match apply::<ConfigMap>(
+            &ctx.client,
+            &spec.namespace,
+            &secrets::mode_config_map(spec, &spec.namespace),
+            spec.dry_run,
+        )
+        .await
+        {
+            Ok(_) if spec.dry_run => status(
+                "secrets-mode",
+                false,
+                format!("planned (dry-run): stardelt-secrets (mode {mode})"),
+            ),
+            Ok(_) => status(
+                "secrets-mode",
+                true,
+                format!("published ConfigMap stardelt-secrets (mode {mode})"),
+            ),
+            Err(e) => status("secrets-mode", false, e.to_string()),
+        },
+    )
+}
+
 /// The enterprise's store (decision D23, `secrets.mode: external`): one ClusterSecretStore.
 /// It needs the External Secrets CRDs, so on a first reconcile it reports the 404 and the next
 /// one succeeds — that is the documented order, not an error to retry inside the step.
