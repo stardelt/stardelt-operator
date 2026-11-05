@@ -230,6 +230,7 @@ mod tests {
             component_values: Default::default(),
             adopt: false,
             deletion_policy: Default::default(),
+            compute: Default::default(),
         }
     }
 

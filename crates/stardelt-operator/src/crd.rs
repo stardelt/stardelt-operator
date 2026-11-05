@@ -540,6 +540,21 @@ impl Default for StorageSpec {
     }
 }
 
+/// `Lakehouse.spec.compute`: compute endpoints the Lakehouse installs next to the catalog.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+pub struct ComputeSpec {
+    #[serde(default)]
+    pub spark: SparkCompute,
+}
+
+/// The Spark Connect endpoint (operator#239's builders): opt-in, because it is a second
+/// driver on the namespace and reads the Lakehouse's own S3 Secret.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+pub struct SparkCompute {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 /// A managed lakehouse: catalog + storage (+ query) on object storage.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -568,6 +583,9 @@ pub struct LakehouseSpec {
     /// What happens to the data when this resource is deleted (decision D18). Defaults to Retain.
     #[serde(default, rename = "deletionPolicy")]
     pub deletion_policy: DeletionPolicy,
+    /// Compute endpoints installed with the Lakehouse (default: none).
+    #[serde(default)]
+    pub compute: ComputeSpec,
     /// Per-component Helm value overrides for the planned components
     /// (`seaweedfs`, `lakekeeper` / `polaris`, `trino`).
     #[serde(flatten)]
@@ -2109,6 +2127,24 @@ mod tests {
         assert_eq!(lh.spec.storage.implementation, StorageImpl::Seaweedfs);
         assert_eq!(lh.spec.profile, Profile::Demo);
         assert!(lh.spec.dry_run, "new Lakehouses must plan only");
+    }
+
+    #[test]
+    fn spark_compute_is_off_by_default_and_read_from_the_spec() {
+        let lh: Lakehouse = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1", "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "data" },
+            "spec": {}
+        }))
+        .expect("deserialize Lakehouse");
+        assert!(!lh.spec.compute.spark.enabled);
+        let lh: Lakehouse = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1", "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "data" },
+            "spec": { "compute": { "spark": { "enabled": true } } }
+        }))
+        .expect("deserialize Lakehouse");
+        assert!(lh.spec.compute.spark.enabled);
     }
 
     #[test]

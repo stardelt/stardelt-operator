@@ -27,6 +27,30 @@
           },
           "type": "object"
         },
+        "compute": {
+          "default": {
+            "spark": {
+              "enabled": false
+            }
+          },
+          "description": "Compute endpoints installed with the Lakehouse (default: none).",
+          "properties": {
+            "spark": {
+              "default": {
+                "enabled": false
+              },
+              "description": "The Spark Connect endpoint (operator#239's builders): opt-in, because it is a second\ndriver on the namespace and reads the Lakehouse's own S3 Secret.",
+              "properties": {
+                "enabled": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
         "deletionPolicy": {
           "default": "Retain",
           "description": "What happens to the data when this resource is deleted (decision D18). Defaults to Retain.",
