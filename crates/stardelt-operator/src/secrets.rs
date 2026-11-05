@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::{
     api::ObjectMeta,
     core::{ApiResource, GroupVersionKind},
@@ -15,6 +16,57 @@ use crate::crd::{PlatformInstanceSpec, SecretsMode};
 
 /// The name every external-mode `ExternalSecret` references.
 pub const ENTERPRISE_STORE: &str = "enterprise";
+
+/// The Secret that holds the sandbox store's recovery key and initial root token (platform
+/// `scripts/openbao-bootstrap.sh`). Sandbox only: a root token in a Secret is acceptable for a
+/// throwaway store and for nothing else.
+pub const INIT_SECRET: &str = "openbao-init";
+
+/// The API-server service proxy path for one endpoint of the store. The operator reaches the
+/// store through the API server, so no HTTP client, Service or port-forward is needed and the
+/// response body never passes through a container log.
+pub fn store_proxy_path(namespace: &str, path: &str) -> String {
+    format!("/api/v1/namespaces/{namespace}/services/http:openbao:8200/proxy{path}")
+}
+
+/// The body of `bao operator init` with one recovery share (auto-unseal: no unseal shares).
+/// `secret_shares: 0` is what the static seal needs; the platform script leaves the CLI's 5/3
+/// default, which the static seal never uses, so only the recovery pair has to match it.
+pub fn init_request_body() -> Value {
+    serde_json::json!({
+        "recovery_shares": 1,
+        "recovery_threshold": 1,
+        "secret_shares": 0,
+        "secret_threshold": 0
+    })
+}
+
+/// Secret `openbao-init` for `spec.namespace`. `recovery_key` is the base64 string the store
+/// returned in `recovery_keys_b64[0]`, stored unchanged, exactly as the platform's script does.
+pub fn init_secret(namespace: &str, recovery_key: &str, root_token: &str) -> Secret {
+    let mut data = BTreeMap::new();
+    data.insert(
+        "recovery-key".to_string(),
+        ByteString(recovery_key.as_bytes().to_vec()),
+    );
+    data.insert(
+        "root-token".to_string(),
+        ByteString(root_token.as_bytes().to_vec()),
+    );
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(INIT_SECRET.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([(
+                "app.kubernetes.io/part-of".to_string(),
+                "stardelt".to_string(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        data: Some(data),
+        ..Secret::default()
+    }
+}
 
 /// The ConfigMap a namespace's `Connection` objects read to learn where their store is. Same shape
 /// as `stardelt-identity`: the platform publishes it, the controllers read it and default to `none`.
@@ -251,5 +303,22 @@ mod tests {
             store["spec"]["provider"],
             spec.secrets.external.as_ref().unwrap().provider
         );
+    }
+
+    #[test]
+    fn init_request_and_secret_match_the_platform_script() {
+        assert_eq!(
+            store_proxy_path("stardelt", "/v1/sys/init"),
+            "/api/v1/namespaces/stardelt/services/http:openbao:8200/proxy/v1/sys/init"
+        );
+        let body = init_request_body();
+        assert_eq!(body["recovery_shares"], 1);
+        assert_eq!(body["recovery_threshold"], 1);
+        assert_eq!(body["secret_shares"], 0);
+        let secret = init_secret("stardelt", "cmVjb3Zlcnk=", "s.roottoken");
+        assert_eq!(secret.metadata.name.as_deref(), Some("openbao-init"));
+        let data = secret.data.expect("data");
+        assert_eq!(data["recovery-key"].0, b"cmVjb3Zlcnk=".to_vec());
+        assert_eq!(data["root-token"].0, b"s.roottoken".to_vec());
     }
 }

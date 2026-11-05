@@ -41,10 +41,11 @@ use crate::provision::{
     ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_discovery,
     ensure_external_store, ensure_identity, ensure_identity_secrets, ensure_ingress,
     ensure_keycloak, ensure_keycloak_pg, ensure_lakekeeper_network_policy, ensure_notebooks_bucket,
-    ensure_nova, ensure_nova_events, ensure_nova_pg, ensure_nova_session, ensure_openbao_seal_key,
-    ensure_openfga_database, ensure_openfga_network_policy, ensure_pg_dumps, ensure_s3_secrets,
-    ensure_secrets_mode, ensure_spark, ensure_superset_group_roles, ensure_superset_rbac,
-    ensure_superset_secrets, ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
+    ensure_nova, ensure_nova_events, ensure_nova_pg, ensure_nova_session, ensure_openbao_init,
+    ensure_openbao_seal_key, ensure_openfga_database, ensure_openfga_network_policy,
+    ensure_pg_dumps, ensure_s3_secrets, ensure_secrets_mode, ensure_spark,
+    ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
+    ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
 use crate::values::{deep_merge, effective_values, identity_values, parse_values_document};
 
@@ -1114,6 +1115,12 @@ async fn reconcile_platform(
     }
     if let Some(seal) = openbao_seal {
         outcome.components.push(seal);
+    }
+    // The store is initialised after its release answered: the recovery key and the initial root
+    // token live in Secret openbao-init (sandbox only), which the KV mount, the JWT role and the
+    // per-group stores read.
+    if let Some(init) = ensure_openbao_init(&ctx, &instance.spec).await {
+        outcome.components.push(init);
     }
     if let Some(secrets) = airflow_secrets {
         outcome.components.push(secrets);
