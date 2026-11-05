@@ -43,8 +43,8 @@ use crate::provision::{
     ensure_keycloak, ensure_keycloak_pg, ensure_lakekeeper_network_policy, ensure_notebooks_bucket,
     ensure_nova, ensure_nova_events, ensure_nova_pg, ensure_nova_session, ensure_openbao_seal_key,
     ensure_openfga_database, ensure_openfga_network_policy, ensure_pg_dumps, ensure_s3_secrets,
-    ensure_spark, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
-    ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
+    ensure_secrets_mode, ensure_spark, ensure_superset_group_roles, ensure_superset_rbac,
+    ensure_superset_secrets, ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
 use crate::values::{deep_merge, effective_values, identity_values, parse_values_document};
 
@@ -1093,6 +1093,9 @@ async fn reconcile_platform(
     // The store's seal key comes before its release: the pod mounts Secret openbao-seal-key and the
     // static seal is what lets it unseal itself after a restart.
     let openbao_seal = ensure_openbao_seal_key(&ctx, &instance.spec).await;
+    // The secrets contract (decision D23): published before the plan is applied so a Connection
+    // reconciled in the same tick already sees which store to sync from.
+    let secrets_mode = ensure_secrets_mode(&ctx, &instance.spec).await;
     let mut outcome = apply_plan(
         &ctx,
         &instance.spec.namespace,
@@ -1103,6 +1106,9 @@ async fn reconcile_platform(
         previous,
     )
     .await;
+    if let Some(contract) = secrets_mode {
+        outcome.components.push(contract);
+    }
     if let Some(store) = ensure_external_store(&ctx, &instance.spec).await {
         outcome.components.push(store);
     }
