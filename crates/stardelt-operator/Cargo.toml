@@ -22,6 +22,8 @@ futures.workspace = true
 getrandom.workspace = true
 thiserror.workspace = true
 bcrypt.workspace = true
+# The raw request to the store through the API server's service proxy (`Client::request_text`).
+http = "1"
 
 [dev-dependencies]
 # Already in the dependency tree (kube pulls both in); used to build a mock kube

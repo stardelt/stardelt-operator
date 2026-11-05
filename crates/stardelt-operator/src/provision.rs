@@ -1042,6 +1042,104 @@ pub async fn ensure_openbao_seal_key(
     Some(status(NAME, true, "ready: created"))
 }
 
+/// Initialises the sandbox store once (`scripts/openbao-bootstrap.sh`) and keeps the recovery key
+/// and the initial root token in Secret `openbao-init`. Runs after the release is applied; when the
+/// store does not answer yet the status is not ready and the next reconcile retries.
+pub async fn ensure_openbao_init(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "openbao-init";
+    if spec.secrets.mode != SecretsMode::Platform {
+        return None;
+    }
+    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &spec.namespace);
+    match secrets_api.get_opt(secrets::INIT_SECRET).await {
+        Ok(Some(existing)) => {
+            let complete = text(&existing, "recovery-key").is_some()
+                && text(&existing, "root-token").is_some();
+            return Some(if complete {
+                status(NAME, true, "ready: kept")
+            } else {
+                status(
+                    NAME,
+                    false,
+                    "Secret openbao-init exists without both keys: the store is initialised and \
+                     its root token is gone, restore it by hand",
+                )
+            });
+        }
+        Ok(None) => {}
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    }
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+    let uri = secrets::store_proxy_path(&spec.namespace, "/v1/sys/init");
+    let body = secrets::init_request_body().to_string();
+    let request = match http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body.into_bytes())
+    {
+        Ok(request) => request,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    // `Client::request_text` resolves the relative path against the cluster URL and turns a
+    // non-2xx answer into an error; an already initialised store answers 400, which the message
+    // above covers on the next reconcile.
+    let response = match ctx.client.request_text(request).await {
+        Ok(response) => response,
+        Err(e) => return Some(status(NAME, false, format!("init request failed: {e}"))),
+    };
+    let document: serde_json::Value = match serde_json::from_str(&response) {
+        Ok(document) => document,
+        Err(e) => return Some(status(NAME, false, format!("init answer is not JSON: {e}"))),
+    };
+    let root_token = document
+        .get("root_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if root_token.is_empty() {
+        return Some(status(
+            NAME,
+            false,
+            "init answer has no root_token; the store's state must be checked by hand",
+        ));
+    }
+    // The platform stores `recovery_keys_b64[0]`; `recovery_keys[0]` is the same key in hex.
+    let recovery_key = document
+        .get("recovery_keys_b64")
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            document
+                .get("recovery_keys")
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or_default()
+        .to_string();
+    if recovery_key.is_empty() {
+        return Some(status(
+            NAME,
+            false,
+            "init answer has no recovery key; the store's state must be checked by hand",
+        ));
+    }
+    let secret = secrets::init_secret(&spec.namespace, &recovery_key, &root_token);
+    match apply::<Secret>(&ctx.client, &spec.namespace, &secret, false).await {
+        Ok(_) => Some(status(
+            NAME,
+            true,
+            "initialised; recovery key and root token are in Secret openbao-init (sandbox only)",
+        )),
+        Err(e) => Some(status(NAME, false, e.to_string())),
+    }
+}
+
 /// The key names of a Secret. Values are never read: the operator only decides which keys are
 /// absent, and a credential must never be logged.
 fn keys_of(secret: &Secret) -> BTreeMap<String, String> {
@@ -2106,6 +2204,49 @@ mod tests {
         (kube::Client::new(service, "data"), requests)
     }
 
+    /// A kube client for the store: `GET …/secrets/openbao-init` is 404, `POST …/v1/sys/init`
+    /// answers `init` with 200, every `PATCH` echoes its body. Requests are recorded.
+    fn mock_store_client(init: &'static str) -> (kube::Client, Recorded) {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                let body = String::from_utf8_lossy(&body).to_string();
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    body.clone(),
+                ));
+                let (status, document) = if method == "POST" {
+                    (200, init.to_string())
+                } else if method == "PATCH" {
+                    (200, body)
+                } else {
+                    (
+                        404,
+                        r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#.to_string(),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(document.into_bytes()))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (kube::Client::new(service, "stardelt"), requests)
+    }
+
     fn context(client: kube::Client) -> Context {
         Context {
             client,
@@ -2137,6 +2278,12 @@ mod tests {
         }))
         .expect("deserialize PlatformInstance");
         instance.spec
+    }
+
+    fn platform_store() -> PlatformInstanceSpec {
+        let mut spec = platform("platform", false);
+        spec.secrets.mode = SecretsMode::Platform;
+        spec
     }
 
     #[tokio::test]
@@ -4223,5 +4370,76 @@ mod tests {
             "/apis/apps/v1/namespaces/data/deployments/spark-connect",
         ];
         assert_eq!(paths, expected);
+    }
+
+    #[tokio::test]
+    async fn the_store_is_initialised_once_and_kept_in_a_secret() {
+        let (client, requests) = mock_store_client(
+            r#"{"root_token":"s.roottoken","recovery_keys":["6162"],"recovery_keys_b64":["cmVjb3Zlcnk="]}"#,
+        );
+        let status = ensure_openbao_init(&context(client), &platform_store())
+            .await
+            .expect("platform mode runs the step");
+        assert!(status.ready, "{:?}", status.message);
+        let seen = requests.lock().expect("requests poisoned").clone();
+        let post = seen
+            .iter()
+            .find(|(method, _, _)| method == "POST")
+            .expect("the init POST");
+        assert_eq!(
+            post.1,
+            "/api/v1/namespaces/stardelt/services/http:openbao:8200/proxy/v1/sys/init"
+        );
+        assert_eq!(
+            post.2,
+            r#"{"recovery_shares":1,"recovery_threshold":1,"secret_shares":0,"secret_threshold":0}"#
+        );
+        let patch = seen
+            .iter()
+            .find(|(method, _, _)| method == "PATCH")
+            .expect("the Secret");
+        assert_eq!(patch.1, "/api/v1/namespaces/stardelt/secrets/openbao-init");
+        let document: serde_json::Value = serde_json::from_str(&patch.2).expect("JSON patch");
+        // ByteString serializes as base64 of its bytes; recovery_key is the string
+        // "cmVjb3Zlcnk=" stored as-is, so the JSON value is base64 of that string.
+        assert_eq!(
+            document["data"]["recovery-key"],
+            serde_json::Value::String("Y21WamIzWmxjbms9".into())
+        );
+        assert_eq!(
+            document["data"]["root-token"],
+            serde_json::Value::String("cy5yb290dG9rZW4=".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_init_secret_is_not_written_again_and_other_modes_do_nothing() {
+        let (client, requests) = mock_store_client("{}");
+        let mut spec = platform_store();
+        spec.dry_run = true;
+        let status = ensure_openbao_init(&context(client), &spec)
+            .await
+            .expect("platform mode runs the step");
+        assert!(!status.ready);
+        assert_eq!(status.message.as_deref(), Some("planned (dry-run)"));
+        assert!(
+            requests
+                .lock()
+                .expect("requests poisoned")
+                .iter()
+                .all(|(method, _, _)| method != "POST"),
+            "a dry run must not initialise the store"
+        );
+        let (client, requests) = mock_client(true);
+        assert!(
+            ensure_openbao_init(&context(client), &platform("platform", false))
+                .await
+                .is_none(),
+            "secrets.mode none must not touch the store"
+        );
+        assert!(
+            requests.lock().expect("requests poisoned").is_empty(),
+            "secrets.mode none must not touch the cluster"
+        );
     }
 }
