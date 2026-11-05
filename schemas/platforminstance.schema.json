@@ -270,7 +270,9 @@
               "nullable": true,
               "properties": {
                 "provider": {
-                  "description": "The `provider` block of the `ClusterSecretStore` (`vault`, `aws`, `azurekv`, …), passed to\nExternal Secrets verbatim. Exactly one provider key; credentials are referenced by Secret\nname inside the block, never inline."
+                  "description": "The `provider` block of the `ClusterSecretStore` (`vault`, `aws`, `azurekv`, …), passed to\nExternal Secrets verbatim. Exactly one provider key; credentials are referenced by Secret\nname inside the block, never inline.",
+                  "type": "object",
+                  "x-kubernetes-preserve-unknown-fields": true
                 }
               },
               "required": [

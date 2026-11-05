@@ -249,6 +249,8 @@ spec:
                           The `provider` block of the `ClusterSecretStore` (`vault`, `aws`, `azurekv`, …), passed to
                           External Secrets verbatim. Exactly one provider key; credentials are referenced by Secret
                           name inside the block, never inline.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
                     required:
                     - provider
                     type: object

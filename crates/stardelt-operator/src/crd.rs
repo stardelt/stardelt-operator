@@ -370,12 +370,27 @@ pub enum SecretsMode {
     External,
 }
 
+/// An object whose keys are the schema: the only shape a CRD may use for an arbitrary JSON block.
+/// `serde_json::Value` alone renders without a `type`, and the API server refuses such a field
+/// ("must not be empty for specified object fields", operator#267).
+fn preserved_object(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    serde_json::json!({
+        "type": "object",
+        "x-kubernetes-preserve-unknown-fields": true,
+    })
+    .as_object()
+    .cloned()
+    .expect("an object literal")
+    .into()
+}
+
 /// The enterprise's own store, used only in `secrets.mode: external` (decision D23).
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
 pub struct ExternalSecretsSpec {
     /// The `provider` block of the `ClusterSecretStore` (`vault`, `aws`, `azurekv`, …), passed to
     /// External Secrets verbatim. Exactly one provider key; credentials are referenced by Secret
     /// name inside the block, never inline.
+    #[schemars(schema_with = "preserved_object")]
     pub provider: serde_json::Value,
 }
 
@@ -2095,6 +2110,47 @@ pub struct Condition {
 mod tests {
     use super::*;
     use kube::CustomResourceExt;
+
+    /// A CRD field must be structural: a `type`, a `$ref`, a combinator, or the preserve flag. The
+    /// API server refuses the whole CRD otherwise ("must not be empty for specified object fields",
+    /// operator#267), and nothing in CI applies a CRD, so the check lives here.
+    fn assert_structural(pointer: &str, schema: &serde_json::Value) {
+        let Some(object) = schema.as_object() else {
+            return;
+        };
+        if let Some(properties) = object.get("properties").and_then(|p| p.as_object()) {
+            for (name, child) in properties {
+                let structural = child.as_object().is_some_and(|o| {
+                    o.contains_key("type")
+                        || o.contains_key("$ref")
+                        || o.contains_key("oneOf")
+                        || o.contains_key("anyOf")
+                        || o.contains_key("allOf")
+                        || o.get("x-kubernetes-preserve-unknown-fields")
+                            == Some(&serde_json::Value::Bool(true))
+                });
+                assert!(structural, "{pointer}/{name} has no schema type: {child}");
+                assert_structural(&format!("{pointer}/{name}"), child);
+            }
+        }
+        for key in ["items", "additionalProperties"] {
+            if let Some(child) = object.get(key) {
+                assert_structural(&format!("{pointer}/{key}"), child);
+            }
+        }
+        if let Some(defs) = object.get("$defs").and_then(|d| d.as_object()) {
+            for (name, child) in defs {
+                assert_structural(&format!("{pointer}/$defs/{name}"), child);
+            }
+        }
+    }
+
+    #[test]
+    fn every_platform_instance_field_has_a_schema_type() {
+        let schema = serde_json::to_value(schemars::schema_for!(PlatformInstance))
+            .expect("the CRD schema serialises");
+        assert_structural("#", &schema);
+    }
 
     #[test]
     fn lakehouse_defaults_are_lakekeeper_seaweedfs_demo() {
