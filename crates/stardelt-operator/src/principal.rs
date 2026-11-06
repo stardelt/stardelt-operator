@@ -11,7 +11,7 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
     Api, ResourceExt,
-    api::{Patch, PatchParams},
+    api::{ListParams, Patch, PatchParams},
     runtime::controller::Action,
 };
 use serde_json::json;
@@ -19,8 +19,10 @@ use serde_json::json;
 use crate::connection::ready_condition;
 use crate::controller::Context;
 use crate::crd::{
-    ServicePrincipal, ServicePrincipalSpec, ServicePrincipalStatus, principal_client_id,
+    IdentityMode, PlatformInstance, ServicePrincipal, ServicePrincipalSpec, ServicePrincipalStatus,
+    principal_client_id,
 };
+use crate::principal_keycloak::{ClientOutcome, ensure_principal_client};
 
 /// What the credentials Secret holds, by key name only: values are never read into messages.
 #[derive(Debug, PartialEq, Eq)]
@@ -159,8 +161,9 @@ pub fn principal_state(
 
 /// Reconcile one `ServicePrincipal`: validate, check the credentials Secret, write the status.
 ///
-/// Nothing here creates or changes a client in the identity provider. A Secret value is never put
-/// into a message, an event or the status.
+/// In `identity.mode: platform` (and without `existingSecretRef`) the operator also converges
+/// the Keycloak client and its Secret. External mode and a CR with `existingSecretRef` keep the
+/// Secret-check-only behaviour. A Secret value is never put into a message, an event or the status.
 pub async fn reconcile_principal(
     sp: Arc<ServicePrincipal>,
     ctx: Arc<Context>,
@@ -171,11 +174,64 @@ pub async fn reconcile_principal(
     }
     let name = sp.name_any();
     let namespace = sp.namespace().unwrap_or_else(|| "default".into());
+
+    // Platform mode creates the client; external mode and existingSecretRef do not.
+    let instance = Api::<PlatformInstance>::all(ctx.client.clone())
+        .list(&ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .find(|pi| pi.spec.namespace == namespace);
+    let platform_mode = sp.spec.existing_secret_ref.is_none()
+        && instance
+            .as_ref()
+            .is_some_and(|pi| pi.spec.identity.mode == IdentityMode::Platform);
+
+    if platform_mode {
+        if let Err(message) = sp.spec.validate(&name) {
+            return patch_principal_status(
+                &sp,
+                &ctx,
+                &namespace,
+                &name,
+                not_ready("InvalidSpec", message),
+            )
+            .await;
+        }
+        match ensure_principal_client(&ctx, &namespace, &name, &sp.spec).await {
+            ClientOutcome::OwnerGroupMissing { group } => {
+                return patch_principal_status(
+                    &sp,
+                    &ctx,
+                    &namespace,
+                    &name,
+                    not_ready(
+                        "OwnerGroupMissing",
+                        format!(
+                            "group `{group}` does not exist in the identity provider — create it there, or fix spec.ownerGroup"
+                        ),
+                    ),
+                )
+                .await;
+            }
+            ClientOutcome::Unavailable { message } => {
+                return patch_principal_status(
+                    &sp,
+                    &ctx,
+                    &namespace,
+                    &name,
+                    not_ready("KeycloakUnavailable", message),
+                )
+                .await;
+            }
+            ClientOutcome::Created { .. } | ClientOutcome::Converged { .. } => {}
+        }
+    }
+
     let secret_name = match &sp.spec.existing_secret_ref {
         Some(reference) => reference.name.clone(),
         None => principal_client_id(&name),
     };
-
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
     let state = match secrets.get_opt(&secret_name).await {
         Ok(secret) => principal_state(&sp.spec, &name, &secret_check(secret.as_ref())),
@@ -191,6 +247,16 @@ pub async fn reconcile_principal(
         Err(error) => return Err(error),
     };
 
+    patch_principal_status(&sp, &ctx, &namespace, &name, state).await
+}
+
+async fn patch_principal_status(
+    sp: &ServicePrincipal,
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+    state: PrincipalState,
+) -> Result<Action, kube::Error> {
     let now = k8s_openapi::jiff::Timestamp::now().to_string();
     let previous = sp
         .status
@@ -210,10 +276,10 @@ pub async fn reconcile_principal(
         )],
         observed_generation: sp.metadata.generation,
     };
-    let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), &namespace);
+    let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), namespace);
     principals
         .patch_status(
-            &name,
+            name,
             &PatchParams::default(),
             &Patch::Merge(json!({ "status": status })),
         )
@@ -483,6 +549,16 @@ mod tests {
                             "code": 403
                         }),
                     )
+                } else if method == "GET" && path == "/apis/stardelt.io/v1alpha1/platforminstances"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "PlatformInstanceList",
+                            "items": []
+                        }),
+                    )
                 } else {
                     (
                         200,
@@ -548,5 +624,115 @@ mod tests {
             message.contains("the operator may not read Secrets in this namespace"),
             "{message}"
         );
+    }
+
+    fn b64(s: &str) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = s.as_bytes();
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let group = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            for pos in 0..4 {
+                if pos <= chunk.len() {
+                    out.push(char::from(TABLE[((group >> (18 - 6 * pos)) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn external_mode_makes_no_keycloak_request() {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    String::from_utf8_lossy(&body).to_string(),
+                ));
+                let document = if method == "GET" && path.contains("/platforminstances") {
+                    json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "PlatformInstanceList",
+                        "items": [{
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "PlatformInstance",
+                            "metadata": { "name": "demo" },
+                            "spec": { "namespace": "stardelt", "identity": { "mode": "external", "issuerUrl": "https://id.example.com/realms/stardelt" } }
+                        }]
+                    })
+                } else if method == "GET" && path.contains("/secrets/external-app") {
+                    json!({
+                        "apiVersion": "v1", "kind": "Secret",
+                        "metadata": { "name": "external-app", "namespace": "stardelt" },
+                        "data": { "client-id": b64("app-registration-id"), "client-secret": b64("secret") }
+                    })
+                } else {
+                    json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "ServicePrincipal",
+                        "metadata": { "name": "etl", "namespace": "stardelt" },
+                        "spec": { "ownerGroup": "analytics", "existingSecretRef": { "name": "external-app" } }
+                    })
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&document).expect("mock document"),
+                        ))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        let client = kube::Client::new(service, "stardelt");
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let principal: ServicePrincipal = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "ServicePrincipal",
+            "metadata": { "name": "etl", "namespace": "stardelt", "generation": 1 },
+            "spec": { "ownerGroup": "analytics", "existingSecretRef": { "name": "external-app" } }
+        }))
+        .expect("deserialize ServicePrincipal");
+
+        let action = reconcile_principal(Arc::new(principal), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            requests
+                .iter()
+                .all(|(_, path, _)| !path.contains("/admin/")),
+            "no Keycloak admin requests expected: {requests:?}"
+        );
+        let patch = requests
+            .iter()
+            .rev()
+            .find(|(method, path, _)| method == "PATCH" && path.ends_with("/status"))
+            .expect("status patch");
+        let body: serde_json::Value = serde_json::from_str(&patch.2).expect("patch body is JSON");
+        assert_eq!(body["status"]["ready"], true);
+        assert_eq!(body["status"]["conditions"][0]["reason"], "Provisioned");
     }
 }
