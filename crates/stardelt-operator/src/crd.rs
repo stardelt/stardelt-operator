@@ -405,7 +405,25 @@ pub struct SecretsSpec {
     /// Owner groups that get their own store entry in `secrets.mode: platform` (decision D27):
     /// each one may read only its own path. Mirrors the platform's `STORE_GROUPS`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(schema_with = "group_list_schema")]
     pub groups: Vec<String>,
+}
+
+/// Schema of `spec.secrets.groups`: the array bounds are load-bearing.
+///
+/// The CEL rule below runs `matches()` over every entry. The API server prices that rule per
+/// element and per character, so an unbounded array of unbounded strings is rejected on apply
+/// ("estimated rule cost exceeds budget by factor of more than 100x", platform#548/#555). The
+/// same rule passes once `maxItems` and the item `maxLength` are present, which is why they are
+/// part of the schema rather than only of the message.
+fn group_list_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::Schema {
+    serde_json::json!({
+        "type": "array",
+        "maxItems": 20,
+        "items": { "type": "string", "maxLength": 40 }
+    })
+    .try_into()
+    .expect("the schema literal above is valid JSON Schema")
 }
 
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
@@ -2416,6 +2434,22 @@ mod tests {
         let crd_str = serde_json::to_string(&crd_json).unwrap();
         assert!(crd_str.contains("secrets.mode external needs secrets.external.provider"));
         assert!(crd_str.contains("secrets.external is only allowed with secrets.mode external"));
+    }
+
+    /// `spec.secrets.groups` must carry the bounds its CEL rule is priced against.
+    ///
+    /// The rule runs `matches()` over every entry. Without `maxItems` on the array and
+    /// `maxLength` on the items the API server estimates the rule above the CEL budget and
+    /// refuses the whole CRD: rolling out #275 (which added the rule) failed with
+    /// "estimated rule cost exceeds budget by factor of more than 100x" until both were
+    /// added. A server-side dry run accepted the CRD with `maxItems: 20` / `maxLength: 40`.
+    #[test]
+    fn the_secrets_groups_schema_is_bounded() {
+        let crd = serde_json::to_value(PlatformInstance::crd()).expect("serialize CRD");
+        let groups = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["secrets"]["properties"]["groups"];
+        assert_eq!(groups["maxItems"], 20, "groups schema: {groups}");
+        assert_eq!(groups["items"]["maxLength"], 40, "groups schema: {groups}");
     }
 
     #[test]
