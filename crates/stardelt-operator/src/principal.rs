@@ -22,7 +22,9 @@ use crate::crd::{
     IdentityMode, PlatformInstance, ServicePrincipal, ServicePrincipalSpec, ServicePrincipalStatus,
     principal_client_id,
 };
-use crate::principal_keycloak::{ClientOutcome, ensure_principal_client};
+use crate::principal_keycloak::{ClientOutcome, delete_principal_client, ensure_principal_client};
+
+pub const PRINCIPAL_FINALIZER: &str = "stardelt.io/principal-keycloak";
 
 /// What the credentials Secret holds, by key name only: values are never read into messages.
 #[derive(Debug, PartialEq, Eq)]
@@ -169,8 +171,7 @@ pub async fn reconcile_principal(
     ctx: Arc<Context>,
 ) -> Result<Action, kube::Error> {
     if sp.metadata.deletion_timestamp.is_some() {
-        // Nothing is owned in the cluster, so there is nothing to clean up.
-        return Ok(Action::await_change());
+        return finalize_principal(&sp, &ctx).await;
     }
     let name = sp.name_any();
     let namespace = sp.namespace().unwrap_or_else(|| "default".into());
@@ -247,7 +248,60 @@ pub async fn reconcile_principal(
         Err(error) => return Err(error),
     };
 
+    if state.ready {
+        ensure_principal_finalizer(&sp, &ctx).await?;
+    }
     patch_principal_status(&sp, &ctx, &namespace, &name, state).await
+}
+
+async fn finalize_principal(sp: &ServicePrincipal, ctx: &Context) -> Result<Action, kube::Error> {
+    let name = sp.name_any();
+    let namespace = sp.namespace().unwrap_or_else(|| "default".into());
+    match delete_principal_client(ctx, &namespace, &name).await {
+        Err(message) => {
+            tracing::warn!(principal = %name, %namespace, %message, "finalize failed");
+            Ok(Action::requeue(Duration::from_secs(30)))
+        }
+        Ok(()) => {
+            let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), &namespace);
+            let finalizers: Vec<String> = sp
+                .finalizers()
+                .iter()
+                .filter(|f| f.as_str() != PRINCIPAL_FINALIZER)
+                .cloned()
+                .collect();
+            principals
+                .patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(json!({ "metadata": { "finalizers": finalizers } })),
+                )
+                .await?;
+            Ok(Action::await_change())
+        }
+    }
+}
+
+async fn ensure_principal_finalizer(
+    sp: &ServicePrincipal,
+    ctx: &Context,
+) -> Result<(), kube::Error> {
+    if sp.finalizers().iter().any(|f| f == PRINCIPAL_FINALIZER) {
+        return Ok(());
+    }
+    let name = sp.name_any();
+    let namespace = sp.namespace().unwrap_or_else(|| "default".into());
+    let mut finalizers = sp.finalizers().to_vec();
+    finalizers.push(PRINCIPAL_FINALIZER.to_string());
+    let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), &namespace);
+    principals
+        .patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "metadata": { "finalizers": finalizers } })),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn patch_principal_status(
@@ -734,5 +788,384 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&patch.2).expect("patch body is JSON");
         assert_eq!(body["status"]["ready"], true);
         assert_eq!(body["status"]["conditions"][0]["reason"], "Provisioned");
+    }
+
+    fn cm_env() -> serde_json::Value {
+        json!({
+            "apiVersion": "v1", "kind": "ConfigMap",
+            "metadata": { "name": "keycloak-env", "namespace": "stardelt" },
+            "data": { "KC_HOSTNAME": "https://id.data.example.com" }
+        })
+    }
+
+    fn admin_secret() -> serde_json::Value {
+        json!({
+            "apiVersion": "v1", "kind": "Secret",
+            "metadata": { "name": "keycloak-admin", "namespace": "stardelt" },
+            "data": { "username": b64("admin"), "password": b64("secretpass") }
+        })
+    }
+
+    #[tokio::test]
+    async fn deleting_a_principal_deletes_its_keycloak_client_and_secret() {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            let uri = request.uri().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    String::from_utf8_lossy(&body).to_string(),
+                ));
+                let (status, document) = if method == "GET"
+                    && path == "/apis/stardelt.io/v1alpha1/platforminstances"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "PlatformInstanceList",
+                            "items": [{
+                                "apiVersion": "stardelt.io/v1alpha1",
+                                "kind": "PlatformInstance",
+                                "metadata": { "name": "demo" },
+                                "spec": { "namespace": "stardelt", "identity": { "mode": "platform" } }
+                            }]
+                        }),
+                    )
+                } else if method == "GET" && path.contains("/configmaps/keycloak-env") {
+                    (200, cm_env())
+                } else if method == "GET" && path.contains("/secrets/keycloak-admin") {
+                    (200, admin_secret())
+                } else if uri.contains("/proxy/realms/master/protocol/openid-connect/token") {
+                    (200, json!({"access_token": "tok"}))
+                } else if method == "GET"
+                    && uri.contains("/proxy/admin/realms/stardelt/clients?clientId=sp-etl")
+                {
+                    (
+                        200,
+                        json!([{"id":"kc-1","attributes":{"stardelt-managed":"principal"}}]),
+                    )
+                } else if method == "DELETE"
+                    && uri.contains("/proxy/admin/realms/stardelt/clients/kc-1")
+                {
+                    (200, json!({}))
+                } else if method == "DELETE" && path == "/api/v1/namespaces/stardelt/secrets/sp-etl"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "v1", "kind": "Secret",
+                            "metadata": { "name": "sp-etl", "namespace": "stardelt" }
+                        }),
+                    )
+                } else if method == "PATCH"
+                    && path
+                        == "/apis/stardelt.io/v1alpha1/namespaces/stardelt/serviceprincipals/etl"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "ServicePrincipal",
+                            "metadata": { "name": "etl", "namespace": "stardelt", "finalizers": [] },
+                            "spec": { "ownerGroup": "analytics" }
+                        }),
+                    )
+                } else if method == "DELETE" || method == "PUT" || method == "POST" {
+                    (200, json!({}))
+                } else {
+                    (
+                        404,
+                        json!({"kind":"Status","code":404,"reason":"NotFound","message":"not found"}),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&document).expect("mock document"),
+                        ))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        let client = kube::Client::new(service, "stardelt");
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let principal: ServicePrincipal = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "ServicePrincipal",
+            "metadata": {
+                "name": "etl",
+                "namespace": "stardelt",
+                "deletionTimestamp": "2026-11-06T00:00:00Z",
+                "finalizers": [PRINCIPAL_FINALIZER]
+            },
+            "spec": { "ownerGroup": "analytics" }
+        }))
+        .expect("deserialize ServicePrincipal");
+
+        let action = reconcile_principal(Arc::new(principal), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::await_change());
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            requests.iter().any(|(m, p, _)| m == "DELETE"
+                && p.contains("/proxy/admin/realms/stardelt/clients/kc-1")),
+            "expected Keycloak client delete: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(m, p, _)| m == "DELETE" && p == "/api/v1/namespaces/stardelt/secrets/sp-etl"),
+            "expected Secret delete: {requests:?}"
+        );
+        let finalizer_patch = requests
+            .iter()
+            .find(|(m, p, _)| {
+                m == "PATCH"
+                    && p == "/apis/stardelt.io/v1alpha1/namespaces/stardelt/serviceprincipals/etl"
+            })
+            .expect("finalizer patch");
+        let body: serde_json::Value = serde_json::from_str(&finalizer_patch.2).expect("json");
+        assert_eq!(body["metadata"]["finalizers"], json!([]), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_client_the_operator_did_not_create_is_left_alone() {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            let uri = request.uri().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    String::from_utf8_lossy(&body).to_string(),
+                ));
+                let (status, document) = if method == "GET"
+                    && path == "/apis/stardelt.io/v1alpha1/platforminstances"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "PlatformInstanceList",
+                            "items": [{
+                                "apiVersion": "stardelt.io/v1alpha1",
+                                "kind": "PlatformInstance",
+                                "metadata": { "name": "demo" },
+                                "spec": { "namespace": "stardelt", "identity": { "mode": "platform" } }
+                            }]
+                        }),
+                    )
+                } else if method == "GET" && path.contains("/configmaps/keycloak-env") {
+                    (200, cm_env())
+                } else if method == "GET" && path.contains("/secrets/keycloak-admin") {
+                    (200, admin_secret())
+                } else if uri.contains("/proxy/realms/master/protocol/openid-connect/token") {
+                    (200, json!({"access_token": "tok"}))
+                } else if method == "GET"
+                    && uri.contains("/proxy/admin/realms/stardelt/clients?clientId=sp-etl")
+                {
+                    (200, json!([{"id":"kc-1","attributes":{}}]))
+                } else {
+                    (
+                        404,
+                        json!({"kind":"Status","code":404,"reason":"NotFound","message":"not found"}),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&document).expect("mock document"),
+                        ))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        let client = kube::Client::new(service, "stardelt");
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let principal: ServicePrincipal = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "ServicePrincipal",
+            "metadata": {
+                "name": "etl",
+                "namespace": "stardelt",
+                "deletionTimestamp": "2026-11-06T00:00:00Z",
+                "finalizers": [PRINCIPAL_FINALIZER]
+            },
+            "spec": { "ownerGroup": "analytics" }
+        }))
+        .expect("deserialize ServicePrincipal");
+
+        let action = reconcile_principal(Arc::new(principal), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            !requests.iter().any(|(m, _p, _)| m == "DELETE"),
+            "no DELETE expected: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|(m, p, _)| {
+                m == "PATCH"
+                    && p == "/apis/stardelt.io/v1alpha1/namespaces/stardelt/serviceprincipals/etl"
+            }),
+            "finalizer patch absent: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_in_external_mode_touches_no_keycloak() {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    String::from_utf8_lossy(&body).to_string(),
+                ));
+                let (status, document) = if method == "GET"
+                    && path == "/apis/stardelt.io/v1alpha1/platforminstances"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "PlatformInstanceList",
+                            "items": [{
+                                "apiVersion": "stardelt.io/v1alpha1",
+                                "kind": "PlatformInstance",
+                                "metadata": { "name": "demo" },
+                                "spec": {
+                                    "namespace": "stardelt",
+                                    "identity": {
+                                        "mode": "external",
+                                        "issuerUrl": "https://id.example.com/realms/stardelt"
+                                    }
+                                }
+                            }]
+                        }),
+                    )
+                } else if method == "DELETE" && path == "/api/v1/namespaces/stardelt/secrets/sp-etl"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "v1", "kind": "Secret",
+                            "metadata": { "name": "sp-etl", "namespace": "stardelt" }
+                        }),
+                    )
+                } else if method == "PATCH"
+                    && path
+                        == "/apis/stardelt.io/v1alpha1/namespaces/stardelt/serviceprincipals/etl"
+                {
+                    (
+                        200,
+                        json!({
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "ServicePrincipal",
+                            "metadata": { "name": "etl", "namespace": "stardelt", "finalizers": [] },
+                            "spec": { "ownerGroup": "analytics" }
+                        }),
+                    )
+                } else {
+                    (
+                        404,
+                        json!({"kind":"Status","code":404,"reason":"NotFound","message":"not found"}),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(
+                            serde_json::to_vec(&document).expect("mock document"),
+                        ))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        let client = kube::Client::new(service, "stardelt");
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let principal: ServicePrincipal = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "ServicePrincipal",
+            "metadata": {
+                "name": "etl",
+                "namespace": "stardelt",
+                "deletionTimestamp": "2026-11-06T00:00:00Z",
+                "finalizers": [PRINCIPAL_FINALIZER]
+            },
+            "spec": { "ownerGroup": "analytics" }
+        }))
+        .expect("deserialize ServicePrincipal");
+
+        let action = reconcile_principal(Arc::new(principal), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::await_change());
+
+        let requests = requests.lock().expect("requests poisoned");
+        assert!(
+            requests.iter().all(|(_, p, _)| !p.contains("/admin/")),
+            "no Keycloak admin requests expected: {requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(m, p, _)| m == "DELETE" && p == "/api/v1/namespaces/stardelt/secrets/sp-etl"),
+            "expected Secret delete: {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|(m, p, _)| {
+                m == "PATCH"
+                    && p == "/apis/stardelt.io/v1alpha1/namespaces/stardelt/serviceprincipals/etl"
+            }),
+            "expected finalizer removal: {requests:?}"
+        );
     }
 }

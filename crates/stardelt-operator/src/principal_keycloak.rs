@@ -15,7 +15,7 @@ use k8s_openapi::{
     ByteString,
     api::core::v1::{ConfigMap, Secret},
 };
-use kube::{Api, api::ListParams};
+use kube::{Api, api::DeleteParams, api::ListParams};
 
 use crate::{
     controller::Context,
@@ -367,6 +367,78 @@ pub async fn platform_instance_for_namespace(
         .items
         .into_iter()
         .find(|pi| pi.spec.namespace == namespace))
+}
+
+/// Delete the Keycloak client and the credentials Secret of one principal.
+/// Mirrors `keycloak-sync-principal.sh --delete`: only a client carrying
+/// `stardelt-managed: principal` may be removed; anything else is an error, not a guess.
+pub async fn delete_principal_client(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+) -> Result<(), String> {
+    let client_id = principal_client_id(name);
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+    let instance = platform_instance_for_namespace(ctx, namespace)
+        .await
+        .map_err(|e| format!("cannot list PlatformInstances: {e}"))?;
+    if instance
+        .as_ref()
+        .is_none_or(|pi| pi.spec.identity.mode != crate::crd::IdentityMode::Platform)
+    {
+        match secrets.delete(&client_id, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 => {}
+            Err(e) => return Err(format!("cannot delete Secret {client_id}: {e}")),
+        }
+        return Ok(());
+    }
+
+    let token = admin_token(ctx, namespace).await?;
+    let clients_json = proxy_auth(
+        ctx,
+        namespace,
+        &token,
+        "GET",
+        &format!("/admin/realms/stardelt/clients?clientId={client_id}"),
+        None,
+        None,
+    )
+    .await?;
+    let clients: Vec<serde_json::Value> = serde_json::from_str(&clients_json)
+        .map_err(|_| "Keycloak returned a client list that is not JSON".to_string())?;
+    if let Some(client) = clients.first() {
+        let managed = client
+            .get("attributes")
+            .and_then(|a| a.get("stardelt-managed"))
+            .and_then(|v| v.as_str());
+        if managed != Some("principal") {
+            return Err(format!(
+                "refusing to delete client {client_id}: it does not carry stardelt-managed=principal"
+            ));
+        }
+        let id = client
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("Keycloak client {client_id} has no id"))?;
+        proxy_auth(
+            ctx,
+            namespace,
+            &token,
+            "DELETE",
+            &format!("/admin/realms/stardelt/clients/{id}"),
+            None,
+            None,
+        )
+        .await?;
+    }
+
+    match secrets.delete(&client_id, &DeleteParams::default()).await {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(e) => return Err(format!("cannot delete Secret {client_id}: {e}")),
+    }
+    Ok(())
 }
 
 /// Converge the Keycloak client and Secret for one principal.
