@@ -2122,6 +2122,204 @@ pub async fn ensure_external_store(
     }
 }
 
+/// One request to the store through the API server's service proxy. The token is a header and
+/// never a log line; the caller decides what to do with the answer.
+async fn store_request(
+    ctx: &Context,
+    namespace: &str,
+    method: http::Method,
+    path: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let uri = secrets::store_proxy_path(namespace, path);
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Vault-Token", token);
+    if body.is_some() {
+        builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+    }
+    let bytes = body.map(|v| v.to_string().into_bytes()).unwrap_or_default();
+    let request = builder.body(bytes).map_err(|e| e.to_string())?;
+    ctx.client
+        .request_text(request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// One secret store per owner group in `secrets.mode: platform` (SC4b, decision D27): the policy
+/// and the auth role in the store, then the ServiceAccount and the `SecretStore` in the namespace.
+/// Idempotent: writing a policy or a role twice sets the same value.
+pub async fn ensure_group_stores(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "group-stores";
+    if spec.secrets.mode != SecretsMode::Platform || spec.secrets.groups.is_empty() {
+        return None;
+    }
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+
+    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &spec.namespace);
+    let init = match secrets_api.get_opt(secrets::INIT_SECRET).await {
+        Ok(Some(secret)) => secret,
+        Ok(None) => {
+            return Some(status(
+                NAME,
+                false,
+                "waiting for Secret openbao-init (the store is not initialised yet)",
+            ));
+        }
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    let token = match text(&init, "root-token") {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            return Some(status(
+                NAME,
+                false,
+                "waiting for Secret openbao-init (the store is not initialised yet)",
+            ));
+        }
+    };
+
+    let auth = match store_request(
+        ctx,
+        &spec.namespace,
+        http::Method::GET,
+        "/v1/sys/auth",
+        &token,
+        None,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    let auth_doc: serde_json::Value = serde_json::from_str(&auth).unwrap_or(serde_json::json!({}));
+    if auth_doc.get("kubernetes/").is_none() {
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::POST,
+            "/v1/sys/auth/kubernetes",
+            &token,
+            Some(serde_json::json!({"type": "kubernetes"})),
+        )
+        .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::POST,
+            "/v1/auth/kubernetes/config",
+            &token,
+            Some(serde_json::json!({"kubernetes_host": "https://kubernetes.default.svc"})),
+        )
+        .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut groups = Vec::new();
+    for group in &spec.secrets.groups {
+        if seen.insert(group.as_str()) {
+            groups.push(group.as_str());
+        }
+    }
+
+    for group in &groups {
+        let role_name = secrets::group_role_name(&spec.namespace, group);
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::PUT,
+            &format!("/v1/sys/policies/acl/{role_name}"),
+            &token,
+            Some(serde_json::json!({"policy": secrets::group_policy(group)})),
+        )
+        .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::POST,
+            &format!("/v1/auth/kubernetes/role/{role_name}"),
+            &token,
+            Some(serde_json::json!({
+                "bound_service_account_names": [format!("eso-{group}")],
+                "bound_service_account_namespaces": [&spec.namespace],
+                "token_policies": [role_name],
+                "token_ttl": "15m",
+            })),
+        )
+        .await
+        {
+            return Some(status(NAME, false, e.to_string()));
+        }
+    }
+
+    let sa_resource = kube::core::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
+        "",
+        "v1",
+        "ServiceAccount",
+    ));
+    for group in &groups {
+        let sa: DynamicObject =
+            match serde_json::from_value(secrets::group_service_account(&spec.namespace, group)) {
+                Ok(d) => d,
+                Err(e) => return Some(status(NAME, false, e.to_string())),
+            };
+        if let Err(e) = apply_dynamic(&ctx.client, &spec.namespace, &sa_resource, &sa, false).await
+        {
+            return Some(match e {
+                kube::Error::Api(api) if api.code == 404 => status(
+                    NAME,
+                    false,
+                    "External Secrets Operator is not installed (make external-secrets)",
+                ),
+                other => status(NAME, false, other.to_string()),
+            });
+        }
+
+        let store: DynamicObject =
+            match serde_json::from_value(secrets::group_secret_store(&spec.namespace, group)) {
+                Ok(d) => d,
+                Err(e) => return Some(status(NAME, false, e.to_string())),
+            };
+        if let Err(e) = apply_dynamic(
+            &ctx.client,
+            &spec.namespace,
+            &secrets::secret_store_resource(),
+            &store,
+            false,
+        )
+        .await
+        {
+            return Some(match e {
+                kube::Error::Api(api) if api.code == 404 => status(
+                    NAME,
+                    false,
+                    "External Secrets Operator is not installed (make external-secrets)",
+                ),
+                other => status(NAME, false, other.to_string()),
+            });
+        }
+    }
+
+    let count = groups.len();
+    Some(status(NAME, true, format!("ready: {count} group store(s)")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2156,6 +2354,82 @@ mod tests {
 
     /// Every request a mock client saw: method, path, body.
     type Recorded = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    /// A kube client for group stores: init Secret present with `root_token`, `/sys/auth` without
+    /// `kubernetes/` (so the auth method is enabled), every PUT/POST answers 204, every PATCH echoes.
+    fn mock_client_with_init(root_token: &str) -> (kube::Client, Recorded) {
+        let token_b64 =
+            serde_json::to_value(k8s_openapi::ByteString(root_token.as_bytes().to_vec()))
+                .expect("base64 token")
+                .as_str()
+                .expect("string")
+                .to_string();
+        let init = format!(
+            r#"{{"apiVersion":"v1","kind":"Secret","metadata":{{"name":"openbao-init"}},"data":{{"root-token":"{token_b64}","recovery-key":"cmVj"}}}}"#
+        );
+        mock_client_with_init_doc(init, false)
+    }
+
+    /// Same group-store mock but the init Secret is absent (404).
+    fn mock_client_with_init_missing() -> (kube::Client, Recorded) {
+        mock_client_with_init_doc(String::new(), true)
+    }
+
+    fn mock_client_with_init_doc(
+        init_secret: String,
+        init_missing: bool,
+    ) -> (kube::Client, Recorded) {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let init_secret = init_secret.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                let body = String::from_utf8_lossy(&body).to_string();
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    body.clone(),
+                ));
+                let (status, document) = if method == "PATCH" {
+                    (200, body)
+                } else if method == "GET" && path.ends_with("/secrets/openbao-init") {
+                    if init_missing {
+                        (
+                            404,
+                            r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#.to_string(),
+                        )
+                    } else {
+                        (200, init_secret)
+                    }
+                } else if method == "GET" && path.ends_with("/proxy/v1/sys/auth") {
+                    (200, r#"{}"#.to_string())
+                } else if method == "PUT" || method == "POST" {
+                    (204, String::new())
+                } else {
+                    (
+                        404,
+                        r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#.to_string(),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(document.into_bytes()))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (kube::Client::new(service, "stardelt"), requests)
+    }
 
     /// A kube client that answers `GET secrets/stardelt-s3-creds` with a complete
     /// Secret (or 404) and echoes every PATCH body back. Every request is recorded.
@@ -4440,6 +4714,143 @@ mod tests {
         assert!(
             requests.lock().expect("requests poisoned").is_empty(),
             "secrets.mode none must not touch the cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_stores_only_for_platform_mode() {
+        for mode in [SecretsMode::None, SecretsMode::External] {
+            let (client, requests) = mock_client_with_init("probe-token");
+            let mut spec = platform("platform", false);
+            spec.secrets.mode = mode;
+            spec.secrets.groups = vec!["analytics".into()];
+            assert!(
+                ensure_group_stores(&context(client), &spec).await.is_none(),
+                "{mode:?}"
+            );
+            assert!(
+                requests.lock().expect("requests poisoned").is_empty(),
+                "{mode:?} must not touch the cluster"
+            );
+        }
+    }
+
+    #[test]
+    fn a_group_store_can_read_only_its_own_path() {
+        assert!(
+            secrets::group_policy("analytics")
+                .contains("secret/data/connections/group/analytics/*")
+        );
+        assert!(!secrets::group_policy("analytics").contains("finance"));
+        let store = secrets::group_secret_store("stardelt", "analytics");
+        assert_eq!(store["metadata"]["name"], "openbao-analytics");
+        assert_eq!(
+            store["spec"]["provider"]["vault"]["auth"]["kubernetes"]["role"],
+            "eso-stardelt-analytics"
+        );
+        assert_eq!(
+            store["spec"]["provider"]["vault"]["auth"]["kubernetes"]["serviceAccountRef"]["name"],
+            "eso-analytics"
+        );
+        assert_eq!(
+            store["spec"]["provider"]["vault"]["server"],
+            "http://openbao.stardelt.svc.cluster.local:8200"
+        );
+        assert_eq!(store["spec"]["provider"]["vault"]["path"], "secret");
+        assert_eq!(store["spec"]["provider"]["vault"]["version"], "v2");
+    }
+
+    #[tokio::test]
+    async fn group_stores_write_the_policy_and_the_role() {
+        let (client, requests) = mock_client_with_init("probe-token");
+        let mut spec = platform("platform", false);
+        spec.secrets.mode = SecretsMode::Platform;
+        spec.secrets.groups = vec!["analytics".into(), "finance".into()];
+        let status = ensure_group_stores(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        assert_eq!(status.message.as_deref(), Some("ready: 2 group store(s)"));
+        let reqs = requests.lock().expect("requests poisoned");
+        let mut index = 0usize;
+        let expect =
+            |reqs: &Vec<(String, String, String)>, index: &mut usize, method: &str, path: &str| {
+                let pos = reqs[*index..]
+                    .iter()
+                    .position(|(m, p, _)| m == method && p.contains(path))
+                    .unwrap_or_else(|| {
+                        panic!("missing {method} containing {path} after {index}: {reqs:?}")
+                    });
+                *index += pos + 1;
+            };
+        expect(&reqs, &mut index, "POST", "/proxy/v1/sys/auth/kubernetes");
+        expect(
+            &reqs,
+            &mut index,
+            "POST",
+            "/proxy/v1/auth/kubernetes/config",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "PUT",
+            "/proxy/v1/sys/policies/acl/eso-stardelt-analytics",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "POST",
+            "/proxy/v1/auth/kubernetes/role/eso-stardelt-analytics",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "PUT",
+            "/proxy/v1/sys/policies/acl/eso-stardelt-finance",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "POST",
+            "/proxy/v1/auth/kubernetes/role/eso-stardelt-finance",
+        );
+        expect(&reqs, &mut index, "PATCH", "/serviceaccounts/eso-analytics");
+        expect(
+            &reqs,
+            &mut index,
+            "PATCH",
+            "/secretstores/openbao-analytics",
+        );
+        expect(&reqs, &mut index, "PATCH", "/serviceaccounts/eso-finance");
+        expect(&reqs, &mut index, "PATCH", "/secretstores/openbao-finance");
+        for (method, path, body) in reqs.iter() {
+            assert!(!path.contains("probe-token"), "{method} {path}");
+            assert!(!body.contains("probe-token"), "{method} {path} body");
+        }
+    }
+
+    #[tokio::test]
+    async fn group_stores_report_a_missing_init_secret() {
+        let (client, requests) = mock_client_with_init_missing();
+        let mut spec = platform("platform", false);
+        spec.secrets.mode = SecretsMode::Platform;
+        spec.secrets.groups = vec!["analytics".into()];
+        let status = ensure_group_stores(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert!(
+            status
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("openbao-init")
+        );
+        let reqs = requests.lock().expect("requests poisoned");
+        assert!(
+            reqs.iter()
+                .all(|(method, _, _)| method != "PUT" && method != "POST"),
+            "no store writes expected: {reqs:?}"
         );
     }
 }
