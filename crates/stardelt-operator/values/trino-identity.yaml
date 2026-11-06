@@ -74,6 +74,27 @@ accessControl:
           {"privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]}
         ]
       }
+initContainers:
+  coordinator:
+    - name: wait-for-idp
+      image: trinodb/trino:480
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: TRINO_OIDC_ISSUER
+          valueFrom:
+            configMapKeyRef:
+              name: stardelt-identity
+              key: issuerUrl
+              optional: true
+      command:
+        - /usr/bin/bash
+        - -c
+        - |
+          until /usr/bin/curl -fsS --max-time 5 \
+            "$TRINO_OIDC_ISSUER/.well-known/openid-configuration" >/dev/null; do
+            echo "waiting for $TRINO_OIDC_ISSUER"
+            sleep 3
+          done
 coordinator:
   # The PKCS12 keystore cert-manager writes into Secret trino-coordinator-tls. A
   # directory mount, not a subPath file: the directory appears when the Secret does

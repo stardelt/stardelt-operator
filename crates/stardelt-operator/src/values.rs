@@ -1054,6 +1054,29 @@ mod tests {
         );
     }
 
+    /// platform#565: the coordinator must not exit 100 when the IdP is briefly
+    /// unavailable. The gate is a chart-level `initContainers.coordinator` entry
+    /// that polls the same discovery URL the coordinator uses.
+    #[test]
+    fn trino_identity_values_wait_for_the_idp() {
+        let values = identity_values("trino");
+        let init = &values["initContainers"]["coordinator"][0];
+        assert_eq!(init["name"], serde_json::json!("wait-for-idp"));
+        assert_eq!(init["image"], serde_json::json!("trinodb/trino:480"));
+        assert_eq!(
+            init["env"][0]["valueFrom"]["configMapKeyRef"]["name"],
+            serde_json::json!("stardelt-identity")
+        );
+        assert_eq!(
+            init["env"][0]["valueFrom"]["configMapKeyRef"]["key"],
+            serde_json::json!("issuerUrl")
+        );
+        assert_eq!(
+            init["env"][0]["valueFrom"]["configMapKeyRef"]["optional"],
+            serde_json::json!(true)
+        );
+    }
+
     #[test]
     fn only_trino_has_identity_values() {
         for component in ["lakekeeper", "airflow", "cnpg"] {
