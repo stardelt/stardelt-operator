@@ -254,6 +254,13 @@ spec:
                     required:
                     - provider
                     type: object
+                  groups:
+                    description: |-
+                      Owner groups that get their own store entry in `secrets.mode: platform` (decision D27):
+                      each one may read only its own path. Mirrors the platform's `STORE_GROUPS`.
+                    items:
+                      type: string
+                    type: array
                   mode:
                     default: none
                     description: Which secret store the platform uses for user credentials (decision D23).
@@ -344,6 +351,10 @@ spec:
               rule: '!has(self.secrets) || !has(self.secrets.mode) || self.secrets.mode != ''external'' || (has(self.secrets.external) && has(self.secrets.external.provider))'
             - message: secrets.external is only allowed with secrets.mode external
               rule: '!has(self.secrets) || !has(self.secrets.external) || (has(self.secrets.mode) && self.secrets.mode == ''external'')'
+            - message: secrets.groups entries are lower-case letters, digits and dashes (at most 40 characters)
+              rule: '!has(self.secrets) || !has(self.secrets.groups) || self.secrets.groups.all(g, g.matches(''^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$''))'
+            - message: secrets.groups is only allowed with secrets.mode platform
+              rule: '!has(self.secrets) || !has(self.secrets.groups) || size(self.secrets.groups) == 0 || (has(self.secrets.mode) && self.secrets.mode == ''platform'')'
           status:
             nullable: true
             properties:

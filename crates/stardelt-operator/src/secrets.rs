@@ -29,6 +29,81 @@ pub fn store_proxy_path(namespace: &str, path: &str) -> String {
     format!("/api/v1/namespaces/{namespace}/services/http:openbao:8200/proxy{path}")
 }
 
+/// The store path an owner group may read, and nothing else (decision D27).
+pub fn group_path_prefix(group: &str) -> String {
+    format!("connections/group/{group}/")
+}
+
+/// The OpenBao policy an owner group's store signs in with: read on its own prefix only.
+/// The platform writes the same text in `scripts/eso-openbao-store.sh`.
+pub fn group_policy(group: &str) -> String {
+    format!(
+        "path \"secret/data/{}*\" {{ capabilities = [\"read\"] }}\n",
+        group_path_prefix(group)
+    )
+}
+
+/// Policy name and Kubernetes-auth role name (the platform uses one string for both).
+pub fn group_role_name(namespace: &str, group: &str) -> String {
+    format!("eso-{namespace}-{group}")
+}
+
+/// The ServiceAccount External Secrets signs in as; the store's role is bound to its name.
+pub fn group_service_account(namespace: &str, group: &str) -> Value {
+    serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "ServiceAccount",
+        "metadata": {
+            "name": format!("eso-{group}"),
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/managed-by": "stardelt-operator",
+                "stardelt.io/component": "openbao",
+            },
+        },
+    })
+}
+
+/// The namespaced `SecretStore` (`external-secrets.io/v1`) of one owner group.
+pub fn group_secret_store(namespace: &str, group: &str) -> Value {
+    serde_json::json!({
+        "apiVersion": "external-secrets.io/v1",
+        "kind": "SecretStore",
+        "metadata": {
+            "name": format!("openbao-{group}"),
+            "namespace": namespace,
+            "labels": {
+                "app.kubernetes.io/managed-by": "stardelt-operator",
+                "stardelt.io/component": "openbao",
+            },
+        },
+        "spec": {
+            "provider": {
+                "vault": {
+                    "server": format!("http://openbao.{namespace}.svc.cluster.local:8200"),
+                    "path": "secret",
+                    "version": "v2",
+                    "auth": {
+                        "kubernetes": {
+                            "mountPath": "kubernetes",
+                            "role": group_role_name(namespace, group),
+                            "serviceAccountRef": { "name": format!("eso-{group}") },
+                        },
+                    },
+                },
+            },
+        },
+    })
+}
+
+/// The `SecretStore` API resource (`secretstores.external-secrets.io/v1`, namespaced).
+pub fn secret_store_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("external-secrets.io", "v1", "SecretStore"),
+        "secretstores",
+    )
+}
+
 /// The body of `bao operator init` with one recovery share (auto-unseal: no unseal shares).
 /// `secret_shares: 0` is what the static seal needs; the platform script leaves the CLI's 5/3
 /// default, which the static seal never uses, so only the recovery pair has to match it.
@@ -251,6 +326,7 @@ mod tests {
             secrets: crate::crd::SecretsSpec {
                 mode: SecretsMode::None,
                 external: None,
+                groups: Vec::new(),
             },
             ingress: IngressSettings::default(),
         };
@@ -286,6 +362,7 @@ mod tests {
             secrets: crate::crd::SecretsSpec {
                 mode: SecretsMode::None,
                 external: None,
+                groups: Vec::new(),
             },
             ingress: IngressSettings::default(),
         };
