@@ -341,6 +341,7 @@ mod tests {
             secrets: SecretsSpec {
                 mode: SecretsMode::External,
                 external: None,
+                groups: Vec::new(),
             },
             pillars: Pillars {
                 notebooks: true,
@@ -356,6 +357,7 @@ mod tests {
             secrets: SecretsSpec {
                 mode: SecretsMode::Platform,
                 external: None,
+                groups: Vec::new(),
             },
             pillars: Pillars {
                 notebooks: true,
@@ -392,6 +394,7 @@ mod tests {
             secrets: SecretsSpec {
                 mode: SecretsMode::Platform,
                 external: None,
+                groups: Vec::new(),
             },
             ingress: Default::default(),
         };
@@ -414,6 +417,7 @@ mod tests {
             secrets: SecretsSpec {
                 mode: SecretsMode::External,
                 external: None,
+                groups: Vec::new(),
             },
             ingress: Default::default(),
         };

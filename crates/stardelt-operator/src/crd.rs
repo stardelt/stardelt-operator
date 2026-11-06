@@ -402,6 +402,10 @@ pub struct SecretsSpec {
     /// The enterprise's store; required for `external`, refused for the other modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external: Option<ExternalSecretsSpec>,
+    /// Owner groups that get their own store entry in `secrets.mode: platform` (decision D27):
+    /// each one may read only its own path. Mirrors the platform's `STORE_GROUPS`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 /// Cluster-scoped root resource: declares which pillars and profile are installed.
@@ -438,6 +442,14 @@ pub struct SecretsSpec {
     {
         "rule": "!has(self.secrets) || !has(self.secrets.external) || (has(self.secrets.mode) && self.secrets.mode == 'external')",
         "message": "secrets.external is only allowed with secrets.mode external"
+    },
+    {
+        "rule": "!has(self.secrets) || !has(self.secrets.groups) || self.secrets.groups.all(g, g.matches('^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$'))",
+        "message": "secrets.groups entries are lower-case letters, digits and dashes (at most 40 characters)"
+    },
+    {
+        "rule": "!has(self.secrets) || !has(self.secrets.groups) || size(self.secrets.groups) == 0 || (has(self.secrets.mode) && self.secrets.mode == 'platform')",
+        "message": "secrets.groups is only allowed with secrets.mode platform"
     }
 ]))]
 pub struct PlatformInstanceSpec {

@@ -17,7 +17,7 @@ use k8s_openapi::{
 use kube::{
     Api, ResourceExt,
     api::{Patch, PatchParams},
-    core::{DynamicObject, ObjectMeta, TypeMeta},
+    core::{ApiResource, DynamicObject, ObjectMeta, TypeMeta},
 };
 use serde_json::json;
 
@@ -2122,6 +2122,238 @@ pub async fn ensure_external_store(
     }
 }
 
+/// One request to the store through the API server's service proxy. The token is a header and
+/// never a log line; the caller decides what to do with the answer.
+async fn store_request(
+    ctx: &Context,
+    namespace: &str,
+    method: http::Method,
+    path: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Result<String, String> {
+    let uri = secrets::store_proxy_path(namespace, path);
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Vault-Token", token);
+    let request = if let Some(body) = body {
+        builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+        builder
+            .body(body.to_string().into_bytes())
+            .map_err(|e| e.to_string())?
+    } else {
+        builder.body(Vec::new()).map_err(|e| e.to_string())?
+    };
+    ctx.client
+        .request_text(request)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// One secret store per owner group in `secrets.mode: platform` (SC4b, decision D27): the policy
+/// and the auth role in the store, then the ServiceAccount and the `SecretStore` in the namespace.
+/// Idempotent: writing a policy or a role twice sets the same value.
+pub async fn ensure_group_stores(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "group-stores";
+    if spec.secrets.mode != SecretsMode::Platform || spec.secrets.groups.is_empty() {
+        return None;
+    }
+    if spec.dry_run {
+        return Some(status(NAME, false, "planned (dry-run)"));
+    }
+
+    let secrets_api: Api<Secret> = Api::namespaced(ctx.client.clone(), &spec.namespace);
+    let init_secret = match secrets_api.get_opt(secrets::INIT_SECRET).await {
+        Ok(Some(secret)) => secret,
+        Ok(None) => {
+            return Some(status(
+                NAME,
+                false,
+                "waiting for Secret openbao-init (the store is not initialised yet)",
+            ));
+        }
+        Err(e) => return Some(status(NAME, false, e.to_string())),
+    };
+    let token = match init_secret
+        .data
+        .as_ref()
+        .and_then(|data| data.get("root-token"))
+        .and_then(|value| String::from_utf8(value.0.clone()).ok())
+    {
+        Some(token) if !token.is_empty() => token,
+        _ => {
+            return Some(status(NAME, false, "Secret openbao-init has no root-token"));
+        }
+    };
+
+    // Enable the Kubernetes auth method once: absent in the sandbox until the operator does it.
+    let auth = match store_request(
+        ctx,
+        &spec.namespace,
+        http::Method::GET,
+        "/v1/sys/auth",
+        &token,
+        None,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(e) => {
+            return Some(status(
+                NAME,
+                false,
+                format!("auth method check failed: {e}"),
+            ));
+        }
+    };
+    let kubernetes_enabled = serde_json::from_str::<serde_json::Value>(&auth)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .is_some_and(|map| map.contains_key("kubernetes/"));
+    if !kubernetes_enabled {
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::POST,
+            "/v1/sys/auth/kubernetes",
+            &token,
+            Some(serde_json::json!({"type": "kubernetes"})),
+        )
+        .await
+        {
+            return Some(status(
+                NAME,
+                false,
+                format!("enabling the Kubernetes auth method failed: {e}"),
+            ));
+        }
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::POST,
+            "/v1/auth/kubernetes/config",
+            &token,
+            Some(serde_json::json!({"kubernetes_host": "https://kubernetes.default.svc"})),
+        )
+        .await
+        {
+            return Some(status(
+                NAME,
+                false,
+                format!("configuring the Kubernetes auth method failed: {e}"),
+            ));
+        }
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    for group in &spec.secrets.groups {
+        if !seen.insert(group.as_str()) {
+            continue;
+        }
+        let role = secrets::group_role_name(&spec.namespace, group);
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::PUT,
+            &format!("/v1/sys/policies/acl/{role}"),
+            &token,
+            Some(serde_json::json!({"policy": secrets::group_policy(group)})),
+        )
+        .await
+        {
+            return Some(status(
+                NAME,
+                false,
+                format!("writing policy {role} failed: {e}"),
+            ));
+        }
+        if let Err(e) = store_request(
+            ctx,
+            &spec.namespace,
+            http::Method::POST,
+            &format!("/v1/auth/kubernetes/role/{role}"),
+            &token,
+            Some(serde_json::json!({
+                "bound_service_account_names": [format!("eso-{group}")],
+                "bound_service_account_namespaces": [&spec.namespace],
+                "token_policies": [role],
+                "token_ttl": "15m",
+            })),
+        )
+        .await
+        {
+            return Some(status(
+                NAME,
+                false,
+                format!("writing role {role} failed: {e}"),
+            ));
+        }
+        let sa = match serde_json::from_value::<DynamicObject>(secrets::group_service_account(
+            &spec.namespace,
+            group,
+        )) {
+            Ok(object) => object,
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        };
+        if let Err(e) = apply_dynamic(
+            &ctx.client,
+            &spec.namespace,
+            &ApiResource::from_gvk_with_plural(
+                &kube::core::GroupVersionKind::gvk("", "v1", "ServiceAccount"),
+                "serviceaccounts",
+            ),
+            &sa,
+            false,
+        )
+        .await
+        {
+            return Some(match e {
+                kube::Error::Api(e) if e.code == 404 => status(
+                    NAME,
+                    false,
+                    "External Secrets Operator is not installed (make external-secrets)",
+                ),
+                other => status(NAME, false, other.to_string()),
+            });
+        }
+        let store = match serde_json::from_value::<DynamicObject>(secrets::group_secret_store(
+            &spec.namespace,
+            group,
+        )) {
+            Ok(object) => object,
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        };
+        if let Err(e) = apply_dynamic(
+            &ctx.client,
+            &spec.namespace,
+            &secrets::secret_store_resource(),
+            &store,
+            false,
+        )
+        .await
+        {
+            return Some(match e {
+                kube::Error::Api(e) if e.code == 404 => status(
+                    NAME,
+                    false,
+                    "External Secrets Operator is not installed (make external-secrets)",
+                ),
+                other => status(NAME, false, other.to_string()),
+            });
+        }
+    }
+
+    Some(status(
+        NAME,
+        true,
+        format!("ready: {} group store(s)", spec.secrets.groups.len()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2229,6 +2461,69 @@ mod tests {
                     (200, init.to_string())
                 } else if method == "PATCH" {
                     (200, body)
+                } else {
+                    (
+                        404,
+                        r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#.to_string(),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(document.into_bytes()))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (kube::Client::new(service, "stardelt"), requests)
+    }
+
+    /// A kube client for group stores: the init Secret is present or 404, the Kubernetes auth
+    /// method is not enabled yet, and every PATCH/PUT/POST to the API is accepted.
+    fn mock_client_with_init(root_token: &str, init_present: bool) -> (kube::Client, Recorded) {
+        let requests: Recorded = Arc::default();
+        let recorder = requests.clone();
+        let root_token_b64 = serde_json::to_value(ByteString(root_token.as_bytes().to_vec()))
+            .expect("serialize token")
+            .as_str()
+            .expect("base64 string")
+            .to_string();
+        let init_secret = format!(
+            r#"{{"apiVersion":"v1","kind":"Secret","metadata":{{"name":"openbao-init"}},"data":{{"root-token":"{root_token_b64}","recovery-key":"cmVj"}}}}"#
+        );
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let init_secret = init_secret.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            async move {
+                let body = request
+                    .into_body()
+                    .collect_bytes()
+                    .await
+                    .expect("mock body");
+                let body = String::from_utf8_lossy(&body).to_string();
+                recorder.lock().expect("requests poisoned").push((
+                    method.clone(),
+                    path.clone(),
+                    body.clone(),
+                ));
+                let (status, document) = if method == "PATCH" {
+                    (200, body)
+                } else if path.ends_with("/secrets/openbao-init") && method == "GET" {
+                    if init_present {
+                        (200, init_secret)
+                    } else {
+                        (
+                            404,
+                            r#"{"apiVersion":"v1","kind":"Status","status":"Failure","reason":"NotFound","code":404,"message":"not found"}"#.to_string(),
+                        )
+                    }
+                } else if path.ends_with("/proxy/v1/sys/auth") && method == "GET" {
+                    (200, "{}".to_string())
+                } else if method == "PUT" || method == "POST" {
+                    (204, String::new())
                 } else {
                     (
                         404,
@@ -4440,6 +4735,145 @@ mod tests {
         assert!(
             requests.lock().expect("requests poisoned").is_empty(),
             "secrets.mode none must not touch the cluster"
+        );
+    }
+
+    #[tokio::test]
+    async fn group_stores_only_for_platform_mode() {
+        for mode in ["none", "external"] {
+            let mut spec = platform(mode, false);
+            spec.secrets.mode = if mode == "none" {
+                SecretsMode::None
+            } else {
+                SecretsMode::External
+            };
+            spec.secrets.groups = vec!["analytics".into()];
+            let (client, requests) = mock_client_with_init("probe-token", true);
+            assert!(ensure_group_stores(&context(client), &spec).await.is_none());
+            assert!(requests.lock().expect("requests poisoned").is_empty());
+        }
+    }
+
+    #[test]
+    fn a_group_store_can_read_only_its_own_path() {
+        let policy = crate::secrets::group_policy("analytics");
+        assert!(policy.contains("secret/data/connections/group/analytics/*"));
+        assert!(!policy.contains("finance"));
+        let store = crate::secrets::group_secret_store("stardelt", "analytics");
+        assert_eq!(store["metadata"]["name"], "openbao-analytics");
+        assert_eq!(
+            store["spec"]["provider"]["vault"]["auth"]["kubernetes"]["role"],
+            "eso-stardelt-analytics"
+        );
+        assert_eq!(
+            store["spec"]["provider"]["vault"]["auth"]["kubernetes"]["serviceAccountRef"]["name"],
+            "eso-analytics"
+        );
+        assert_eq!(
+            store["spec"]["provider"]["vault"]["server"],
+            "http://openbao.stardelt.svc.cluster.local:8200"
+        );
+        assert_eq!(store["spec"]["provider"]["vault"]["path"], "secret");
+        assert_eq!(store["spec"]["provider"]["vault"]["version"], "v2");
+    }
+
+    #[tokio::test]
+    async fn group_stores_write_the_policy_and_the_role() {
+        let (client, requests) = mock_client_with_init("probe-token", true);
+        let mut spec = platform("platform", false);
+        spec.secrets.mode = SecretsMode::Platform;
+        spec.secrets.groups = vec!["analytics".into(), "finance".into()];
+        let status = ensure_group_stores(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        assert!(
+            status
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("2 group store(s)")
+        );
+        let reqs = requests.lock().expect("requests poisoned").clone();
+        let mut index = 0usize;
+        let expect =
+            |reqs: &Vec<(String, String, String)>, index: &mut usize, method: &str, path: &str| {
+                let pos = reqs[*index..]
+                    .iter()
+                    .position(|(m, p, _)| m == method && p.contains(path))
+                    .unwrap_or_else(|| {
+                        panic!("missing {method} containing {path} after {index}: {reqs:?}")
+                    });
+                *index += pos + 1;
+            };
+        expect(&reqs, &mut index, "POST", "/proxy/v1/sys/auth/kubernetes");
+        expect(
+            &reqs,
+            &mut index,
+            "POST",
+            "/proxy/v1/auth/kubernetes/config",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "PUT",
+            "/proxy/v1/sys/policies/acl/eso-stardelt-analytics",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "POST",
+            "/proxy/v1/auth/kubernetes/role/eso-stardelt-analytics",
+        );
+        expect(&reqs, &mut index, "PATCH", "/serviceaccounts/eso-analytics");
+        expect(
+            &reqs,
+            &mut index,
+            "PATCH",
+            "/secretstores/openbao-analytics",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "PUT",
+            "/proxy/v1/sys/policies/acl/eso-stardelt-finance",
+        );
+        expect(
+            &reqs,
+            &mut index,
+            "POST",
+            "/proxy/v1/auth/kubernetes/role/eso-stardelt-finance",
+        );
+        expect(&reqs, &mut index, "PATCH", "/serviceaccounts/eso-finance");
+        expect(&reqs, &mut index, "PATCH", "/secretstores/openbao-finance");
+        for (method, path, body) in &reqs {
+            assert!(!path.contains("probe-token"), "{method} {path}");
+            assert!(!body.contains("probe-token"), "{method} {path} body");
+        }
+    }
+
+    #[tokio::test]
+    async fn group_stores_report_a_missing_init_secret() {
+        let (client, requests) = mock_client_with_init("probe-token", false);
+        let mut spec = platform("platform", false);
+        spec.secrets.mode = SecretsMode::Platform;
+        spec.secrets.groups = vec!["analytics".into()];
+        let status = ensure_group_stores(&context(client), &spec)
+            .await
+            .expect("a status");
+        assert!(!status.ready);
+        assert!(
+            status
+                .message
+                .as_deref()
+                .unwrap_or("")
+                .contains("openbao-init")
+        );
+        let reqs = requests.lock().expect("requests poisoned");
+        assert!(
+            reqs.iter()
+                .all(|(method, _, _)| method != "PUT" && method != "POST"),
+            "no store writes expected: {reqs:?}"
         );
     }
 }
