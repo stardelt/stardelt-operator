@@ -22,6 +22,7 @@ pub mod pg_dump;
 pub mod planner;
 pub mod prerequisites;
 pub mod principal;
+pub mod principal_keycloak;
 pub mod provision;
 pub mod secrets;
 pub mod spark;
