@@ -102,6 +102,16 @@ pub fn identity_values(component: &str) -> Value {
     }
 }
 
+/// Values that exist only with the streaming pillar (D42): the demo Airflow DAGs publish to the
+/// bus. Empty `kafka.bootstrap` in the golden file renders no `PEGELONLINE_KAFKA_BOOTSTRAP`, so a
+/// platform without the pillar never points a task at a Service that does not exist.
+pub fn streaming_values(component: &str) -> Value {
+    match component {
+        "airflow" => serde_json::json!({"kafka": {"bootstrap": "kafka-kafka-bootstrap:9092"}}),
+        _ => Value::Object(Map::new()),
+    }
+}
+
 /// Replace every `__BASE_DOMAIN__` in the strings of a values document. The identity overlays
 /// are checked-in files and cannot read `spec.baseDomain`; `identity_checklist.rs` uses the
 /// same placeholder for its commands.
@@ -1090,6 +1100,15 @@ mod tests {
                 "{component}"
             );
         }
+    }
+
+    #[test]
+    fn streaming_values_set_the_airflow_bus_address() {
+        assert_eq!(
+            streaming_values("airflow")["kafka"]["bootstrap"],
+            serde_json::json!("kafka-kafka-bootstrap:9092")
+        );
+        assert_eq!(streaming_values("lakekeeper"), serde_json::json!({}));
     }
 
     #[test]

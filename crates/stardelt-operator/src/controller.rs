@@ -156,6 +156,8 @@ struct OverridesContext<'a> {
     /// operator installs no Reloader (D-op-3), so this is what turns a `SqlWarehouse` class
     /// change into a coordinator roll. `None` when the ConfigMap does not exist yet.
     trino_warehouses: Option<&'a str>,
+    /// `spec.pillars.streaming`: the bus exists, so Airflow may be told where it is.
+    streaming: bool,
 }
 
 /// Outcome of applying (or planning) one component plan.
@@ -304,6 +306,13 @@ async fn resolve_component_values(
     // silently put Trino back on the anonymous development default.
     let values = if overrides.identity {
         deep_merge(values, identity_values(component))
+    } else {
+        values
+    };
+    // The bus exists only with the streaming pillar; the golden Airflow values leave the address
+    // empty so a batch-only platform renders no publish env (platform#595 parity).
+    let values = if overrides.streaming {
+        deep_merge(values, crate::values::streaming_values(component))
     } else {
         values
     };
@@ -932,6 +941,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         identity: identity_contract && trino_ready,
         base_domain: None,
         trino_warehouses: warehouses_stamp.as_deref(),
+        streaming: false,
     };
     let previous = lh
         .status
@@ -1092,6 +1102,7 @@ async fn reconcile_platform(
         identity: instance.spec.identity.mode != IdentityMode::None,
         base_domain: instance.spec.base_domain.as_deref(),
         trino_warehouses: None,
+        streaming: instance.spec.pillars.streaming,
     };
     let previous = instance
         .status
@@ -1281,6 +1292,7 @@ mod tests {
             identity: false,
             base_domain: Some("data.example.com"),
             trino_warehouses: None,
+            streaming: false,
         }
     }
 
@@ -2616,6 +2628,47 @@ mod tests {
             json!("old"),
             "an unchanged Ready keeps its transition time"
         );
+    }
+
+    #[tokio::test]
+    async fn the_airflow_values_name_the_bus_only_with_the_streaming_pillar() {
+        let (client, _requests) = mock_client("[]", "[]");
+        let ctx = Context {
+            client,
+            helm: helm_stub(),
+        };
+        let values = ComponentValues::default();
+
+        let mut on = overrides_context(&values);
+        on.streaming = true;
+        let on_values = resolve_component_values(&ctx, &on, "airflow")
+            .await
+            .expect("values");
+
+        let off = overrides_context(&values);
+        let off_values = resolve_component_values(&ctx, &off, "airflow")
+            .await
+            .expect("values");
+
+        assert_eq!(
+            on_values["kafka"]["bootstrap"],
+            serde_json::json!("kafka-kafka-bootstrap:9092")
+        );
+        assert_eq!(off_values["kafka"]["bootstrap"], serde_json::json!(""));
+        let extra_env = on_values["extraEnv"].as_str().expect("extraEnv");
+        assert!(extra_env.contains("{{- if .Values.kafka.bootstrap }}"));
+        assert!(extra_env.contains("PEGELONLINE_KAFKA_BOOTSTRAP"));
+        assert_eq!(
+            on_values["extraEnv"], off_values["extraEnv"],
+            "the template is the same; kafka.bootstrap drives whether Helm renders the var"
+        );
+        let lakekeeper = resolve_component_values(&ctx, &on, "lakekeeper")
+            .await
+            .expect("values");
+        let lakekeeper_off = resolve_component_values(&ctx, &off, "lakekeeper")
+            .await
+            .expect("values");
+        assert_eq!(lakekeeper, lakekeeper_off);
     }
 
     #[tokio::test]
