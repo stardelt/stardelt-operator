@@ -93,7 +93,11 @@ pub fn spark_application(
     );
     let s3_secret = crate::prerequisites::S3_SECRET;
     let mut spark_conf = json!({
-        "spark.jars.packages": "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8",
+        // The image carries both jars already (`iceberg-spark-runtime.jar` and the Kafka
+        // connector, platform#601). `spark.jars.packages` would resolve them from Maven
+        // Central at submit time — against the "pinned artifacts, not Maven at pod start"
+        // rule — and the published coordinates are Scala 2.12/3.5, while the image is
+        // Spark 4.1.3/Scala 2.13, so the fetched jars could not link.
         "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         "spark.hadoop.fs.s3a.endpoint": "http://seaweedfs-s3:8333",
         "spark.hadoop.fs.s3a.path.style.access": "true",
@@ -583,19 +587,21 @@ mod tests {
     }
 
     #[test]
-    fn the_application_targets_spark_4_1_3_without_the_bundled_iceberg_runtime() {
+    fn the_application_uses_the_jars_baked_in_the_image() {
         let s = spec(SinkMode::Merge, vec!["id"]);
         let a =
             spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
         assert_eq!(a.data["spec"]["sparkVersion"], "4.1.3");
-        let packages = a.data["spec"]["sparkConf"]["spark.jars.packages"]
-            .as_str()
-            .expect("packages");
+        // The image carries the Iceberg runtime and the Kafka connector (platform#601).
+        // Resolving either through `spark.jars.packages` would download Scala 2.12 / Spark
+        // 3.5 coordinates into a Scala 2.13 / Spark 4.1.3 runtime at submit time.
         assert!(
-            !packages.contains("iceberg-spark-runtime-3.5"),
-            "must not request the 2.12/3.5 Iceberg runtime: {packages}"
+            a.data["spec"]["sparkConf"]
+                .get("spark.jars.packages")
+                .is_none(),
+            "the StreamApp driver must not fetch jars: {:?}",
+            a.data["spec"]["sparkConf"]
         );
-        assert!(packages.contains("spark-sql-kafka-0-10"), "{packages}");
         assert_eq!(
             a.data["spec"]["sparkConf"]["spark.sql.extensions"],
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
