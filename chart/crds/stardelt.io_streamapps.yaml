@@ -89,9 +89,12 @@ spec:
               source:
                 properties:
                   connectionRef:
-                    description: 'Name of the `Connection` (`type: kafka`) whose `config.bootstrapServers` the job reads.'
+                    description: |-
+                      Name of the `Connection` (`type: kafka`) whose `config.bootstrapServers` the job reads.
+                      Absent: the platform's own bus, `kafka-kafka-bootstrap.<namespace>.svc.cluster.local:9092`.
                     maxLength: 63
                     minLength: 1
+                    nullable: true
                     pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                     type: string
                   format:
@@ -105,7 +108,6 @@ spec:
                     pattern: ^[A-Za-z0-9._-]+$
                     type: string
                 required:
-                - connectionRef
                 - topic
                 type: object
               stopped:

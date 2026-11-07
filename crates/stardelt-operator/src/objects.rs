@@ -118,6 +118,14 @@ pub fn kafka_node_pool_resource() -> ApiResource {
     )
 }
 
+/// A Strimzi topic (`kafkatopics.kafka.strimzi.io/v1`).
+pub fn kafka_topic_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("kafka.strimzi.io", "v1", "KafkaTopic"),
+        "kafkatopics",
+    )
+}
+
 /// The Kubeflow Spark Operator application (`sparkapplications.sparkoperator.k8s.io/v1beta2`).
 pub fn spark_application_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
@@ -176,6 +184,7 @@ mod tests {
         for (r, plural) in [
             (kafka_resource(), "kafkas"),
             (kafka_node_pool_resource(), "kafkanodepools"),
+            (kafka_topic_resource(), "kafkatopics"),
         ] {
             assert_eq!(
                 (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
