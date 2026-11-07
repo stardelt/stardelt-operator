@@ -33,7 +33,7 @@ pub fn node_pool(namespace: &str, profile: Profile) -> DynamicObject {
     };
     DynamicObject {
         types: Some(TypeMeta {
-            api_version: "kafka.strimzi.io/v1beta2".into(),
+            api_version: "kafka.strimzi.io/v1".into(),
             kind: "KafkaNodePool".into(),
         }),
         metadata: meta(namespace),
@@ -60,7 +60,7 @@ pub fn broker(namespace: &str) -> DynamicObject {
     )]));
     DynamicObject {
         types: Some(TypeMeta {
-            api_version: "kafka.strimzi.io/v1beta2".into(),
+            api_version: "kafka.strimzi.io/v1".into(),
             kind: "Kafka".into(),
         }),
         metadata,
@@ -85,6 +85,20 @@ pub fn broker(namespace: &str) -> DynamicObject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kafka_objects_use_the_served_api_version() {
+        // Strimzi 1.3.1 (planner.rs chart_version) serves only kafka.strimzi.io/v1; v1beta2 is a
+        // 404 that ensure_kafka_broker reads as "waiting for Strimzi" forever.
+        assert_eq!(
+            node_pool("data", Profile::Demo).types.unwrap().api_version,
+            "kafka.strimzi.io/v1"
+        );
+        assert_eq!(
+            broker("data").types.unwrap().api_version,
+            "kafka.strimzi.io/v1"
+        );
+    }
 
     #[test]
     fn node_pool_is_one_combined_pool() {

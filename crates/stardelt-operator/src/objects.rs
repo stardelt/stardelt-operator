@@ -102,18 +102,18 @@ pub fn cnpg_cluster_resource() -> ApiResource {
     )
 }
 
-/// The Strimzi broker (`kafkas.kafka.strimzi.io/v1beta2`).
+/// The Strimzi broker (`kafkas.kafka.strimzi.io/v1`).
 pub fn kafka_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
-        &GroupVersionKind::gvk("kafka.strimzi.io", "v1beta2", "Kafka"),
+        &GroupVersionKind::gvk("kafka.strimzi.io", "v1", "Kafka"),
         "kafkas",
     )
 }
 
-/// A Strimzi node pool (`kafkanodepools.kafka.strimzi.io/v1beta2`). Strimzi 1.x requires one.
+/// A Strimzi node pool (`kafkanodepools.kafka.strimzi.io/v1`). Strimzi 1.x requires one.
 pub fn kafka_node_pool_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
-        &GroupVersionKind::gvk("kafka.strimzi.io", "v1beta2", "KafkaNodePool"),
+        &GroupVersionKind::gvk("kafka.strimzi.io", "v1", "KafkaNodePool"),
         "kafkanodepools",
     )
 }
@@ -179,7 +179,7 @@ mod tests {
         ] {
             assert_eq!(
                 (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
-                ("kafka.strimzi.io", "v1beta2", plural)
+                ("kafka.strimzi.io", "v1", plural)
             );
         }
     }
