@@ -60,6 +60,15 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
             chart: Some("superset/superset"),
         });
     }
+    // The streaming bus (D42): Strimzi is the operator, not the broker. A `Kafka` resource
+    // is applied separately once the pillar is on, so a cluster that does not stream pays
+    // for nothing but the controller it asked for.
+    if spec.pillars.streaming {
+        plan.push(ComponentPlan {
+            name: "kafka",
+            chart: Some("strimzi/strimzi-kafka-operator"),
+        });
+    }
     plan
 }
 
@@ -184,6 +193,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "openfga/openfga" => Some("0.2.62"),
         "external-secrets/external-secrets" => Some("2.13.0"),
         "openbao/openbao" => Some("0.30.4"),
+        "strimzi/strimzi-kafka-operator" => Some("1.3.1"),
         _ => None,
     }
 }
@@ -202,6 +212,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "openfga/openfga" => Some("https://openfga.github.io/helm-charts"),
         "external-secrets/external-secrets" => Some("https://charts.external-secrets.io"),
         "openbao/openbao" => Some("https://openbao.github.io/openbao-helm"),
+        "strimzi/strimzi-kafka-operator" => Some("https://strimzi.io/charts/"),
         _ => None,
     }
 }
@@ -514,6 +525,44 @@ mod tests {
     }
 
     #[test]
+    fn streaming_pillar_plans_the_kafka_operator() {
+        let with = PlatformInstanceSpec {
+            profile: Default::default(),
+            pillars: Pillars {
+                streaming: true,
+                ..Default::default()
+            },
+            dry_run: true,
+            component_values: Default::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: Default::default(),
+            secrets: Default::default(),
+            ingress: Default::default(),
+        };
+        let plan = plan_platform(&with);
+        let kafka = plan
+            .iter()
+            .find(|c| c.name == "kafka")
+            .expect("streaming plans kafka");
+        assert_eq!(kafka.chart, Some("strimzi/strimzi-kafka-operator"));
+
+        let without = PlatformInstanceSpec {
+            pillars: Pillars {
+                streaming: false,
+                ..Default::default()
+            },
+            ..with
+        };
+        assert!(!names(&plan_platform(&without)).contains(&"kafka"));
+
+        assert_eq!(
+            chart_version("strimzi/strimzi-kafka-operator"),
+            Some("1.3.1")
+        );
+    }
+
+    #[test]
     fn platform_plan_owns_the_cluster_scoped_cnpg_operator() {
         let pi = PlatformInstanceSpec {
             profile: Default::default(),
@@ -556,6 +605,7 @@ mod tests {
             pillars: Pillars {
                 notebooks: true,
                 pipelines: true,
+                streaming: true,
                 ..Default::default()
             },
             dry_run: true,
