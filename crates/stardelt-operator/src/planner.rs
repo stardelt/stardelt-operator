@@ -568,11 +568,11 @@ mod tests {
             chart_version("strimzi/strimzi-kafka-operator"),
             Some("1.3.1")
         );
+        assert_eq!(names(&plan), vec!["cnpg", "kafka", "spark-operator"]);
         assert_eq!(
-            names(&plan),
-            vec!["cnpg", "kafka", "spark-operator"]
+            chart_version("spark-operator/spark-operator"),
+            Some("2.5.2")
         );
-        assert_eq!(chart_version("spark-operator/spark-operator"), Some("2.5.2"));
         assert_eq!(
             chart_repo("spark-operator/spark-operator"),
             Some("https://kubeflow.github.io/spark-operator")
