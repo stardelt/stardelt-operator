@@ -17,6 +17,7 @@ import os
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.types import StringType, StructField, StructType
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,7 +85,37 @@ def main() -> None:
         .option("startingOffsets", "earliest")
         .load()
     )
-    rows = raw.select(F.from_json(F.col("value").cast("string"), sink_schema).alias("r")).select("r.*")
+    # Spark's JSON parser returns null for the ISO-8601 timestamps the PEGELONLINE DAG
+    # writes (`2026-11-07T12:45:00Z`), and the sink columns are NOT NULL. Read those
+    # fields as strings, then parse them with the session parser (which also accepts the
+    # fractional seconds in `ingested_at`).
+    def json_schema(schema: StructType) -> StructType:
+        return StructType(
+            [
+                StructField(
+                    f.name,
+                    StringType()
+                    if type(f.dataType).__name__ in ("TimestampType", "TimestampNTZType")
+                    else f.dataType,
+                    f.nullable,
+                )
+                for f in schema.fields
+            ]
+        )
+
+    parsed = raw.select(
+        F.from_json(F.col("value").cast("string"), json_schema(sink_schema)).alias("r")
+    ).select("r.*")
+    rows = parsed.select(
+        *[
+            F.to_timestamp(
+                F.regexp_replace(F.regexp_replace(F.col(f.name), "T", " "), "Z$", "")
+            ).alias(f.name)
+            if type(f.dataType).__name__ in ("TimestampType", "TimestampNTZType")
+            else F.col(f.name)
+            for f in sink_schema.fields
+        ]
+    )
 
     if a.mode == "append":
         rows.writeStream.format("iceberg").outputMode("append").option(
