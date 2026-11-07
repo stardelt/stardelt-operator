@@ -1,6 +1,13 @@
 # The Kubeflow Spark Operator (D42): reconciles `SparkApplication` objects in the namespace it
 # watches. One controller replica is enough on the dev node; the webhook is off because nothing
 # here mutates pods and the certificate it would need is one more moving part.
+#
+# The chart's default is `jobNamespaces: [default]`, so a controller that only sets the release
+# namespace never looks at the `StreamApp`s beside it (platform#608, operator path). The empty
+# string means every namespace: the install namespace is not known when this file is compiled in.
+spark:
+  jobNamespaces:
+    - ""
 controller:
   replicas: 1
   resources:
