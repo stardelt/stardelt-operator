@@ -29,3 +29,4 @@ http = "1"
 # Already in the dependency tree (kube pulls both in); used to build a mock kube
 # client for the controller tests, so no test needs a cluster.
 tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

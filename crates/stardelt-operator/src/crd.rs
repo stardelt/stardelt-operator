@@ -1798,6 +1798,10 @@ pub struct StreamAppSpec {
     pub run_as: Option<String>,
     #[serde(default, rename = "restartPolicy")]
     pub restart_policy: StreamRestartPolicy,
+    /// `true` stops the job and deletes its SparkApplication; the checkpoint is kept, so
+    /// `stopped: false` resumes from it. The one verb Nova's page needs (D42).
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]

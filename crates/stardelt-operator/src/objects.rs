@@ -118,6 +118,14 @@ pub fn kafka_node_pool_resource() -> ApiResource {
     )
 }
 
+/// The Kubeflow Spark Operator application (`sparkapplications.sparkoperator.k8s.io/v1beta2`).
+pub fn spark_application_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("sparkoperator.k8s.io", "v1beta2", "SparkApplication"),
+        "sparkapplications",
+    )
+}
+
 /// The CloudNative-PG ScheduledBackup resource (`scheduledbackups.postgresql.cnpg.io/v1`).
 pub fn cnpg_scheduled_backup_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
