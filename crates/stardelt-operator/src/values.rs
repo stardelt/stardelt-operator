@@ -79,6 +79,8 @@ pub fn golden_values(component: &str) -> Value {
         // in Secret openbao-seal-key, audit to stdout.
         "openbao" => serde_yaml::from_str(include_str!("../values/openbao.yaml"))
             .expect("values/openbao.yaml is not valid YAML"),
+        "kafka" => serde_yaml::from_str(include_str!("../values/kafka.yaml"))
+            .expect("values/kafka.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }

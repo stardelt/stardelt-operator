@@ -1,0 +1,13 @@
+# The Strimzi cluster operator. It runs one controller pod that watches this namespace; the
+# Kafka broker is a `Kafka` resource (created when a stream needs one), not part of the chart.
+# The chart's defaults ask for 200m/384Mi; the dev node is shared, so the request is halved and
+# the memory limit kept — the operator idles.
+replicas: 1
+watchAnyNamespace: false
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 384Mi
