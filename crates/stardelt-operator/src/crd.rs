@@ -1751,6 +1751,245 @@ pub struct ServicePrincipalStatus {
     pub observed_generation: Option<i64>,
 }
 
+/// One long-running stream: a Kafka topic in, an Iceberg table out (decision D42).
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "StreamApp",
+    namespaced,
+    status = "StreamAppStatus",
+    shortname = "sapp",
+    doc = "A streaming app: a Kafka topic in, an Iceberg table out."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "self.source.topic.size() > 0 && self.source.topic.matches('^[A-Za-z0-9._-]{1,249}$')",
+        "message": "a stream needs a topic of 1 to 249 characters: letters, digits, dot, underscore or dash"
+    },
+    {
+        "rule": "self.sink.table.matches('^[a-z0-9_]+\\\\.[a-z0-9_]+$')",
+        "message": "sink.table is schema.table, lower-case letters, digits and underscores"
+    },
+    {
+        "rule": "self.sink.mode == 'merge' ? self.sink.mergeKeys.size() > 0 : !has(self.sink.mergeKeys) || self.sink.mergeKeys.size() == 0",
+        "message": "sink.mode merge needs mergeKeys; append forbids them"
+    }
+]))]
+pub struct StreamAppSpec {
+    pub source: StreamSource,
+    pub sink: StreamSink,
+    #[serde(default)]
+    pub engine: StreamEngine,
+    /// The group whose members may see and stop the stream; absent means administrators only.
+    #[serde(
+        default,
+        rename = "ownerGroup",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub owner_group: Option<String>,
+    /// The `ServicePrincipal` the job runs as (convention: `pipeline-<ownerGroup>`).
+    #[serde(default, rename = "runAs", skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 40), regex(pattern = r"^[a-z0-9][a-z0-9-]*$"))]
+    pub run_as: Option<String>,
+    #[serde(default, rename = "restartPolicy")]
+    pub restart_policy: StreamRestartPolicy,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamEngine {
+    /// Spark Structured Streaming through a `SparkApplication` (D42: the first engine).
+    #[default]
+    Spark,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamFormat {
+    #[default]
+    Json,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSource {
+    /// Name of the `Connection` (`type: kafka`) whose `config.bootstrapServers` the job reads.
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    )]
+    pub connection_ref: String,
+    #[schemars(length(min = 1, max = 249), regex(pattern = r"^[A-Za-z0-9._-]+$"))]
+    pub topic: String,
+    #[serde(default)]
+    pub format: StreamFormat,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SinkMode {
+    /// `foreachBatch` + `MERGE` on `mergeKeys`: the stream owns the key.
+    #[default]
+    Merge,
+    /// Append-only: at-least-once.
+    Append,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamSink {
+    /// Catalog the sink table lives in; it must let `runAs` write.
+    #[schemars(length(min = 1, max = 63), regex(pattern = r"^[a-z0-9][a-z0-9-]*$"))]
+    pub catalog: String,
+    /// `schema.table`.
+    #[schemars(
+        length(min = 3, max = 128),
+        regex(pattern = r"^[a-z0-9_]+\.[a-z0-9_]+$")
+    )]
+    pub table: String,
+    #[serde(default)]
+    pub mode: SinkMode,
+    /// Columns of `MERGE … ON`; 1 to 8, each one an existing column.
+    #[serde(default, rename = "mergeKeys", skip_serializing_if = "Vec::is_empty")]
+    #[schemars(
+        length(min = 0, max = 8),
+        inner(length(min = 1, max = 63), regex(pattern = r"^[a-z0-9_]+$"))
+    )]
+    pub merge_keys: Vec<String>,
+    /// S3 prefix for the checkpoint; absent means `checkpoints/<namespace>/<name>`.
+    #[serde(
+        default,
+        rename = "checkpointPrefix",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(
+        length(min = 1, max = 512),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_./-]*$")
+    )]
+    pub checkpoint_prefix: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum StreamRestartPolicy {
+    #[default]
+    Always,
+    OnFailure,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct StreamAppStatus {
+    /// `Pending`, `Running`, `Failed` or `Stopped`.
+    #[serde(default)]
+    pub phase: String,
+    #[serde(
+        default,
+        rename = "lastCheckpointAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_checkpoint_at: Option<String>,
+    #[serde(default, rename = "lastError", skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
+impl StreamAppSpec {
+    /// The rules the schema enforces, repeated for the controller and the tests, plus the name.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !name_ok {
+            return Err(format!(
+                "stream name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
+            ));
+        }
+        let topic_ok = !self.source.topic.is_empty()
+            && self.source.topic.len() <= 249
+            && self
+                .source
+                .topic
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !topic_ok {
+            return Err("source.topic must be 1 to 249 characters: letters, digits, dot, underscore or dash".to_string());
+        }
+        if !catalog_ok(&self.sink.catalog) {
+            return Err("sink.catalog must be a lower-case catalog name".to_string());
+        }
+        let mut parts = self.sink.table.split('.');
+        let (schema, table) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+        if parts.next().is_some() || !data_identifier_ok(schema) || !data_identifier_ok(table) {
+            return Err(
+                "sink.table must be schema.table, lower-case letters, digits and underscores"
+                    .to_string(),
+            );
+        }
+        match self.sink.mode {
+            SinkMode::Merge if self.sink.merge_keys.is_empty() => {
+                return Err("sink.mode merge needs at least one merge key".to_string());
+            }
+            SinkMode::Append if !self.sink.merge_keys.is_empty() => {
+                return Err("sink.mode append must not set mergeKeys".to_string());
+            }
+            _ => {}
+        }
+        if self.sink.merge_keys.len() > 8 {
+            return Err("at most 8 merge keys".to_string());
+        }
+        for key in &self.sink.merge_keys {
+            if !data_identifier_ok(key) {
+                return Err(format!("merge key `{key}` must be a column name"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A lower-case column or schema identifier: a letter, then letters, digits, underscores or
+/// dashes; at most 63 characters.
+fn data_identifier_ok(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+/// A catalog name: a lower-case letter or digit, then letters, digits or dashes; no underscore
+/// (Lakekeeper and the `Catalog` resource spell it that way).
+fn catalog_ok(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && (bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
 /// What a grant lets a group do with a catalog (decision D21, internal note
 /// `design/multitenant-catalogs.md` §5.2). Six verbs exist; `use` belongs to compute (`SqlWarehouse`)
 /// and is not a data verb. There is no deny, no `ALL PRIVILEGES` and no per-column verb.
@@ -3807,5 +4046,102 @@ mod tests {
         let yaml = serde_yaml::to_string(&crd).unwrap();
         assert!(yaml.contains("each group may appear once in grants"));
         assert!(yaml.contains("weighted_fair"));
+    }
+
+    #[test]
+    fn stream_app_defaults_are_spark_merge_json() {
+        let spec: StreamAppSpec = serde_json::from_value(serde_json::json!({
+            "source": { "connectionRef": "kafka", "topic": "pegelonline.measurements" },
+            "sink": {
+                "catalog": "shared",
+                "table": "gold.pegelonline_hourly",
+                "mergeKeys": ["station_uuid", "measured_at"]
+            }
+        }))
+        .expect("minimal stream deserialises");
+        assert!(matches!(spec.engine, StreamEngine::Spark));
+        assert!(matches!(spec.sink.mode, SinkMode::Merge));
+        assert!(matches!(spec.source.format, StreamFormat::Json));
+        assert!(matches!(spec.restart_policy, StreamRestartPolicy::Always));
+    }
+
+    fn minimal_stream_spec(
+        topic: &str,
+        table: &str,
+        mode: SinkMode,
+        merge_keys: Vec<&str>,
+    ) -> StreamAppSpec {
+        serde_json::from_value(serde_json::json!({
+            "source": { "connectionRef": "kafka", "topic": topic },
+            "sink": {
+                "catalog": "shared",
+                "table": table,
+                "mode": mode,
+                "mergeKeys": merge_keys
+            }
+        }))
+        .expect("stream spec parses")
+    }
+
+    #[test]
+    fn stream_app_validation_rejects_a_bad_topic() {
+        let spec = minimal_stream_spec(
+            "a/b",
+            "gold.pegelonline_hourly",
+            SinkMode::Merge,
+            vec!["station_uuid"],
+        );
+        assert!(spec.validate("pegel").is_err());
+    }
+
+    #[test]
+    fn stream_app_merge_without_keys_is_refused() {
+        let spec = minimal_stream_spec(
+            "pegelonline.measurements",
+            "gold.pegelonline_hourly",
+            SinkMode::Merge,
+            vec![],
+        );
+        assert!(spec.validate("pegel").is_err());
+    }
+
+    #[test]
+    fn stream_app_append_with_keys_is_refused() {
+        let spec = minimal_stream_spec(
+            "pegelonline.measurements",
+            "gold.pegelonline_hourly",
+            SinkMode::Append,
+            vec!["station_uuid"],
+        );
+        assert!(spec.validate("pegel").is_err());
+    }
+
+    #[test]
+    fn stream_app_rejects_a_table_without_a_schema() {
+        let spec = minimal_stream_spec(
+            "pegelonline.measurements",
+            "orders",
+            SinkMode::Merge,
+            vec!["id"],
+        );
+        assert!(spec.validate("pegel").is_err());
+    }
+
+    #[test]
+    fn stream_app_round_trips_camel_case() {
+        let spec = minimal_stream_spec(
+            "pegelonline.measurements",
+            "gold.pegelonline_hourly",
+            SinkMode::Merge,
+            vec!["station_uuid"],
+        );
+        let json = serde_json::to_value(&spec).expect("serialises");
+        assert!(json.get("source").unwrap().get("connectionRef").is_some());
+        assert!(json.get("sink").unwrap().get("mergeKeys").is_some());
+        assert!(json.get("restartPolicy").is_some());
+        // checkpointPrefix and ownerGroup/runAs are absent (skipped when None/empty)
+        assert!(json.get("sink").unwrap().get("checkpointPrefix").is_none());
+        assert!(json.get("ownerGroup").is_none());
+        assert!(json.get("runAs").is_none());
     }
 }
