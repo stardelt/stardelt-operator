@@ -71,7 +71,25 @@ fn resolve_run_as(spec: &StreamAppSpec) -> Result<String, String> {
     Err("runAs is required (or set ownerGroup to derive pipeline-<group>)".to_string())
 }
 
-pub fn kafka_topic(_app: &str, topic: &str, owner: &OwnerReference) -> DynamicObject {
+/// A Kubernetes object name for the `KafkaTopic`. The topic itself may contain
+/// characters a DNS-1123 subdomain does not allow (`_`, upper case) or may be
+/// owned by another `KafkaTopic`, so the topic name lives in `spec.topicName`.
+fn topic_resource_name(app: &str, topic: &str) -> String {
+    let legal = !topic.is_empty()
+        && topic.len() <= 63
+        && topic
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+        && topic.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && topic.ends_with(|c: char| c.is_ascii_alphanumeric());
+    if legal {
+        topic.to_string()
+    } else {
+        format!("stream-{app}")
+    }
+}
+
+pub fn kafka_topic(app: &str, topic: &str, owner: &OwnerReference) -> DynamicObject {
     let mut topic_labels = labels();
     topic_labels.insert("strimzi.io/cluster".to_string(), "kafka".to_string());
     DynamicObject {
@@ -80,13 +98,14 @@ pub fn kafka_topic(_app: &str, topic: &str, owner: &OwnerReference) -> DynamicOb
             kind: "KafkaTopic".into(),
         }),
         metadata: ObjectMeta {
-            name: Some(topic.to_string()),
+            name: Some(topic_resource_name(app, topic)),
             labels: Some(topic_labels),
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
         data: json!({
             "spec": {
+                "topicName": topic,
                 "partitions": 1,
                 "replicas": 1,
                 "config": {
@@ -95,6 +114,19 @@ pub fn kafka_topic(_app: &str, topic: &str, owner: &OwnerReference) -> DynamicOb
             }
         }),
     }
+}
+
+/// The name of an existing `KafkaTopic` that already manages `topic`, if any.
+/// The topic name is `spec.topicName` when set (Strimzi), otherwise the object name.
+pub fn topic_owner(existing: &[DynamicObject], topic: &str) -> Option<String> {
+    existing.iter().find_map(|t| {
+        let effective = t
+            .data
+            .pointer("/spec/topicName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| t.metadata.name.as_deref().unwrap_or(""));
+        (effective == topic).then(|| t.name_any())
+    })
 }
 
 pub fn spark_application(
@@ -358,14 +390,31 @@ pub async fn reconcile_stream_app(
     let checkpoint = checkpoint_for(&app.spec, &namespace, &name);
     if create_topic {
         let topic = kafka_topic(&name, &app.spec.source.topic, &owner);
-        objects::apply_dynamic(
-            &ctx.client,
+        let topics: Api<DynamicObject> = Api::namespaced_with(
+            ctx.client.clone(),
             &namespace,
             &objects::kafka_topic_resource(),
-            &topic,
-            false,
-        )
-        .await?;
+        );
+        let existing = topics.list(&Default::default()).await?.items;
+        let own = topic.name_any();
+        match topic_owner(&existing, &app.spec.source.topic) {
+            Some(other) if other != own => {
+                tracing::warn!(
+                    stream = %name, %namespace, topic = %app.spec.source.topic, owner = %other,
+                    "topic is already managed by another KafkaTopic; not applying ours"
+                );
+            }
+            _ => {
+                objects::apply_dynamic(
+                    &ctx.client,
+                    &namespace,
+                    &objects::kafka_topic_resource(),
+                    &topic,
+                    false,
+                )
+                .await?;
+            }
+        }
     }
     let cm = job_config_map(&namespace, &name, &owner);
     objects::apply(&ctx.client, &namespace, &cm, false).await?;
@@ -581,6 +630,11 @@ mod tests {
         );
         assert_eq!(topic.types.as_ref().unwrap().kind, "KafkaTopic");
         assert_eq!(
+            topic.metadata.name.as_deref(),
+            Some("pegelonline.measurements")
+        );
+        assert_eq!(topic.data["spec"]["topicName"], "pegelonline.measurements");
+        assert_eq!(
             topic
                 .metadata
                 .labels
@@ -589,6 +643,27 @@ mod tests {
             Some(&"kafka".to_string())
         );
         assert_eq!(topic.data["spec"]["replicas"], 1);
+    }
+
+    #[test]
+    fn an_illegal_topic_name_moves_to_spec_topic_name() {
+        let topic = kafka_topic("orders", "orders_v1", &owner());
+        assert_eq!(topic.metadata.name.as_deref(), Some("stream-orders"));
+        assert_eq!(topic.data["spec"]["topicName"], "orders_v1");
+    }
+
+    #[test]
+    fn an_existing_owner_of_the_topic_is_found() {
+        // Ticket #325 specified "orders.v1" here, but '.' is legal per the ticket's
+        // own topic_resource_name so the resource would be named "orders.v1" (not
+        // "stream-producer"). Use an illegal topic name (underscore) to exercise the
+        // case where the KafkaTopic resource name differs from spec.topicName.
+        let other = kafka_topic("producer", "orders_v1", &owner());
+        assert_eq!(
+            topic_owner(&[other], "orders_v1").as_deref(),
+            Some("stream-producer")
+        );
+        assert_eq!(topic_owner(&[], "orders_v1"), None);
     }
 
     #[test]
