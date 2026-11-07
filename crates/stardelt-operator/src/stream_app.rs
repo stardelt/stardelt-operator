@@ -172,7 +172,7 @@ pub fn spark_application(
                     "--merge-keys", merge_keys,
                     "--checkpoint", checkpoint,
                 ],
-                "restartPolicy": {"type": restart},
+                "restartPolicy": restart_policy(restart),
                 "sparkConf": spark_conf,
                 "driver": {
                     "cores": 1,
@@ -214,6 +214,18 @@ fn owner_reference(app: &StreamApp) -> OwnerReference {
 
 fn now_rfc3339() -> String {
     k8s_openapi::jiff::Timestamp::now().to_string()
+}
+
+/// The v2 controller refuses to retry when the interval fields are absent (`invalid retry
+/// interval`), even when `type` is set, so both failure paths carry explicit values.
+fn restart_policy(restart: &str) -> serde_json::Value {
+    json!({
+        "type": restart,
+        "onFailureRetries": 3,
+        "onFailureRetryInterval": 10,
+        "onSubmissionFailureRetries": 3,
+        "onSubmissionFailureRetryInterval": 10,
+    })
 }
 
 fn ready_condition(
@@ -540,6 +552,19 @@ mod tests {
             Some(&"kafka".to_string())
         );
         assert_eq!(topic.data["spec"]["replicas"], 1);
+    }
+
+    #[test]
+    fn restart_policy_carries_the_v2_retry_fields() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a =
+            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let rp = &a.data["spec"]["restartPolicy"];
+        assert_eq!(rp["type"], "Always");
+        assert_eq!(rp["onFailureRetries"], 3);
+        assert_eq!(rp["onFailureRetryInterval"], 10);
+        assert_eq!(rp["onSubmissionFailureRetries"], 3);
+        assert_eq!(rp["onSubmissionFailureRetryInterval"], 10);
     }
 
     #[test]

@@ -273,6 +273,14 @@ mod tests {
     }
 
     #[test]
+    fn the_spark_operator_webhook_is_on() {
+        // The mutating webhook copies a SparkApplication's volumes and volume mounts into the
+        // driver/executor pods; without it a StreamApp's job file is never mounted (operator#314).
+        let s = golden_values("spark-operator");
+        assert_eq!(s["webhook"]["enable"], serde_json::json!(true));
+    }
+
+    #[test]
     fn openfga_golden_values_mirror_the_platform_shape() {
         let o = golden_values("openfga");
         assert_eq!(
