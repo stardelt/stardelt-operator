@@ -13,7 +13,9 @@ use kube::{Api, ResourceExt};
 use serde_json::json;
 
 use crate::controller::Context;
-use crate::crd::{Condition, Connection, SinkMode, StreamApp, StreamAppSpec, StreamAppStatus, StreamRestartPolicy};
+use crate::crd::{
+    Condition, Connection, SinkMode, StreamApp, StreamAppSpec, StreamAppStatus, StreamRestartPolicy,
+};
 use crate::objects::{self, FIELD_MANAGER};
 use crate::spark;
 
@@ -256,8 +258,15 @@ pub async fn reconcile_stream_app(
     let checkpoint = checkpoint_for(&app.spec, &namespace, &name);
     let cm = job_config_map(&namespace, &name, &owner);
     objects::apply(&ctx.client, &namespace, &cm, false).await?;
-    let spark = spark_application(&namespace, &name, &app.spec, &bootstrap, &checkpoint, &owner)
-        .map_err(|e| kube::Error::Service(Box::new(std::io::Error::other(e))))?;
+    let spark = spark_application(
+        &namespace,
+        &name,
+        &app.spec,
+        &bootstrap,
+        &checkpoint,
+        &owner,
+    )
+    .map_err(|e| kube::Error::Service(Box::new(std::io::Error::other(e))))?;
     objects::apply_dynamic(
         &ctx.client,
         &namespace,
@@ -309,11 +318,7 @@ pub async fn reconcile_stream_app(
     Ok(Action::requeue(Duration::from_secs(60)))
 }
 
-pub(crate) fn error_policy(
-    obj: Arc<StreamApp>,
-    err: &kube::Error,
-    ctx: Arc<Context>,
-) -> Action {
+pub(crate) fn error_policy(obj: Arc<StreamApp>, err: &kube::Error, ctx: Arc<Context>) -> Action {
     crate::controller::error_policy(obj, err, ctx)
 }
 
@@ -473,7 +478,10 @@ mod tests {
                 generation: Some(1),
                 ..Default::default()
             },
-            spec: StreamAppSpec { stopped, ..spec(SinkMode::Merge, vec!["id"]) },
+            spec: StreamAppSpec {
+                stopped,
+                ..spec(SinkMode::Merge, vec!["id"])
+            },
             status: None,
         }
     }
@@ -592,6 +600,9 @@ mod tests {
         assert_eq!(action, Action::requeue(Duration::from_secs(60)));
         let log = requests.lock().expect("requests").join("\n");
         assert!(log.contains("\"phase\":\"Failed\""), "{log}");
-        assert!(log.contains("\"lastError\":\"boom\"") || log.contains("boom"), "{log}");
+        assert!(
+            log.contains("\"lastError\":\"boom\"") || log.contains("boom"),
+            "{log}"
+        );
     }
 }
