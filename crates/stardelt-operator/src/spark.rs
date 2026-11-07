@@ -26,6 +26,12 @@ use kube::api::ObjectMeta;
 pub const NAME: &str = "spark-connect";
 pub const CONFIG_MAP: &str = "spark-connect-config";
 
+/// The digest-pinned Spark image every pod in this repo runs (the Connect server and a
+/// `StreamApp`'s driver/executors share it, D42).
+pub fn image() -> String {
+    golden().image
+}
+
 /// The image and the `spark-defaults.conf` body live in one file, like the golden values of the
 /// Helm components do (`values.rs`).
 #[derive(serde::Deserialize)]
