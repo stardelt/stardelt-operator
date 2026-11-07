@@ -11,6 +11,11 @@
 # KubernetesExecutor: no Celery, no Redis, no standing workers; one replica of each component.
 executor: KubernetesExecutor
 
+# D42 phase 2a: the demo DAG publishes to the bus only when this is set. The operator fills it
+# from `streaming_values` when `spec.pillars.streaming` is on (platform#595 parity).
+kafka:
+  bootstrap: ""
+
 # stardelt-owned image with DAGs baked in
 images:
   airflow:
@@ -251,6 +256,10 @@ env:
 
 # Secret-backed envs use extraEnv (templated string accepting valueFrom).
 extraEnv: |
+  {{- if .Values.kafka.bootstrap }}
+  - name: PEGELONLINE_KAFKA_BOOTSTRAP
+    value: {{ .Values.kafka.bootstrap | quote }}
+  {{- end }}
   - name: S3_ENDPOINT
     valueFrom:
       secretKeyRef:
