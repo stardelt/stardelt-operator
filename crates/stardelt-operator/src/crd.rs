@@ -1143,11 +1143,11 @@ pub struct ConnectionSecret {
         "message": "usableBy must list group names (letters, digits, dot, underscore, dash)"
     },
     {
-        "rule": "!has(self.secret.remoteRef) || (!self.secret.remoteRef.contains('..') && !self.secret.remoteRef.contains('//'))",
+        "rule": "!has(self.secret) || !has(self.secret.remoteRef) || (!self.secret.remoteRef.contains('..') && !self.secret.remoteRef.contains('//'))",
         "message": "secret.remoteRef must not contain .. or //"
     },
     {
-        "rule": "self.secret.keys.all(k, k.matches('^[A-Za-z][A-Za-z0-9_]{0,62}$') && self.secret.keys.exists_one(j, j == k))",
+        "rule": "!has(self.secret) || self.secret.keys.all(k, k.matches('^[A-Za-z][A-Za-z0-9_]{0,62}$') && self.secret.keys.exists_one(j, j == k))",
         "message": "secret.keys must be unique names of letters, digits and underscore"
     },
     {
@@ -1155,19 +1155,19 @@ pub struct ConnectionSecret {
         "message": "config holds settings, not secrets: a name like password, secret or token belongs in secret.keys"
     },
     {
-        "rule": "!(self.type in ['postgresql', 'mysql', 'sqlserver', 'oracle']) || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && 'password' in self.secret.keys)",
+        "rule": "!(self.type in ['postgresql', 'mysql', 'sqlserver', 'oracle']) || (has(self.config) && 'host' in self.config && has(self.secret) && 'user' in self.secret.keys && 'password' in self.secret.keys)",
         "message": "a database connection needs config.host and the secret keys user and password"
     },
     {
-        "rule": "self.type != 'rest-api' || (has(self.config) && 'baseUrl' in self.config && ('token' in self.secret.keys || ('clientId' in self.secret.keys && 'clientSecret' in self.secret.keys)))",
+        "rule": "self.type != 'rest-api' || (has(self.config) && 'baseUrl' in self.config && has(self.secret) && ('token' in self.secret.keys || ('clientId' in self.secret.keys && 'clientSecret' in self.secret.keys)))",
         "message": "a rest-api connection needs config.baseUrl and the secret key token, or clientId and clientSecret"
     },
     {
-        "rule": "self.type != 's3' || (has(self.config) && 'bucket' in self.config && 'accessKeyId' in self.secret.keys && 'secretAccessKey' in self.secret.keys)",
+        "rule": "self.type != 's3' || (has(self.config) && 'bucket' in self.config && has(self.secret) && 'accessKeyId' in self.secret.keys && 'secretAccessKey' in self.secret.keys)",
         "message": "an s3 connection needs config.bucket and the secret keys accessKeyId and secretAccessKey"
     },
     {
-        "rule": "self.type != 'sftp' || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && ('password' in self.secret.keys || 'privateKey' in self.secret.keys))",
+        "rule": "self.type != 'sftp' || (has(self.config) && 'host' in self.config && has(self.secret) && 'user' in self.secret.keys && ('password' in self.secret.keys || 'privateKey' in self.secret.keys))",
         "message": "an sftp connection needs config.host and the secret keys user and password or privateKey"
     },
     {
@@ -1199,7 +1199,11 @@ pub struct ConnectionSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schemars(extend("maxProperties" = 32))]
     pub config: BTreeMap<String, String>,
-    pub secret: ConnectionSecret,
+    /// The secret fields, when this connection has any. Absent for a connection that needs no
+    /// credentials (the platform's own Kafka bus, an anonymous `generic` endpoint). The per-type
+    /// validation below still requires it for every type that authenticates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<ConnectionSecret>,
     /// How often the synced Secret is refreshed from the store, for example `15m`. Between one minute and 24 hours.
     #[serde(default = "default_refresh_interval", rename = "refreshInterval")]
     #[schemars(regex(pattern = r"^[0-9]{1,4}(m|h)$"))]
@@ -1255,28 +1259,32 @@ impl ConnectionSpec {
                 }
             }
         }
-        if let Some(path) = &self.secret.remote_ref
+        if let Some(secret) = &self.secret
+            && let Some(path) = &secret.remote_ref
             && (path.contains("..") || path.contains("//"))
         {
             return Err("secret.remoteRef must not contain .. or //".to_string());
         }
-        let keys = &self.secret.keys;
-        let key_ok = |k: &str| {
-            !k.is_empty()
-                && k.len() <= 63
-                && k.as_bytes()[0].is_ascii_alphabetic()
-                && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-        };
-        let unique: std::collections::BTreeSet<&str> = keys.iter().map(String::as_str).collect();
-        if keys.is_empty()
-            || keys.len() > 16
-            || unique.len() != keys.len()
-            || !keys.iter().all(|k| key_ok(k))
-        {
-            return Err(
-                "secret.keys must be 1 to 16 unique names of letters, digits and underscore"
-                    .to_string(),
-            );
+        let keys = self.secret.as_ref().map(|s| &s.keys);
+        if let Some(keys) = keys {
+            let key_ok = |k: &str| {
+                !k.is_empty()
+                    && k.len() <= 63
+                    && k.as_bytes()[0].is_ascii_alphabetic()
+                    && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            };
+            let unique: std::collections::BTreeSet<&str> =
+                keys.iter().map(String::as_str).collect();
+            if keys.is_empty()
+                || keys.len() > 16
+                || unique.len() != keys.len()
+                || !keys.iter().all(|k| key_ok(k))
+            {
+                return Err(
+                    "secret.keys must be 1 to 16 unique names of letters, digits and underscore"
+                        .to_string(),
+                );
+            }
         }
         for key in self.config.keys() {
             let lower = key.to_ascii_lowercase();
@@ -1297,7 +1305,7 @@ impl ConnectionSpec {
             }
         }
         let has_config = |k: &str| self.config.contains_key(k);
-        let has_key = |k: &str| keys.iter().any(|x| x == k);
+        let has_key = |k: &str| keys.is_some_and(|ks| ks.iter().any(|x| x == k));
         let needs = |ok: bool, what: &str| if ok { Ok(()) } else { Err(what.to_string()) };
         match self.type_ {
             ConnectionType::Postgresql
@@ -3388,7 +3396,7 @@ mod tests {
         assert_eq!(c.spec.scope, ConnectionScope::Group);
         assert_eq!(c.spec.type_, ConnectionType::Sqlserver);
         assert_eq!(c.spec.refresh_interval, "15m");
-        assert!(c.spec.secret.remote_ref.is_none());
+        assert!(c.spec.secret.as_ref().unwrap().remote_ref.is_none());
         assert!(c.spec.validate("crm-db").is_ok());
         assert_eq!(
             c.spec.derived_remote_ref("crm-db"),
@@ -3408,6 +3416,40 @@ mod tests {
             c.spec.derived_remote_ref("crm-db"),
             "connections/managed/crm-db"
         );
+    }
+
+    #[test]
+    fn a_connection_without_secret_deserialises_and_validates_per_type() {
+        let kafka: Connection = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Connection",
+            "metadata": { "name": "bus", "namespace": "stardelt" },
+            "spec": {
+                "scope": "group",
+                "ownerGroup": "analytics",
+                "type": "kafka",
+                "config": { "bootstrapServers": "kafka-kafka-bootstrap.stardelt.svc.cluster.local:9092" }
+            }
+        }))
+        .expect("deserialize Connection without secret");
+        assert!(kafka.spec.secret.is_none());
+        assert!(kafka.spec.validate("bus").is_ok());
+
+        let pg: Connection = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Connection",
+            "metadata": { "name": "db", "namespace": "stardelt" },
+            "spec": {
+                "scope": "group",
+                "ownerGroup": "analytics",
+                "type": "postgresql",
+                "config": { "host": "db.example.com" }
+            }
+        }))
+        .expect("deserialize Connection without secret");
+        assert!(pg.spec.secret.is_none());
+        let err = pg.spec.validate("db").unwrap_err();
+        assert!(err.contains("user") && err.contains("password"), "{err}");
     }
 
     #[test]

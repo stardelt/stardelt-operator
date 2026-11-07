@@ -37,7 +37,8 @@
           "type": "string"
         },
         "secret": {
-          "description": "Where the secret part of a connection lives.",
+          "description": "The secret fields, when this connection has any. Absent for a connection that needs no\ncredentials (the platform's own Kafka bus, an anonymous `generic` endpoint). The per-type\nvalidation below still requires it for every type that authenticates.",
+          "nullable": true,
           "properties": {
             "keys": {
               "description": "Names of the secret fields, for example `user` and `password`. They become the keys of the\nsynced Kubernetes Secret and the environment variables `CONN_<NAME>_<KEY>`.",
@@ -91,7 +92,6 @@
         }
       },
       "required": [
-        "secret",
         "type"
       ],
       "type": "object",
@@ -110,11 +110,11 @@
         },
         {
           "message": "secret.remoteRef must not contain .. or //",
-          "rule": "!has(self.secret.remoteRef) || (!self.secret.remoteRef.contains('..') && !self.secret.remoteRef.contains('//'))"
+          "rule": "!has(self.secret) || !has(self.secret.remoteRef) || (!self.secret.remoteRef.contains('..') && !self.secret.remoteRef.contains('//'))"
         },
         {
           "message": "secret.keys must be unique names of letters, digits and underscore",
-          "rule": "self.secret.keys.all(k, k.matches('^[A-Za-z][A-Za-z0-9_]{0,62}$') && self.secret.keys.exists_one(j, j == k))"
+          "rule": "!has(self.secret) || self.secret.keys.all(k, k.matches('^[A-Za-z][A-Za-z0-9_]{0,62}$') && self.secret.keys.exists_one(j, j == k))"
         },
         {
           "message": "config holds settings, not secrets: a name like password, secret or token belongs in secret.keys",
@@ -122,19 +122,19 @@
         },
         {
           "message": "a database connection needs config.host and the secret keys user and password",
-          "rule": "!(self.type in ['postgresql', 'mysql', 'sqlserver', 'oracle']) || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && 'password' in self.secret.keys)"
+          "rule": "!(self.type in ['postgresql', 'mysql', 'sqlserver', 'oracle']) || (has(self.config) && 'host' in self.config && has(self.secret) && 'user' in self.secret.keys && 'password' in self.secret.keys)"
         },
         {
           "message": "a rest-api connection needs config.baseUrl and the secret key token, or clientId and clientSecret",
-          "rule": "self.type != 'rest-api' || (has(self.config) && 'baseUrl' in self.config && ('token' in self.secret.keys || ('clientId' in self.secret.keys && 'clientSecret' in self.secret.keys)))"
+          "rule": "self.type != 'rest-api' || (has(self.config) && 'baseUrl' in self.config && has(self.secret) && ('token' in self.secret.keys || ('clientId' in self.secret.keys && 'clientSecret' in self.secret.keys)))"
         },
         {
           "message": "an s3 connection needs config.bucket and the secret keys accessKeyId and secretAccessKey",
-          "rule": "self.type != 's3' || (has(self.config) && 'bucket' in self.config && 'accessKeyId' in self.secret.keys && 'secretAccessKey' in self.secret.keys)"
+          "rule": "self.type != 's3' || (has(self.config) && 'bucket' in self.config && has(self.secret) && 'accessKeyId' in self.secret.keys && 'secretAccessKey' in self.secret.keys)"
         },
         {
           "message": "an sftp connection needs config.host and the secret keys user and password or privateKey",
-          "rule": "self.type != 'sftp' || (has(self.config) && 'host' in self.config && 'user' in self.secret.keys && ('password' in self.secret.keys || 'privateKey' in self.secret.keys))"
+          "rule": "self.type != 'sftp' || (has(self.config) && 'host' in self.config && has(self.secret) && 'user' in self.secret.keys && ('password' in self.secret.keys || 'privateKey' in self.secret.keys))"
         },
         {
           "message": "a kafka connection needs config.bootstrapServers",
