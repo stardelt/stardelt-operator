@@ -237,6 +237,7 @@ fn restart_policy(restart: &str) -> serde_json::Value {
 
 fn ready_condition(
     phase: &str,
+    reason: &str,
     generation: Option<i64>,
     previous: Option<&Condition>,
     now: &str,
@@ -249,7 +250,7 @@ fn ready_condition(
     Condition {
         type_: "Ready".into(),
         status: status.into(),
-        reason: Some(phase.into()),
+        reason: Some(reason.into()),
         message: None,
         last_transition_time,
         observed_generation: generation,
@@ -262,6 +263,7 @@ async fn patch_stream_status(
     generation: Option<i64>,
     previous: Option<&Condition>,
     phase: &str,
+    reason: &str,
     last_error: Option<String>,
 ) -> Result<(), kube::Error> {
     let now = now_rfc3339();
@@ -269,7 +271,7 @@ async fn patch_stream_status(
         phase: phase.into(),
         last_checkpoint_at: None,
         last_error,
-        conditions: vec![ready_condition(phase, generation, previous, &now)],
+        conditions: vec![ready_condition(phase, reason, generation, previous, &now)],
         observed_generation: generation,
     };
     apps.patch_status(
@@ -312,7 +314,10 @@ pub async fn reconcile_stream_app(
             Err(e) if is_not_found(&e) => {}
             Err(e) => return Err(e),
         }
-        patch_stream_status(&apps, &name, generation, previous, "Stopped", None).await?;
+        patch_stream_status(
+            &apps, &name, generation, previous, "Stopped", "Stopped", None,
+        )
+        .await?;
         tracing::info!(stream = %name, %namespace, "stream stopped");
         return Ok(Action::requeue(Duration::from_secs(300)));
     }
@@ -332,8 +337,16 @@ pub async fn reconcile_stream_app(
                 None => {
                     let msg =
                         format!("source Connection {conn_name} has no config.bootstrapServers");
-                    patch_stream_status(&apps, &name, generation, previous, "Failed", Some(msg))
-                        .await?;
+                    patch_stream_status(
+                        &apps,
+                        &name,
+                        generation,
+                        previous,
+                        "Failed",
+                        "Failed",
+                        Some(msg),
+                    )
+                    .await?;
                     return Ok(Action::requeue(Duration::from_secs(60)));
                 }
             }
@@ -379,7 +392,7 @@ pub async fn reconcile_stream_app(
         &namespace,
         &objects::spark_application_resource(),
     );
-    let (phase, last_error) = match spark_api.get(&name).await {
+    let (phase, reason, last_error) = match spark_api.get(&name).await {
         Ok(obj) => {
             let state = obj
                 .data
@@ -400,19 +413,36 @@ pub async fn reconcile_stream_app(
                     }
                     t
                 });
+            let execution_attempts = obj
+                .data
+                .get("status")
+                .and_then(|s| s.get("executionAttempts"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             match state {
-                Some("RUNNING") | Some("SUBMITTED") => ("Running".to_string(), None),
-                Some("COMPLETED") => ("Stopped".to_string(), None),
-                Some("FAILED") | Some("SUBMISSION_FAILED") => ("Failed".to_string(), err_msg),
-                _ => ("Pending".to_string(), None),
+                Some("RUNNING") | Some("SUBMITTED") => {
+                    if execution_attempts > 1 {
+                        ("Running".to_string(), "Restarting".to_string(), err_msg)
+                    } else {
+                        ("Running".to_string(), "Running".to_string(), None)
+                    }
+                }
+                Some("COMPLETED") => ("Stopped".to_string(), "Stopped".to_string(), None),
+                Some("FAILED") | Some("SUBMISSION_FAILED") => {
+                    ("Failed".to_string(), "Failed".to_string(), err_msg)
+                }
+                _ => ("Pending".to_string(), "Pending".to_string(), None),
             }
         }
-        Err(e) if is_not_found(&e) => ("Pending".to_string(), None),
+        Err(e) if is_not_found(&e) => ("Pending".to_string(), "Pending".to_string(), None),
         Err(e) => return Err(e),
     };
 
-    patch_stream_status(&apps, &name, generation, previous, &phase, last_error).await?;
-    tracing::info!(stream = %name, %namespace, %phase, "reconciled");
+    patch_stream_status(
+        &apps, &name, generation, previous, &phase, &reason, last_error,
+    )
+    .await?;
+    tracing::info!(stream = %name, %namespace, %phase, %reason, "reconciled");
     Ok(Action::requeue(Duration::from_secs(60)))
 }
 
@@ -894,5 +924,51 @@ mod tests {
             log.contains("\"lastError\":\"boom\"") || log.contains("boom"),
             "{log}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_crash_looping_running_application_reports_restarting() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/connections/kafka-bus") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Connection","metadata":{"name":"kafka-bus","namespace":"data"},"spec":{"scope":"group","ownerGroup":"a","type":"kafka","config":{"bootstrapServers":"kafka:9092"},"secret":{"name":"s","keys":["token"]}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkapplications/orders") {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data"},"status":{"applicationState":{"state":"RUNNING","errorMessage":"boom"},"executionAttempts":4}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/streamapps/orders/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"connectionRef":"kafka-bus","topic":"orders.v1"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge","mergeKeys":["id"]}},"status":{"phase":"Running","lastError":"boom"}}"#.into(),
+                );
+            }
+            if method == "PATCH" || method == "POST" || method == "PUT" || method == "CREATE" {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"orders-job","namespace":"data"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"v1","kind":"Status","status":"Success"}"#.into(),
+            )
+        });
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let action = reconcile_stream_app(Arc::new(stream_app(false)), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(log.contains("\"phase\":\"Running\""), "{log}");
+        assert!(log.contains("\"reason\":\"Restarting\""), "{log}");
+        assert!(log.contains("\"lastError\":\"boom\""), "{log}");
     }
 }
