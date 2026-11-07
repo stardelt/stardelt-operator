@@ -28,11 +28,11 @@ use crate::{
         CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, SecretsMode,
         StorageImpl,
     },
-    identity, ingress, keycloak, network_policy, nova,
+    identity, ingress, kafka, keycloak, network_policy, nova,
     objects::{
         apply, apply_dynamic, apply_dynamic_cluster, cert_manager_certificate_resource,
         cert_manager_issuer_resource, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
-        labels, owner_reference,
+        kafka_node_pool_resource, kafka_resource, labels, owner_reference,
     },
     pg_dump,
     prerequisites::{
@@ -525,6 +525,67 @@ pub async fn ensure_notebooks_bucket(
         }
         Ok(_) => Some(status(NAME, false, "the bucket Job is running")),
     }
+}
+
+/// The streaming bus (D42): one Strimzi `Kafka` and its combined `KafkaNodePool` when
+/// `pillars.streaming` is on. `None` when it is off, so a platform that does not stream is
+/// unchanged. The Strimzi CRDs arrive with the chart the same reconcile applies, so a first
+/// tick reports "waiting for Strimzi" and the next one creates the broker.
+pub async fn ensure_kafka_broker(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = kafka::NAME;
+    if !spec.pillars.streaming {
+        return None;
+    }
+    let namespace = &spec.namespace;
+    for (resource, object) in [
+        (
+            kafka_node_pool_resource(),
+            kafka::node_pool(namespace, spec.profile),
+        ),
+        (kafka_resource(), kafka::broker(namespace)),
+    ] {
+        match apply_dynamic(&ctx.client, namespace, &resource, &object, spec.dry_run).await {
+            Err(kube::Error::Api(e)) if e.code == 404 => {
+                return Some(status(
+                    NAME,
+                    false,
+                    format!(
+                        "waiting for Strimzi: CRD {} is not installed yet",
+                        resource.plural
+                    ),
+                ));
+            }
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+            Ok(applied) if resource.plural == "kafkas" && kafka_ready(&applied) => {
+                return Some(status(NAME, true, "broker ready"));
+            }
+            Ok(_) => {}
+        }
+    }
+    if spec.dry_run {
+        Some(status(
+            NAME,
+            false,
+            format!("planned (dry-run): Kafka {NAME}"),
+        ))
+    } else {
+        Some(status(NAME, false, "waiting for Kafka to become Ready"))
+    }
+}
+
+/// Strimzi reports `status.conditions[type=Ready].status == "True"`, the same shape
+/// `cluster_ready` reads for CloudNative-PG.
+fn kafka_ready(broker: &DynamicObject) -> bool {
+    broker.data["status"]["conditions"]
+        .as_array()
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|c| c["type"] == "Ready" && c["status"] == "True")
+        })
 }
 
 /// The Spark Connect endpoint (operator#239's builders, O8 part 4b): applied only with

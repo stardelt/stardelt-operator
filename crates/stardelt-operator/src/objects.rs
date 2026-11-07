@@ -102,6 +102,22 @@ pub fn cnpg_cluster_resource() -> ApiResource {
     )
 }
 
+/// The Strimzi broker (`kafkas.kafka.strimzi.io/v1beta2`).
+pub fn kafka_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("kafka.strimzi.io", "v1beta2", "Kafka"),
+        "kafkas",
+    )
+}
+
+/// A Strimzi node pool (`kafkanodepools.kafka.strimzi.io/v1beta2`). Strimzi 1.x requires one.
+pub fn kafka_node_pool_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("kafka.strimzi.io", "v1beta2", "KafkaNodePool"),
+        "kafkanodepools",
+    )
+}
+
 /// The CloudNative-PG ScheduledBackup resource (`scheduledbackups.postgresql.cnpg.io/v1`).
 pub fn cnpg_scheduled_backup_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
@@ -145,6 +161,19 @@ mod tests {
             (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
             ("postgresql.cnpg.io", "v1", "clusters")
         );
+    }
+
+    #[test]
+    fn kafka_resources_point_at_strimzi() {
+        for (r, plural) in [
+            (kafka_resource(), "kafkas"),
+            (kafka_node_pool_resource(), "kafkanodepools"),
+        ] {
+            assert_eq!(
+                (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
+                ("kafka.strimzi.io", "v1beta2", plural)
+            );
+        }
     }
 
     #[test]
