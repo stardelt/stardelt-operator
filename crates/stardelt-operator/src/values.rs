@@ -81,6 +81,8 @@ pub fn golden_values(component: &str) -> Value {
             .expect("values/openbao.yaml is not valid YAML"),
         "kafka" => serde_yaml::from_str(include_str!("../values/kafka.yaml"))
             .expect("values/kafka.yaml is not valid YAML"),
+        "spark-operator" => serde_yaml::from_str(include_str!("../values/spark-operator.yaml"))
+            .expect("values/spark-operator.yaml is not valid YAML"),
         _ => Value::Object(Map::new()),
     }
 }

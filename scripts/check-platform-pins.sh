@@ -35,6 +35,7 @@ declare -A PREFIX_OF=(
   [external-secrets/external-secrets]=EXTERNAL_SECRETS
   [openbao/openbao]=OPENBAO
   [strimzi/strimzi-kafka-operator]=STRIMZI
+  [spark-operator/spark-operator]=SPARK_OPERATOR
 )
 
 status=0

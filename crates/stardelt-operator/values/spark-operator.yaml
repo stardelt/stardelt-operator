@@ -1,0 +1,14 @@
+# The Kubeflow Spark Operator (D42): reconciles `SparkApplication` objects in the namespace it
+# watches. One controller replica is enough on the dev node; the webhook is off because nothing
+# here mutates pods and the certificate it would need is one more moving part.
+controller:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+webhook:
+  enable: false
