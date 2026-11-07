@@ -172,7 +172,9 @@ pub fn roles(namespace: &str) -> Vec<Role> {
         // The Pipelines page lists `Pipeline` resources and Schedule creates, replaces (`PUT`,
         // hence update not patch) and deletes them; `ServicePrincipal`, `Catalog` and
         // `SqlWarehouse` resources are read for the group, permission and compute views
-        // (a catalog is also patched by the administrators' view).
+        // (a catalog is also patched by the administrators' view). `StreamApp` resources are read
+        // for the Streams page (D42) — list and phase only; the start/stop routes are a later
+        // ticket.
         role(
             PIPELINES_ROLE,
             namespace,
@@ -183,6 +185,7 @@ pub fn roles(namespace: &str) -> Vec<Role> {
                     "stardelt.io",
                 ),
                 rule(&["serviceprincipals"], &["get", "list"], "stardelt.io"),
+                rule(&["streamapps"], &["get", "list"], "stardelt.io"),
                 rule(&["catalogs"], &["get", "list", "patch"], "stardelt.io"),
                 rule(&["sqlwarehouses"], &["get", "list"], "stardelt.io"),
             ],
@@ -436,10 +439,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Every (apiGroup, resource, verb) that Nova may use. 22 entries: the list that
+    /// Every (apiGroup, resource, verb) that Nova may use. 24 entries: the list that
     /// `scripts/check-nova-rbac-parity.sh` in stardelt-platform compares between the manifest
     /// and the chart.
-    const GRANTED: [(&str, &str, &str); 22] = [
+    const GRANTED: [(&str, &str, &str); 24] = [
         ("apps", "deployments", "get"),
         ("apps", "deployments", "list"),
         ("apps", "statefulsets", "get"),
@@ -457,6 +460,8 @@ mod tests {
         ("stardelt.io", "pipelines", "watch"),
         ("stardelt.io", "serviceprincipals", "get"),
         ("stardelt.io", "serviceprincipals", "list"),
+        ("stardelt.io", "streamapps", "get"),
+        ("stardelt.io", "streamapps", "list"),
         ("stardelt.io", "catalogs", "get"),
         ("stardelt.io", "catalogs", "list"),
         ("stardelt.io", "catalogs", "patch"),
