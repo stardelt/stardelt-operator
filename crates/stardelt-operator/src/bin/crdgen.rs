@@ -9,7 +9,7 @@ use kube::CustomResourceExt;
 
 use stardelt_operator::crd::{
     Catalog, Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance, ServicePrincipal,
-    SqlWarehouse, Volume,
+    SqlWarehouse, StreamApp, Volume,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -74,6 +74,15 @@ fn main() -> anyhow::Result<()> {
         "serviceprincipal.schema.json",
         "ServicePrincipal",
         &principal_crd,
+    )?;
+
+    let stream_crd = StreamApp::crd();
+    write(dir, "stardelt.io_streamapps.yaml", &stream_crd)?;
+    write_schema(
+        schema_dir,
+        "streamapp.schema.json",
+        "StreamApp",
+        &stream_crd,
     )?;
 
     let catalog_crd = Catalog::crd();

@@ -1,0 +1,206 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A streaming app: a Kafka topic in, an Iceberg table out.",
+  "properties": {
+    "spec": {
+      "description": "One long-running stream: a Kafka topic in, an Iceberg table out (decision D42).",
+      "properties": {
+        "engine": {
+          "default": "spark",
+          "enum": [
+            "spark"
+          ],
+          "type": "string"
+        },
+        "ownerGroup": {
+          "description": "The group whose members may see and stop the stream; absent means administrators only.",
+          "maxLength": 64,
+          "minLength": 1,
+          "nullable": true,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "type": "string"
+        },
+        "restartPolicy": {
+          "default": "always",
+          "enum": [
+            "always",
+            "on-failure"
+          ],
+          "type": "string"
+        },
+        "runAs": {
+          "description": "The `ServicePrincipal` the job runs as (convention: `pipeline-<ownerGroup>`).",
+          "maxLength": 40,
+          "minLength": 1,
+          "nullable": true,
+          "pattern": "^[a-z0-9][a-z0-9-]*$",
+          "type": "string"
+        },
+        "sink": {
+          "properties": {
+            "catalog": {
+              "description": "Catalog the sink table lives in; it must let `runAs` write.",
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9][a-z0-9-]*$",
+              "type": "string"
+            },
+            "checkpointPrefix": {
+              "description": "S3 prefix for the checkpoint; absent means `checkpoints/<namespace>/<name>`.",
+              "maxLength": 512,
+              "minLength": 1,
+              "nullable": true,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_./-]*$",
+              "type": "string"
+            },
+            "mergeKeys": {
+              "description": "Columns of `MERGE … ON`; 1 to 8, each one an existing column.",
+              "items": {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z0-9_]+$",
+                "type": "string"
+              },
+              "maxItems": 8,
+              "minItems": 0,
+              "type": "array"
+            },
+            "mode": {
+              "default": "merge",
+              "enum": [
+                "merge",
+                "append"
+              ],
+              "type": "string"
+            },
+            "table": {
+              "description": "`schema.table`.",
+              "maxLength": 128,
+              "minLength": 3,
+              "pattern": "^[a-z0-9_]+\\.[a-z0-9_]+$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "catalog",
+            "table"
+          ],
+          "type": "object"
+        },
+        "source": {
+          "properties": {
+            "connectionRef": {
+              "description": "Name of the `Connection` (`type: kafka`) whose `config.bootstrapServers` the job reads.",
+              "maxLength": 63,
+              "minLength": 1,
+              "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+              "type": "string"
+            },
+            "format": {
+              "default": "json",
+              "enum": [
+                "json"
+              ],
+              "type": "string"
+            },
+            "topic": {
+              "maxLength": 249,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "connectionRef",
+            "topic"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "sink",
+        "source"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "a stream needs a topic of 1 to 249 characters: letters, digits, dot, underscore or dash",
+          "rule": "self.source.topic.size() > 0 && self.source.topic.matches('^[A-Za-z0-9._-]{1,249}$')"
+        },
+        {
+          "message": "sink.table is schema.table, lower-case letters, digits and underscores",
+          "rule": "self.sink.table.matches('^[a-z0-9_]+\\\\.[a-z0-9_]+$')"
+        },
+        {
+          "message": "sink.mode merge needs mergeKeys; append forbids them",
+          "rule": "self.sink.mode == 'merge' ? self.sink.mergeKeys.size() > 0 : !has(self.sink.mergeKeys) || self.sink.mergeKeys.size() == 0"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "conditions": {
+          "default": [],
+          "items": {
+            "properties": {
+              "lastTransitionTime": {
+                "nullable": true,
+                "type": "string"
+              },
+              "message": {
+                "nullable": true,
+                "type": "string"
+              },
+              "observedGeneration": {
+                "format": "int64",
+                "nullable": true,
+                "type": "integer"
+              },
+              "reason": {
+                "nullable": true,
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "type"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "lastCheckpointAt": {
+          "nullable": true,
+          "type": "string"
+        },
+        "lastError": {
+          "nullable": true,
+          "type": "string"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "description": "`Pending`, `Running`, `Failed` or `Stopped`.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "StreamApp",
+  "type": "object"
+}
