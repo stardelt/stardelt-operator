@@ -5,6 +5,7 @@
 //! - `Lakehouse` → its namespace-scoped plan (storage + catalog)
 //! - `Connection` → an External Secrets sync (see [`crate::connection`])
 //! - `ServicePrincipal` → validation and its credentials Secret check (see [`crate::principal`])
+//! - `StreamApp` → a SparkApplication job (see [`crate::stream_app`])
 //!
 //! Applies go through Helm. Both resources default to `dryRun: true`, so a new
 //! resource plans first and changes nothing until explicitly flipped.
@@ -29,7 +30,7 @@ use crate::crd::Profile;
 use crate::crd::{
     ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, IdentityMode,
     Lakehouse, LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal,
-    StorageImpl, ValuesSource,
+    StorageImpl, StreamApp, ValuesSource,
 };
 use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
 use crate::objects::cnpg_cluster_resource;
@@ -84,16 +85,27 @@ pub async fn run() -> anyhow::Result<()> {
     )
     .run(reconcile_principal, error_policy, ctx.clone());
 
-    tracing::info!(
-        "stardelt-operator watching PlatformInstance, Lakehouse, Connection and ServicePrincipal"
+    let streams = Controller::new(
+        Api::<StreamApp>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .run(
+        crate::stream_app::reconcile_stream_app,
+        crate::stream_app::error_policy,
+        ctx.clone(),
     );
-    futures::pin_mut!(lakehouses, platforms, connections, principals);
+
+    tracing::info!(
+        "stardelt-operator watching PlatformInstance, Lakehouse, Connection, ServicePrincipal and StreamApp"
+    );
+    futures::pin_mut!(lakehouses, platforms, connections, principals, streams);
     loop {
         tokio::select! {
             _ = lakehouses.next() => {}
             _ = platforms.next() => {}
             _ = connections.next() => {}
             _ = principals.next() => {}
+            _ = streams.next() => {}
         }
     }
 }
@@ -1229,7 +1241,7 @@ async fn reconcile_platform(
     Ok(Action::requeue(Duration::from_secs(300)))
 }
 
-fn error_policy<K>(_obj: Arc<K>, err: &kube::Error, _ctx: Arc<Context>) -> Action {
+pub(crate) fn error_policy<K>(_obj: Arc<K>, err: &kube::Error, _ctx: Arc<Context>) -> Action {
     tracing::warn!(error = %err, "reconcile failed");
     Action::requeue(Duration::from_secs(30))
 }

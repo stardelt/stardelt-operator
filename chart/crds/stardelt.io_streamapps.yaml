@@ -108,6 +108,12 @@ spec:
                 - connectionRef
                 - topic
                 type: object
+              stopped:
+                default: false
+                description: |-
+                  `true` stops the job and deletes its SparkApplication; the checkpoint is kept, so
+                  `stopped: false` resumes from it. The one verb Nova's page needs (D42).
+                type: boolean
             required:
             - sink
             - source
