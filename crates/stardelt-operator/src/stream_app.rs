@@ -75,6 +75,7 @@ pub fn spark_application(
     owner: &OwnerReference,
 ) -> Result<DynamicObject, String> {
     let run_as = resolve_run_as(spec)?;
+    let sp = format!("sp-{run_as}");
     let restart = match spec.restart_policy {
         StreamRestartPolicy::Always => "Always",
         StreamRestartPolicy::OnFailure => "OnFailure",
@@ -85,6 +86,25 @@ pub fn spark_application(
         SinkMode::Merge => "merge",
         SinkMode::Append => "append",
     };
+    let c = &spec.sink.catalog;
+    let token_url = format!(
+        "http://keycloak:8080/realms/{}/protocol/openid-connect/token",
+        crate::identity::PLATFORM_REALM
+    );
+    let s3_secret = crate::prerequisites::S3_SECRET;
+    let mut spark_conf = json!({
+        "spark.jars.packages": "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8",
+        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.hadoop.fs.s3a.endpoint": "http://seaweedfs-s3:8333",
+        "spark.hadoop.fs.s3a.path.style.access": "true",
+        "spark.hadoop.fs.s3a.connection.ssl.enabled": "false",
+        "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
+        "spark.hadoop.fs.s3a.access.key": "${env:AWS_ACCESS_KEY_ID}",
+        "spark.hadoop.fs.s3a.secret.key": "${env:AWS_SECRET_ACCESS_KEY}",
+    });
+    spark_conf[format!("spark.sql.catalog.{c}.s3.endpoint")] = json!("http://seaweedfs-s3:8333");
+    spark_conf[format!("spark.sql.catalog.{c}.s3.path-style-access")] = json!("true");
 
     Ok(DynamicObject {
         types: Some(TypeMeta {
@@ -105,7 +125,7 @@ pub fn spark_application(
                 "mode": "cluster",
                 "image": spark::image(),
                 "imagePullPolicy": "IfNotPresent",
-                "sparkVersion": "3.5.8",
+                "sparkVersion": "4.1.3",
                 "mainApplicationFile": "local:///opt/job/stream.py",
                 "arguments": [
                     "--bootstrap-servers", bootstrap,
@@ -118,16 +138,20 @@ pub fn spark_application(
                     "--checkpoint", checkpoint,
                 ],
                 "restartPolicy": {"type": restart},
-                "sparkConf": {
-                    "spark.jars.packages": "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.8,org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2",
-                    "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-                },
+                "sparkConf": spark_conf,
                 "driver": {
                     "cores": 1,
                     "coreLimit": "1200m",
                     "memory": "1g",
                     "serviceAccount": "spark-connect",
-                    "envFrom": [{"secretRef": {"name": format!("sp-{run_as}")}}],
+                    "env": [
+                        {"name": "CATALOG_CLIENT_ID", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-id"}}},
+                        {"name": "CATALOG_CLIENT_SECRET", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-secret"}}},
+                        {"name": "CATALOG_TOKEN_URL", "value": token_url},
+                        {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": s3_secret, "key": "access-key"}}},
+                        {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": s3_secret, "key": "secret-key"}}},
+                        {"name": "AWS_REGION", "valueFrom": {"secretKeyRef": {"name": s3_secret, "key": "region"}}}
+                    ],
                     "volumeMounts": [{"name": "job", "mountPath": JOB_MOUNT}],
                 },
                 "executor": {
@@ -458,8 +482,21 @@ mod tests {
         s.owner_group = Some("analysts".into());
         let a =
             spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let env = a.data["spec"]["driver"]["env"].as_array().expect("env");
+        let client_id = env
+            .iter()
+            .find(|e| e["name"] == "CATALOG_CLIENT_ID")
+            .expect("CATALOG_CLIENT_ID");
         assert_eq!(
-            a.data["spec"]["driver"]["envFrom"][0]["secretRef"]["name"],
+            client_id["valueFrom"]["secretKeyRef"]["name"],
+            "sp-pipeline-analysts"
+        );
+        let client_secret = env
+            .iter()
+            .find(|e| e["name"] == "CATALOG_CLIENT_SECRET")
+            .expect("CATALOG_CLIENT_SECRET");
+        assert_eq!(
+            client_secret["valueFrom"]["secretKeyRef"]["name"],
             "sp-pipeline-analysts"
         );
 
@@ -467,6 +504,135 @@ mod tests {
         let err =
             spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).unwrap_err();
         assert!(err.contains("runAs"), "{err}");
+    }
+
+    #[test]
+    fn the_driver_carries_catalog_and_s3_env_with_no_env_from() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a =
+            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let driver = &a.data["spec"]["driver"];
+        assert!(
+            driver.get("envFrom").is_none(),
+            "driver must not use envFrom"
+        );
+        let env = driver["env"].as_array().expect("env array");
+        let names: Vec<&str> = env.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "CATALOG_CLIENT_ID",
+                "CATALOG_CLIENT_SECRET",
+                "CATALOG_TOKEN_URL",
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_REGION",
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_backed_driver_env_uses_secret_key_refs_never_literal_values() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a =
+            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let env = a.data["spec"]["driver"]["env"].as_array().expect("env");
+        let secret_backed = [
+            ("CATALOG_CLIENT_ID", "sp-pipeline-analysts", "client-id"),
+            (
+                "CATALOG_CLIENT_SECRET",
+                "sp-pipeline-analysts",
+                "client-secret",
+            ),
+            (
+                "AWS_ACCESS_KEY_ID",
+                crate::prerequisites::S3_SECRET,
+                "access-key",
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY",
+                crate::prerequisites::S3_SECRET,
+                "secret-key",
+            ),
+            ("AWS_REGION", crate::prerequisites::S3_SECRET, "region"),
+        ];
+        for (name, secret, key) in secret_backed {
+            let entry = env
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(
+                entry.get("value").is_none(),
+                "{name} must not be a literal value"
+            );
+            assert_eq!(
+                entry["valueFrom"]["secretKeyRef"]["name"], secret,
+                "{name} secret"
+            );
+            assert_eq!(entry["valueFrom"]["secretKeyRef"]["key"], key, "{name} key");
+        }
+        let token = env
+            .iter()
+            .find(|e| e["name"] == "CATALOG_TOKEN_URL")
+            .expect("CATALOG_TOKEN_URL");
+        assert_eq!(
+            token["value"],
+            "http://keycloak:8080/realms/stardelt/protocol/openid-connect/token"
+        );
+        assert!(token.get("valueFrom").is_none());
+    }
+
+    #[test]
+    fn the_application_targets_spark_4_1_3_without_the_bundled_iceberg_runtime() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a =
+            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        assert_eq!(a.data["spec"]["sparkVersion"], "4.1.3");
+        let packages = a.data["spec"]["sparkConf"]["spark.jars.packages"]
+            .as_str()
+            .expect("packages");
+        assert!(
+            !packages.contains("iceberg-spark-runtime-3.5"),
+            "must not request the 2.12/3.5 Iceberg runtime: {packages}"
+        );
+        assert!(packages.contains("spark-sql-kafka-0-10"), "{packages}");
+        assert_eq!(
+            a.data["spec"]["sparkConf"]["spark.sql.extensions"],
+            "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+        );
+    }
+
+    #[test]
+    fn spark_conf_carries_s3a_and_sink_catalog_s3_endpoints() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a =
+            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let conf = &a.data["spec"]["sparkConf"];
+        assert_eq!(
+            conf["spark.hadoop.fs.s3a.endpoint"],
+            "http://seaweedfs-s3:8333"
+        );
+        assert_eq!(conf["spark.hadoop.fs.s3a.path.style.access"], "true");
+        assert_eq!(
+            conf["spark.hadoop.fs.s3a.aws.credentials.provider"],
+            "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
+        );
+        assert_eq!(
+            conf["spark.hadoop.fs.s3a.access.key"],
+            "${env:AWS_ACCESS_KEY_ID}"
+        );
+        assert_eq!(
+            conf["spark.hadoop.fs.s3a.secret.key"],
+            "${env:AWS_SECRET_ACCESS_KEY}"
+        );
+        assert_eq!(
+            conf["spark.sql.catalog.shared.s3.endpoint"],
+            "http://seaweedfs-s3:8333"
+        );
+        assert_eq!(
+            conf["spark.sql.catalog.shared.s3.path-style-access"],
+            "true"
+        );
     }
 
     fn stream_app(stopped: bool) -> StreamApp {
