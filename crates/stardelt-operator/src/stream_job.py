@@ -39,6 +39,8 @@ def spark(catalog: str, catalog_uri: str) -> SparkSession:
             "spark.sql.extensions",
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         )
+        .config("spark.hadoop.fs.s3a.access.key", os.environ["AWS_ACCESS_KEY_ID"])
+        .config("spark.hadoop.fs.s3a.secret.key", os.environ["AWS_SECRET_ACCESS_KEY"])
         .config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
         .config(f"spark.sql.catalog.{catalog}.type", "rest")
         .config(f"spark.sql.catalog.{catalog}.uri", catalog_uri)

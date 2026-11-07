@@ -135,11 +135,18 @@ pub fn spark_application(
         "spark.hadoop.fs.s3a.connection.ssl.enabled": "false",
         "spark.hadoop.fs.s3a.impl": "org.apache.hadoop.fs.s3a.S3AFileSystem",
         "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider",
-        "spark.hadoop.fs.s3a.access.key": "${env:AWS_ACCESS_KEY_ID}",
-        "spark.hadoop.fs.s3a.secret.key": "${env:AWS_SECRET_ACCESS_KEY}",
     });
     spark_conf[format!("spark.sql.catalog.{c}.s3.endpoint")] = json!("http://seaweedfs-s3:8333");
     spark_conf[format!("spark.sql.catalog.{c}.s3.path-style-access")] = json!("true");
+    // The executor reads and writes Iceberg data files, so it needs the same S3 credentials
+    // as the driver. The Spark operator maps `spark.kubernetes.executor.secretKeyRef.*` to
+    // executor environment variables (the shape Spark Connect already uses).
+    spark_conf["spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID"] =
+        json!(format!("{s3_secret}:access-key"));
+    spark_conf["spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY"] =
+        json!(format!("{s3_secret}:secret-key"));
+    spark_conf["spark.kubernetes.executor.secretKeyRef.AWS_REGION"] =
+        json!(format!("{s3_secret}:region"));
 
     Ok(DynamicObject {
         types: Some(TypeMeta {
@@ -726,13 +733,21 @@ mod tests {
             conf["spark.hadoop.fs.s3a.aws.credentials.provider"],
             "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider"
         );
+        // The access and secret keys come from the driver environment at runtime; a
+        // literal `${env:...}` here is not expanded by Hadoop and signs with a bogus key.
+        assert!(conf.get("spark.hadoop.fs.s3a.access.key").is_none());
+        assert!(conf.get("spark.hadoop.fs.s3a.secret.key").is_none());
         assert_eq!(
-            conf["spark.hadoop.fs.s3a.access.key"],
-            "${env:AWS_ACCESS_KEY_ID}"
+            conf["spark.kubernetes.executor.secretKeyRef.AWS_ACCESS_KEY_ID"],
+            "stardelt-s3-creds:access-key"
         );
         assert_eq!(
-            conf["spark.hadoop.fs.s3a.secret.key"],
-            "${env:AWS_SECRET_ACCESS_KEY}"
+            conf["spark.kubernetes.executor.secretKeyRef.AWS_SECRET_ACCESS_KEY"],
+            "stardelt-s3-creds:secret-key"
+        );
+        assert_eq!(
+            conf["spark.kubernetes.executor.secretKeyRef.AWS_REGION"],
+            "stardelt-s3-creds:region"
         );
         assert_eq!(
             conf["spark.sql.catalog.shared.s3.endpoint"],
