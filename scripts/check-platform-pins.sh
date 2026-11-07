@@ -34,6 +34,7 @@ declare -A PREFIX_OF=(
   [openfga/openfga]=OPENFGA
   [external-secrets/external-secrets]=EXTERNAL_SECRETS
   [openbao/openbao]=OPENBAO
+  [strimzi/strimzi-kafka-operator]=STRIMZI
 )
 
 status=0
