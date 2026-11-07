@@ -37,6 +37,8 @@ pub fn external_secret_resource() -> ApiResource {
 pub enum Plan {
     /// Apply this `ExternalSecret`.
     Apply(Value),
+    /// The connection needs no credentials: no `ExternalSecret` is created and it is Ready.
+    NoSecret,
     /// Do not apply anything; report `reason` (a CamelCase word) and `message` in the status.
     Invalid {
         reason: &'static str,
@@ -85,11 +87,18 @@ pub fn plan(
             message,
         };
     }
+    if spec.secret.is_none() {
+        return Plan::NoSecret;
+    }
+    let secret_spec = spec
+        .secret
+        .as_ref()
+        .expect("secret present after NoSecret check");
     // The enterprise's store (decision D23, `secrets.mode: external`): the author names the path,
     // because the path is the enterprise's convention and the platform cannot derive it. Every
     // other mode derives the path from the scope, so a group cannot read another group's secret.
     let (store, store_kind, path) = if mode == SecretsMode::External {
-        let Some(remote_ref) = spec.secret.remote_ref.as_deref() else {
+        let Some(remote_ref) = secret_spec.remote_ref.as_deref() else {
             return Plan::Invalid {
                 reason: "RemoteRefRequired",
                 message: "secrets.mode external: set secret.remoteRef to the path in the enterprise store (for example `apps/crm/db`)".to_string(),
@@ -101,7 +110,7 @@ pub fn plan(
             remote_ref.to_string(),
         )
     } else {
-        if spec.secret.remote_ref.is_some() {
+        if secret_spec.remote_ref.is_some() {
             return Plan::Invalid {
                 reason: "RemoteRefNotAllowed",
                 message: "secret.remoteRef is only allowed with an external secret store; remove it and the path is derived from the scope".to_string(),
@@ -119,8 +128,7 @@ pub fn plan(
         (store, "SecretStore", spec.derived_remote_ref(name))
     };
     let secret = connection_secret_name(name);
-    let data: Vec<Value> = spec
-        .secret
+    let data: Vec<Value> = secret_spec
         .keys
         .iter()
         .map(|key| json!({ "secretKey": key, "remoteRef": { "key": path, "property": key } }))
@@ -258,6 +266,12 @@ pub async fn reconcile_connection(
     let (ready, reason, message, last_sync) = match plan(&conn.spec, &name, &namespace, &uid, mode)
     {
         Plan::Invalid { reason, message } => (false, reason, Some(message), None),
+        Plan::NoSecret => (
+            true,
+            "NoSecret",
+            Some("this connection carries no credentials".to_string()),
+            None,
+        ),
         Plan::Apply(external_secret) => {
             let api: Api<DynamicObject> =
                 Api::namespaced_with(ctx.client.clone(), &namespace, &external_secret_resource());
@@ -295,7 +309,7 @@ pub async fn reconcile_connection(
         .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
     let status = ConnectionStatus {
         ready,
-        secret_name: ready.then(|| connection_secret_name(&name)),
+        secret_name: (ready && reason == "Synced").then(|| connection_secret_name(&name)),
         last_sync,
         conditions: vec![ready_condition(
             ready,
@@ -351,6 +365,7 @@ mod tests {
     fn applied(plan: Plan) -> Value {
         match plan {
             Plan::Apply(v) => v,
+            Plan::NoSecret => panic!("expected Apply, got NoSecret"),
             Plan::Invalid { reason, message } => panic!("expected Apply, got {reason}: {message}"),
         }
     }
@@ -359,6 +374,7 @@ mod tests {
         match plan {
             Plan::Invalid { reason, message } => (reason, message),
             Plan::Apply(_) => panic!("expected Invalid"),
+            Plan::NoSecret => panic!("expected Invalid, got NoSecret"),
         }
     }
 
@@ -544,5 +560,38 @@ mod tests {
         ));
         assert_eq!(es["spec"]["secretStoreRef"]["kind"], "SecretStore");
         assert_eq!(es["spec"]["secretStoreRef"]["name"], "openbao-analytics");
+    }
+
+    #[test]
+    fn a_kafka_connection_without_a_secret_needs_no_external_secret() {
+        let s: ConnectionSpec = serde_json::from_value(json!({
+            "scope": "group",
+            "ownerGroup": "analytics",
+            "type": "kafka",
+            "config": { "bootstrapServers": "kafka-kafka-bootstrap.stardelt.svc.cluster.local:9092" }
+        }))
+        .expect("spec");
+        assert!(matches!(
+            plan(&s, "bus", "stardelt", "uid-1", SecretsMode::None),
+            Plan::NoSecret
+        ));
+    }
+
+    #[test]
+    fn a_postgresql_connection_without_a_secret_is_invalid() {
+        let s: ConnectionSpec = serde_json::from_value(json!({
+            "scope": "group",
+            "ownerGroup": "analytics",
+            "type": "postgresql",
+            "config": { "host": "db.example.com" }
+        }))
+        .expect("spec");
+        assert!(matches!(
+            plan(&s, "db", "stardelt", "uid-1", SecretsMode::None),
+            Plan::Invalid {
+                reason: "InvalidSpec",
+                ..
+            }
+        ));
     }
 }
