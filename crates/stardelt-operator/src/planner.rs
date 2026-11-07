@@ -68,6 +68,12 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
             name: "kafka",
             chart: Some("strimzi/strimzi-kafka-operator"),
         });
+        // The engine of a `StreamApp` (D42): Spark Structured Streaming runs as a
+        // `SparkApplication`, so the pillar that streams also owns the operator that reconciles it.
+        plan.push(ComponentPlan {
+            name: "spark-operator",
+            chart: Some("spark-operator/spark-operator"),
+        });
     }
     plan
 }
@@ -194,6 +200,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "external-secrets/external-secrets" => Some("2.13.0"),
         "openbao/openbao" => Some("0.30.4"),
         "strimzi/strimzi-kafka-operator" => Some("1.3.1"),
+        "spark-operator/spark-operator" => Some("2.5.2"),
         _ => None,
     }
 }
@@ -213,6 +220,7 @@ pub fn chart_repo(chart: &str) -> Option<&'static str> {
         "external-secrets/external-secrets" => Some("https://charts.external-secrets.io"),
         "openbao/openbao" => Some("https://openbao.github.io/openbao-helm"),
         "strimzi/strimzi-kafka-operator" => Some("https://strimzi.io/charts/"),
+        "spark-operator/spark-operator" => Some("https://kubeflow.github.io/spark-operator"),
         _ => None,
     }
 }
@@ -559,6 +567,15 @@ mod tests {
         assert_eq!(
             chart_version("strimzi/strimzi-kafka-operator"),
             Some("1.3.1")
+        );
+        assert_eq!(names(&plan), vec!["cnpg", "kafka", "spark-operator"]);
+        assert_eq!(
+            chart_version("spark-operator/spark-operator"),
+            Some("2.5.2")
+        );
+        assert_eq!(
+            chart_repo("spark-operator/spark-operator"),
+            Some("https://kubeflow.github.io/spark-operator")
         );
     }
 
