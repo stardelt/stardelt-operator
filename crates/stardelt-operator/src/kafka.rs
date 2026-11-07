@@ -1,4 +1,4 @@
-//! The streaming bus (D42): one KRaft Kafka on Strimzi, one combined controller and broker node pool. Pure builders; no topic, no user, no `StreamApp`.
+//! The streaming bus (D42): one KRaft Kafka on Strimzi, one combined controller and broker node pool. Pure builders; no user, no `StreamApp`. A `StreamApp` on the internal bus creates its own `KafkaTopic`.
 
 use kube::api::{DynamicObject, ObjectMeta, TypeMeta};
 use serde_json::json;

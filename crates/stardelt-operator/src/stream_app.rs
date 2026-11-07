@@ -22,6 +22,11 @@ use crate::spark;
 pub const JOB_FILE: &str = "stream.py";
 pub const JOB_MOUNT: &str = "/opt/job";
 
+/// The bus the streaming pillar installs (`kafka.rs`: `Kafka` `kafka`, plain listener 9092).
+pub fn internal_bootstrap(namespace: &str) -> String {
+    format!("kafka-kafka-bootstrap.{namespace}.svc.cluster.local:9092")
+}
+
 fn labels() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -64,6 +69,32 @@ fn resolve_run_as(spec: &StreamAppSpec) -> Result<String, String> {
         return Ok(format!("pipeline-{group}"));
     }
     Err("runAs is required (or set ownerGroup to derive pipeline-<group>)".to_string())
+}
+
+pub fn kafka_topic(_app: &str, topic: &str, owner: &OwnerReference) -> DynamicObject {
+    let mut topic_labels = labels();
+    topic_labels.insert("strimzi.io/cluster".to_string(), "kafka".to_string());
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "kafka.strimzi.io/v1".into(),
+            kind: "KafkaTopic".into(),
+        }),
+        metadata: ObjectMeta {
+            name: Some(topic.to_string()),
+            labels: Some(topic_labels),
+            owner_references: Some(vec![owner.clone()]),
+            ..Default::default()
+        },
+        data: json!({
+            "spec": {
+                "partitions": 1,
+                "replicas": 1,
+                "config": {
+                    "retention.ms": "604800000"
+                }
+            }
+        }),
+    }
 }
 
 pub fn spark_application(
@@ -267,23 +298,43 @@ pub async fn reconcile_stream_app(
         return Ok(Action::requeue(Duration::from_secs(300)));
     }
 
-    let conn_name = &app.spec.source.connection_ref;
-    let conn = Api::<Connection>::namespaced(ctx.client.clone(), &namespace)
-        .get(conn_name)
-        .await;
-    let bootstrap = match conn {
-        Ok(c) => c.spec.config.get("bootstrapServers").cloned(),
-        Err(e) if is_not_found(&e) => None,
-        Err(e) => return Err(e),
-    };
-    let Some(bootstrap) = bootstrap else {
-        let msg = format!("source Connection {conn_name} has no config.bootstrapServers");
-        patch_stream_status(&apps, &name, generation, previous, "Failed", Some(msg)).await?;
-        return Ok(Action::requeue(Duration::from_secs(60)));
+    let (bootstrap, create_topic) = match app.spec.source.connection_ref.as_deref() {
+        Some(conn_name) => {
+            let conn = Api::<Connection>::namespaced(ctx.client.clone(), &namespace)
+                .get(conn_name)
+                .await;
+            let bootstrap = match conn {
+                Ok(c) => c.spec.config.get("bootstrapServers").cloned(),
+                Err(e) if is_not_found(&e) => None,
+                Err(e) => return Err(e),
+            };
+            match bootstrap {
+                Some(b) => (b, false),
+                None => {
+                    let msg =
+                        format!("source Connection {conn_name} has no config.bootstrapServers");
+                    patch_stream_status(&apps, &name, generation, previous, "Failed", Some(msg))
+                        .await?;
+                    return Ok(Action::requeue(Duration::from_secs(60)));
+                }
+            }
+        }
+        None => (internal_bootstrap(&namespace), true),
     };
 
     let owner = owner_reference(&app);
     let checkpoint = checkpoint_for(&app.spec, &namespace, &name);
+    if create_topic {
+        let topic = kafka_topic(&name, &app.spec.source.topic, &owner);
+        objects::apply_dynamic(
+            &ctx.client,
+            &namespace,
+            &objects::kafka_topic_resource(),
+            &topic,
+            false,
+        )
+        .await?;
+    }
     let cm = job_config_map(&namespace, &name, &owner);
     objects::apply(&ctx.client, &namespace, &cm, false).await?;
     let spark = spark_application(
@@ -375,7 +426,7 @@ mod tests {
     fn spec(mode: SinkMode, merge_keys: Vec<&str>) -> StreamAppSpec {
         StreamAppSpec {
             source: StreamSource {
-                connection_ref: "kafka-bus".into(),
+                connection_ref: Some("kafka-bus".into()),
                 topic: "orders.v1".into(),
                 format: StreamFormat::Json,
             },
@@ -462,6 +513,33 @@ mod tests {
         let f = spark_application("data", "orders", &failure, "k:9092", "s3a://c/p", &owner())
             .expect("ok");
         assert_eq!(f.data["spec"]["restartPolicy"]["type"], "OnFailure");
+    }
+
+    #[test]
+    fn internal_bootstrap_points_at_the_platform_bus() {
+        assert_eq!(
+            internal_bootstrap("stardelt"),
+            "kafka-kafka-bootstrap.stardelt.svc.cluster.local:9092"
+        );
+    }
+
+    #[test]
+    fn kafka_topic_is_a_strimzi_topic_for_the_cluster() {
+        let topic = kafka_topic("measurements", "pegelonline.measurements", &owner());
+        assert_eq!(
+            topic.types.as_ref().unwrap().api_version,
+            "kafka.strimzi.io/v1"
+        );
+        assert_eq!(topic.types.as_ref().unwrap().kind, "KafkaTopic");
+        assert_eq!(
+            topic
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("strimzi.io/cluster")),
+            Some(&"kafka".to_string())
+        );
+        assert_eq!(topic.data["spec"]["replicas"], 1);
     }
 
     #[test]

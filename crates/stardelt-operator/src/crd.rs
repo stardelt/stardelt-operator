@@ -1823,11 +1823,17 @@ pub enum StreamFormat {
 #[serde(rename_all = "camelCase")]
 pub struct StreamSource {
     /// Name of the `Connection` (`type: kafka`) whose `config.bootstrapServers` the job reads.
+    /// Absent: the platform's own bus, `kafka-kafka-bootstrap.<namespace>.svc.cluster.local:9092`.
+    #[serde(
+        default,
+        rename = "connectionRef",
+        skip_serializing_if = "Option::is_none"
+    )]
     #[schemars(
         length(min = 1, max = 63),
         regex(pattern = r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
     )]
-    pub connection_ref: String,
+    pub connection_ref: Option<String>,
     #[schemars(length(min = 1, max = 249), regex(pattern = r"^[A-Za-z0-9._-]+$"))]
     pub topic: String,
     #[serde(default)]
@@ -4147,5 +4153,33 @@ mod tests {
         assert!(json.get("sink").unwrap().get("checkpointPrefix").is_none());
         assert!(json.get("ownerGroup").is_none());
         assert!(json.get("runAs").is_none());
+    }
+
+    #[test]
+    fn stream_app_without_source_connection_ref_deserialises_to_none() {
+        let spec: StreamAppSpec = serde_json::from_value(serde_json::json!({
+            "source": { "topic": "pegelonline.measurements" },
+            "sink": {
+                "catalog": "shared",
+                "table": "gold.pegelonline_hourly",
+                "mergeKeys": ["station_uuid"]
+            }
+        }))
+        .expect("stream without connectionRef deserialises");
+        assert_eq!(spec.source.connection_ref, None);
+    }
+
+    #[test]
+    fn stream_app_with_source_connection_ref_keeps_it() {
+        let spec: StreamAppSpec = serde_json::from_value(serde_json::json!({
+            "source": { "connectionRef": "kafka-bus", "topic": "pegelonline.measurements" },
+            "sink": {
+                "catalog": "shared",
+                "table": "gold.pegelonline_hourly",
+                "mergeKeys": ["station_uuid"]
+            }
+        }))
+        .expect("stream with connectionRef deserialises");
+        assert_eq!(spec.source.connection_ref.as_deref(), Some("kafka-bus"));
     }
 }
