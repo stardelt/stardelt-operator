@@ -478,6 +478,9 @@ pub struct PlatformInstanceSpec {
     /// Plan only (no cluster changes) until explicitly disabled. Safe default.
     #[serde(default = "default_true", rename = "dryRun")]
     pub dry_run: bool,
+    /// Freeze this resource: no cluster changes, status phase `Paused` (operator#64).
+    #[serde(default, rename = "clusterOperation")]
+    pub cluster_operation: ClusterOperation,
     /// Per-component Helm value overrides for the platform's own components
     /// (today: `cnpg`).
     #[serde(flatten)]
