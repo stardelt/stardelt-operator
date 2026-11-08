@@ -59,6 +59,12 @@ def spark(catalog: str, catalog_uri: str) -> SparkSession:
 
 
 def merge_batch(batch: DataFrame, keys: list[str], target: str) -> None:
+    # A Kafka micro-batch can carry the same merge key twice (a producer retry, or two
+    # messages for one measurement time). Iceberg's MERGE refuses a source with duplicate
+    # ON keys (MERGE_CARDINALITY_VIOLATION) and the checkpoint replays the same batch, so
+    # the stream would fail for ever. The sink is a current-state table: keep one row per
+    # key and let the MERGE update it.
+    batch = batch.dropDuplicates(keys)
     batch.createOrReplaceTempView("batch")
     on = " AND ".join(f"t.{k} = s.{k}" for k in keys)
     columns = batch.columns
