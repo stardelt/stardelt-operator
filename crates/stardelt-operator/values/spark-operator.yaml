@@ -4,6 +4,10 @@
 # pods. With it off, a StreamApp's job ConfigMap mounts nowhere and
 # `local:///opt/job/stream.py` cannot be read (stardelt-operator#314).
 #
+# The 2 Gi memory limit covers the `spark-submit` child JVM the controller starts for every
+# application. At 512 Mi, two submissions at once OOM-killed the controller every ~60 s
+# (exitCode 137, 2026-11-08); the platform's file carries the same number (platform#664).
+#
 # The chart's default is `jobNamespaces: [default]`, so a controller that only sets the release
 # namespace never looks at the `StreamApp`s beside it (platform#608, operator path). The empty
 # string means every namespace: the install namespace is not known when this file is compiled in.
@@ -18,6 +22,6 @@ controller:
       memory: 256Mi
     limits:
       cpu: 500m
-      memory: 512Mi
+      memory: 2Gi
 webhook:
   enable: true
