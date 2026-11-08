@@ -281,6 +281,14 @@ mod tests {
     }
 
     #[test]
+    fn the_spark_operator_keeps_the_submission_webhook_and_memory_budget() {
+        let v = crate::values::golden_values("spark-operator");
+        assert_eq!(v["webhook"]["enable"], true);
+        assert_eq!(v["controller"]["resources"]["limits"]["memory"], "2Gi");
+        assert_eq!(v["controller"]["resources"]["requests"]["memory"], "256Mi");
+    }
+
+    #[test]
     fn openfga_golden_values_mirror_the_platform_shape() {
         let o = golden_values("openfga");
         assert_eq!(
