@@ -336,6 +336,24 @@ pub fn pending_rerun_is_wedged(
         && created.is_some_and(|c| now - c > PENDING_RERUN_GRACE_SECS)
 }
 
+/// A pod the scheduler cannot place: `Pending` with the `PodScheduled` condition `False`
+/// (for example "0/1 nodes are available: 1 Insufficient cpu"). A driver can be `RUNNING`
+/// while every executor waits like this, and Spark reports the application as healthy —
+/// so the stream must say it is not doing work (`#320`'s observability sibling).
+pub fn pod_unschedulable(pod: &Pod) -> bool {
+    let Some(status) = pod.status.as_ref() else {
+        return false;
+    };
+    if status.phase.as_deref() != Some("Pending") {
+        return false;
+    }
+    status.conditions.as_ref().is_some_and(|conditions| {
+        conditions
+            .iter()
+            .any(|c| c.type_ == "PodScheduled" && c.status == "False")
+    })
+}
+
 /// The v2 controller refuses to retry when the interval fields are absent (`invalid retry
 /// interval`), even when `type` is set, so both failure paths carry explicit values.
 fn restart_policy(restart: &str) -> serde_json::Value {
@@ -638,6 +656,18 @@ pub async fn reconcile_stream_app(
                     })),
                 )
                 .await?;
+            }
+
+            // A driver can be RUNNING while its executor cannot be scheduled. Spark keeps
+            // the application healthy, so without this the stream reads as Running while
+            // it processes nothing. Nova shows the Ready reason as a badge.
+            if phase == "Running" && reason == "Running" {
+                let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
+                let selector = format!("sparkoperator.k8s.io/app-name={name},spark-role=executor");
+                let executors = pods.list(&ListParams::default().labels(&selector)).await?;
+                if executors.items.iter().any(pod_unschedulable) {
+                    reason = "ExecutorsUnschedulable";
+                }
             }
 
             (
@@ -1408,6 +1438,27 @@ mod tests {
         assert!(!pending_rerun_is_wedged(Some("RUNNING"), 0, Some(0), 999));
     }
 
+    #[test]
+    fn a_pending_executor_is_unschedulable() {
+        use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
+        let pod = |phase: &str, scheduled: &str| Pod {
+            status: Some(PodStatus {
+                phase: Some(phase.into()),
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".into(),
+                    status: scheduled.into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(pod_unschedulable(&pod("Pending", "False")));
+        assert!(!pod_unschedulable(&pod("Pending", "True")));
+        assert!(!pod_unschedulable(&pod("Running", "True")));
+        assert!(!pod_unschedulable(&Pod::default()));
+    }
+
     #[tokio::test]
     async fn a_crash_looping_running_application_reports_restarting() {
         let recent = k8s_openapi::jiff::Timestamp::now().to_string();
@@ -1472,6 +1523,13 @@ mod tests {
                 return (
                     200,
                     r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data"},"status":{"applicationState":{"state":"RUNNING","errorMessage":"boom"},"executionAttempts":4,"lastSubmissionAttemptTime":"2020-01-01T00:00:00Z"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/pods") {
+                // The executor lookup: no executor is pending, so the stream stays Running.
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"PodList","items":[]}"#.into(),
                 );
             }
             if method == "PATCH" && path.contains("/streamapps/orders/status") {
