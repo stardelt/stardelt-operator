@@ -2111,6 +2111,108 @@ pub struct CatalogStorage {
     pub credential_secret_ref: Option<SecretKeySelector>,
 }
 
+/// `Catalog.spec.maintenance`: the automatic Iceberg table maintenance policy (platform#129).
+/// On by default and conservative; `excludeTables` opts a table out.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct MaintenanceSpec {
+    /// Five-field cron; the default is 02:00 every day.
+    #[serde(default = "default_maintenance_schedule")]
+    #[schemars(regex(pattern = r"^(\S+\s+){4}\S+$"))]
+    pub schedule: String,
+    #[serde(default)]
+    pub optimize: OptimizeSpec,
+    #[serde(default, rename = "expireSnapshots")]
+    pub expire_snapshots: ExpireSnapshotsSpec,
+    #[serde(default, rename = "removeOrphanFiles")]
+    pub remove_orphan_files: RemoveOrphanFilesSpec,
+    /// Tables (`schema.table`) this policy never touches.
+    #[serde(default, rename = "excludeTables")]
+    #[schemars(length(max = 100))]
+    pub exclude_tables: Vec<String>,
+}
+
+fn default_maintenance_schedule() -> String {
+    "0 2 * * *".to_string()
+}
+
+impl Default for MaintenanceSpec {
+    fn default() -> Self {
+        Self {
+            schedule: default_maintenance_schedule(),
+            optimize: OptimizeSpec::default(),
+            expire_snapshots: ExpireSnapshotsSpec::default(),
+            remove_orphan_files: RemoveOrphanFilesSpec::default(),
+            exclude_tables: Vec::new(),
+        }
+    }
+}
+
+/// Compaction: files smaller than the threshold are rewritten when at least `minSmallFiles` exist.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct OptimizeSpec {
+    #[serde(default = "default_file_size_threshold", rename = "fileSizeThreshold")]
+    #[schemars(regex(pattern = r"^[1-9][0-9]*(MB|GB)$"))]
+    pub file_size_threshold: String,
+    #[serde(default = "default_min_small_files", rename = "minSmallFiles")]
+    #[schemars(range(min = 0))]
+    pub min_small_files: i32,
+}
+
+fn default_file_size_threshold() -> String {
+    "128MB".to_string()
+}
+
+fn default_min_small_files() -> i32 {
+    20
+}
+
+impl Default for OptimizeSpec {
+    fn default() -> Self {
+        Self {
+            file_size_threshold: default_file_size_threshold(),
+            min_small_files: default_min_small_files(),
+        }
+    }
+}
+
+/// Snapshot expiry. The engine's minimum is 7 days (`iceberg.expire-snapshots.min-retention`),
+/// so `retention` is a minimum, not a preference.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ExpireSnapshotsSpec {
+    #[serde(default = "default_retention")]
+    #[schemars(regex(pattern = r"^[1-9][0-9]*d$"))]
+    pub retention: String,
+}
+
+/// Orphan-file removal. The engine's minimum is 7 days
+/// (`iceberg.remove-orphan-files.min-retention`).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct RemoveOrphanFilesSpec {
+    #[serde(default = "default_retention")]
+    #[schemars(regex(pattern = r"^[1-9][0-9]*d$"))]
+    pub retention: String,
+}
+
+fn default_retention() -> String {
+    "7d".to_string()
+}
+
+impl Default for ExpireSnapshotsSpec {
+    fn default() -> Self {
+        Self {
+            retention: default_retention(),
+        }
+    }
+}
+
+impl Default for RemoveOrphanFilesSpec {
+    fn default() -> Self {
+        Self {
+            retention: default_retention(),
+        }
+    }
+}
+
 /// One data domain inside the catalog software of a `Lakehouse`: its storage, its owner and its
 /// grants. `metadata.name` is the name users type (`finance.orders`) and the name of the
 /// catalog's warehouse; there is no alias.
@@ -2161,6 +2263,10 @@ pub struct CatalogDomainSpec {
     /// True: the owner cannot grant on this catalog; only platform administrators can.
     #[serde(default, rename = "managedAccess")]
     pub managed_access: bool,
+    /// The automatic Iceberg maintenance policy (platform#129): compaction, snapshot expiry and
+    /// orphan-file removal, daily at 02:00 unless changed. On by default.
+    #[serde(default)]
+    pub maintenance: MaintenanceSpec,
 }
 
 /// Trino catalog names that are taken by the engine or by the platform.
@@ -4046,6 +4152,42 @@ mod tests {
         assert!(
             !yaml.contains("secretKey:") && !yaml.contains("password"),
             "no field holds a credential"
+        );
+    }
+
+    #[test]
+    fn catalog_maintenance_is_on_by_default_and_conservative() {
+        let c: Catalog = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Catalog",
+            "metadata": { "name": "finance", "namespace": "stardelt" },
+            "spec": { "lakehouseRef": { "name": "default" }, "owner": "analytics" }
+        }))
+        .expect("deserialize Catalog");
+        let m = &c.spec.maintenance;
+        assert_eq!(m.schedule, "0 2 * * *");
+        assert_eq!(m.optimize.file_size_threshold, "128MB");
+        assert_eq!(m.optimize.min_small_files, 20);
+        assert_eq!(m.expire_snapshots.retention, "7d");
+        assert_eq!(m.remove_orphan_files.retention, "7d");
+        assert!(m.exclude_tables.is_empty());
+    }
+
+    #[test]
+    fn catalog_crd_carries_the_maintenance_defaults() {
+        let yaml = serde_yaml::to_string(&Catalog::crd()).unwrap();
+        for key in [
+            "fileSizeThreshold",
+            "minSmallFiles",
+            "expireSnapshots",
+            "removeOrphanFiles",
+            "excludeTables",
+        ] {
+            assert!(yaml.contains(key), "the catalog CRD is missing {key}");
+        }
+        assert!(
+            yaml.contains("0 2 * * *"),
+            "the default schedule is in the schema"
         );
     }
 
