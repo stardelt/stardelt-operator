@@ -593,6 +593,9 @@ mod tests {
         let script = data.get("stream.py").expect("stream.py");
         assert!(script.starts_with("\"\"\"A StreamApp:"), "{script}");
         assert!(script.contains("from_json"));
+        // Both sink modes must wait for the query: `append` used to return from main()
+        // after `toTable()`, so the driver exited after the first batch (this ticket).
+        assert_eq!(script.matches("awaitTermination").count(), 2, "{script}");
     }
 
     #[test]

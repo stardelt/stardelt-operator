@@ -118,9 +118,13 @@ def main() -> None:
     )
 
     if a.mode == "append":
-        rows.writeStream.format("iceberg").outputMode("append").option(
-            "checkpointLocation", a.checkpoint
-        ).toTable(target)
+        (
+            rows.writeStream.format("iceberg")
+            .outputMode("append")
+            .option("checkpointLocation", a.checkpoint)
+            .toTable(target)
+            .awaitTermination()
+        )
         return
 
     keys = [k for k in a.merge_keys.split(",") if k]
