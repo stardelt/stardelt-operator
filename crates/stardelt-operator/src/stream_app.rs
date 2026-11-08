@@ -378,7 +378,11 @@ fn ready_condition(
     previous: Option<&Condition>,
     now: &str,
 ) -> Condition {
-    let status = if phase == "Running" { "True" } else { "False" };
+    let status = if phase == "Running" && reason != "ExecutorsUnschedulable" {
+        "True"
+    } else {
+        "False"
+    };
     let last_transition_time = match previous {
         Some(p) if p.status == status => p.last_transition_time.clone(),
         _ => Some(now.to_string()),
@@ -1605,5 +1609,20 @@ mod tests {
             stream_state(Some("COMPLETED"), 1, None, now),
             ("Stopped", "Stopped")
         );
+    }
+
+    #[test]
+    fn an_unschedulable_executor_is_not_ready() {
+        let now = "2026-11-08T00:00:00Z";
+        let running = ready_condition("Running", "Running", Some(3), None, now);
+        assert_eq!(running.status, "True");
+        assert_eq!(running.reason.as_deref(), Some("Running"));
+
+        let stalled = ready_condition("Running", "ExecutorsUnschedulable", Some(3), None, now);
+        assert_eq!(stalled.status, "False");
+        assert_eq!(stalled.reason.as_deref(), Some("ExecutorsUnschedulable"));
+
+        let pending = ready_condition("Pending", "Pending", Some(3), None, now);
+        assert_eq!(pending.status, "False");
     }
 }
