@@ -147,6 +147,8 @@ pub fn topic_satisfied(existing: &[DynamicObject], topic: &str, desired: &Dynami
     })
 }
 
+/// The request is half a core so two streams fit on the 8-CPU dev node; the CPU limit stays
+/// a full core (`coreLimit` on the driver, `cores` on the executor).
 pub fn spark_application(
     namespace: &str,
     app: &str,
@@ -242,6 +244,7 @@ pub fn spark_application(
                 "sparkConf": spark_conf,
                 "driver": {
                     "cores": 1,
+                    "coreRequest": "500m",
                     "coreLimit": "1200m",
                     "memory": "2g",
                     "memoryOverhead": "1g",
@@ -258,6 +261,7 @@ pub fn spark_application(
                 },
                 "executor": {
                     "cores": 1,
+                    "coreRequest": "500m",
                     "instances": 1,
                     "memory": "2g",
                     "memoryOverhead": "1g",
@@ -1105,6 +1109,7 @@ mod tests {
         let a =
             spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
         for part in ["driver", "executor"] {
+            assert_eq!(a.data["spec"][part]["coreRequest"], "500m", "{part}");
             assert_eq!(a.data["spec"][part]["memory"], "2g", "{part}");
             assert_eq!(a.data["spec"][part]["memoryOverhead"], "1g", "{part}");
         }
