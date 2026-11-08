@@ -145,6 +145,12 @@
     "status": {
       "nullable": true,
       "properties": {
+        "attempts": {
+          "description": "How many times Spark has submitted the application\n(`SparkApplication.status.executionAttempts`); absent until it exists.",
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
         "conditions": {
           "default": [],
           "items": {
@@ -186,6 +192,11 @@
           "type": "string"
         },
         "lastError": {
+          "nullable": true,
+          "type": "string"
+        },
+        "lastSubmittedAt": {
+          "description": "When Spark last submitted the application (RFC 3339), from\n`SparkApplication.status.lastSubmissionAttemptTime`.",
           "nullable": true,
           "type": "string"
         },

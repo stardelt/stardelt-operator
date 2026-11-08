@@ -324,6 +324,7 @@ fn ready_condition(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn patch_stream_status(
     apps: &Api<StreamApp>,
     name: &str,
@@ -332,12 +333,16 @@ async fn patch_stream_status(
     phase: &str,
     reason: &str,
     last_error: Option<String>,
+    attempts: Option<i64>,
+    last_submitted_at: Option<String>,
 ) -> Result<(), kube::Error> {
     let now = now_rfc3339();
     let status = StreamAppStatus {
         phase: phase.into(),
         last_checkpoint_at: None,
         last_error,
+        attempts,
+        last_submitted_at,
         conditions: vec![ready_condition(phase, reason, generation, previous, &now)],
         observed_generation: generation,
     };
@@ -382,7 +387,7 @@ pub async fn reconcile_stream_app(
             Err(e) => return Err(e),
         }
         patch_stream_status(
-            &apps, &name, generation, previous, "Stopped", "Stopped", None,
+            &apps, &name, generation, previous, "Stopped", "Stopped", None, None, None,
         )
         .await?;
         tracing::info!(stream = %name, %namespace, "stream stopped");
@@ -412,6 +417,8 @@ pub async fn reconcile_stream_app(
                         "Failed",
                         "Failed",
                         Some(msg),
+                        None,
+                        None,
                     )
                     .await?;
                     return Ok(Action::requeue(Duration::from_secs(60)));
@@ -476,7 +483,8 @@ pub async fn reconcile_stream_app(
         &namespace,
         &objects::spark_application_resource(),
     );
-    let (phase, reason, last_error) = match spark_api.get(&name).await {
+    let (phase, reason, last_error, attempts, last_submitted_at) = match spark_api.get(&name).await
+    {
         Ok(obj) => {
             let state = obj
                 .data
@@ -507,21 +515,42 @@ pub async fn reconcile_stream_app(
                 .data
                 .get("status")
                 .and_then(|s| s.get("lastSubmissionAttemptTime"))
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             let (phase, reason) = stream_state(
                 state,
                 execution_attempts,
-                last_submission,
+                last_submission.as_deref(),
                 k8s_openapi::jiff::Timestamp::now(),
             );
-            (phase.to_string(), reason.to_string(), err_msg)
+            (
+                phase.to_string(),
+                reason.to_string(),
+                err_msg,
+                Some(execution_attempts),
+                last_submission,
+            )
         }
-        Err(e) if is_not_found(&e) => ("Pending".to_string(), "Pending".to_string(), None),
+        Err(e) if is_not_found(&e) => (
+            "Pending".to_string(),
+            "Pending".to_string(),
+            None,
+            None,
+            None,
+        ),
         Err(e) => return Err(e),
     };
 
     patch_stream_status(
-        &apps, &name, generation, previous, &phase, &reason, last_error,
+        &apps,
+        &name,
+        generation,
+        previous,
+        &phase,
+        &reason,
+        last_error,
+        attempts,
+        last_submitted_at,
     )
     .await?;
     tracing::info!(stream = %name, %namespace, %phase, %reason, "reconciled");
@@ -1095,6 +1124,8 @@ mod tests {
         assert!(log.contains("\"phase\":\"Running\""), "{log}");
         assert!(log.contains("\"reason\":\"Restarting\""), "{log}");
         assert!(log.contains("\"lastError\":\"boom\""), "{log}");
+        assert!(log.contains("\"attempts\":4"), "{log}");
+        assert!(log.contains("\"lastSubmittedAt\":\"20"), "{log}");
     }
 
     #[tokio::test]

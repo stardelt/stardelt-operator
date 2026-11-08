@@ -1913,6 +1913,18 @@ pub struct StreamAppStatus {
     pub last_checkpoint_at: Option<String>,
     #[serde(default, rename = "lastError", skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// How many times Spark has submitted the application
+    /// (`SparkApplication.status.executionAttempts`); absent until it exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts: Option<i64>,
+    /// When Spark last submitted the application (RFC 3339), from
+    /// `SparkApplication.status.lastSubmissionAttemptTime`.
+    #[serde(
+        default,
+        rename = "lastSubmittedAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_submitted_at: Option<String>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
     #[serde(
