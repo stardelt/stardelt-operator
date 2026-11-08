@@ -131,6 +131,22 @@ pub fn topic_owner(existing: &[DynamicObject], topic: &str) -> Option<String> {
     })
 }
 
+/// Whether an existing `KafkaTopic` already satisfies `desired`: it manages the same
+/// topic and its `spec` is what the operator would apply. The object's name may differ
+/// (the demo applies `pegelonline-continuous` for the topic `pegelonline.continuous`),
+/// and the operator writes nothing in either case. A spec that differs is a real
+/// conflict and must stay a warning (`#320`).
+pub fn topic_satisfied(existing: &[DynamicObject], topic: &str, desired: &DynamicObject) -> bool {
+    existing.iter().any(|t| {
+        let effective = t
+            .data
+            .pointer("/spec/topicName")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| t.metadata.name.as_deref().unwrap_or(""));
+        effective == topic && t.data.get("spec") == desired.data.get("spec")
+    })
+}
+
 pub fn spark_application(
     namespace: &str,
     app: &str,
@@ -471,10 +487,19 @@ pub async fn reconcile_stream_app(
         let own = topic.name_any();
         match topic_owner(&existing, &app.spec.source.topic) {
             Some(other) if other != own => {
-                tracing::warn!(
-                    stream = %name, %namespace, topic = %app.spec.source.topic, owner = %other,
-                    "topic is already managed by another KafkaTopic; not applying ours"
-                );
+                if topic_satisfied(&existing, &app.spec.source.topic, &topic) {
+                    // Nothing to apply: the topic exists with the spec we want. Debug, not
+                    // warn — the reconcile runs every 60 s on a healthy stream (#320).
+                    tracing::debug!(
+                        stream = %name, %namespace, topic = %app.spec.source.topic, owner = %other,
+                        "topic is already managed by an identical KafkaTopic; nothing to apply"
+                    );
+                } else {
+                    tracing::warn!(
+                        stream = %name, %namespace, topic = %app.spec.source.topic, owner = %other,
+                        "topic is already managed by another KafkaTopic with a different spec; not applying ours"
+                    );
+                }
             }
             _ => {
                 objects::apply_dynamic(
@@ -821,6 +846,31 @@ mod tests {
             Some("stream-producer")
         );
         assert_eq!(topic_owner(&[], "orders_v1"), None);
+    }
+
+    #[test]
+    fn an_identical_kafka_topic_satisfies_the_requirement() {
+        // What the operator would apply, and what the demo applied by hand: same topic,
+        // same spec, a different object name.
+        let desired = kafka_topic("pegelonline-continuous", "pegelonline.continuous", &owner());
+        let mut same = kafka_topic("pegelonline-continuous", "pegelonline.continuous", &owner());
+        same.metadata.name = Some("pegelonline-continuous".into());
+        same.metadata.owner_references = None;
+        assert!(topic_satisfied(
+            &[same.clone()],
+            "pegelonline.continuous",
+            &desired
+        ));
+
+        // A different retention is a real conflict: the warning must stay.
+        let mut different = same;
+        different.data["spec"]["config"]["retention.ms"] = serde_json::json!("86400000");
+        assert!(!topic_satisfied(
+            &[different],
+            "pegelonline.continuous",
+            &desired
+        ));
+        assert!(!topic_satisfied(&[], "pegelonline.continuous", &desired));
     }
 
     #[test]
