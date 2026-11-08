@@ -845,6 +845,25 @@ mod tests {
     }
 
     #[test]
+    fn the_merge_sink_keeps_the_newest_kafka_offset() {
+        let cm = job_config_map("data", "orders", &owner());
+        let data = cm.data.expect("data");
+        let script = data.get("stream.py").expect("stream.py");
+        assert!(
+            script.contains("Window.partitionBy(*keys)"),
+            "the dedupe window is gone from stream_job.py: {script}"
+        );
+        assert!(
+            script.contains(r#".orderBy(F.col("_kafka_offset").desc())"#),
+            "the dedupe no longer keeps the newest Kafka offset: {script}"
+        );
+        assert!(
+            !script.contains("dropDuplicates"),
+            "dropDuplicates keeps an arbitrary row (#368); the newest offset must win: {script}"
+        );
+    }
+
+    #[test]
     fn the_application_is_cluster_mode_and_mounts_the_job() {
         let s = spec(SinkMode::Merge, vec!["id"]);
         let app = spark_application("data", "orders", &s, "kafka:9092", "s3a://c/p", &owner())
