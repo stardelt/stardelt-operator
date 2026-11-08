@@ -184,7 +184,8 @@ pub fn spark_application(
                 "driver": {
                     "cores": 1,
                     "coreLimit": "1200m",
-                    "memory": "1g",
+                    "memory": "2g",
+                    "memoryOverhead": "1g",
                     "serviceAccount": "spark-connect",
                     "env": [
                         {"name": "CATALOG_CLIENT_ID", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-id"}}},
@@ -199,7 +200,8 @@ pub fn spark_application(
                 "executor": {
                     "cores": 1,
                     "instances": 1,
-                    "memory": "1g",
+                    "memory": "2g",
+                    "memoryOverhead": "1g",
                     "volumeMounts": [{"name": "job", "mountPath": JOB_MOUNT}],
                 },
                 "volumes": [{"name": "job", "configMap": {"name": format!("{app}-job")}}],
@@ -746,6 +748,17 @@ mod tests {
             a.data["spec"]["sparkConf"]["spark.sql.extensions"],
             "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
         );
+    }
+
+    #[test]
+    fn the_stream_has_room_above_the_jvm_heap() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a =
+            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        for part in ["driver", "executor"] {
+            assert_eq!(a.data["spec"][part]["memory"], "2g", "{part}");
+            assert_eq!(a.data["spec"][part]["memoryOverhead"], "1g", "{part}");
+        }
     }
 
     #[test]
