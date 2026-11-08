@@ -1,13 +1,18 @@
 # The Strimzi cluster operator. It runs one controller pod that watches this namespace; the
 # Kafka broker is a `Kafka` resource (created when a stream needs one), not part of the chart.
-# The chart's defaults ask for 200m/384Mi; the dev node is shared, so the request is halved and
-# the memory limit kept — the operator idles.
+#
+# The resources are the chart's own defaults (strimzi-kafka-operator 1.3.1): requests
+# 200m/384Mi, limits 1 CPU/384Mi. `stardelt-platform` `install-kafka` installs the same chart
+# with no values, so this file must not lower them — the two install paths render one
+# component (`operator#216`, `operator#242`). A halved CPU request (100m) is the first pod
+# throttled when two Spark drivers start on the shared node, and the controller's Kubernetes
+# probes have a 1 s timeout, so throttling shows up as a liveness restart.
 replicas: 1
 watchAnyNamespace: false
 resources:
   requests:
-    cpu: 100m
-    memory: 256Mi
+    cpu: 200m
+    memory: 384Mi
   limits:
-    cpu: 500m
+    cpu: "1"
     memory: 384Mi

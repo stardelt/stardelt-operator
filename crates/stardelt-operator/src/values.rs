@@ -289,6 +289,17 @@ mod tests {
     }
 
     #[test]
+    fn the_strimzi_operator_matches_the_chart_and_the_platform_path() {
+        // stardelt-platform install-kafka installs this chart with no values, so the chart's
+        // defaults are the platform path; the operator path must not lower them (operator#216).
+        let v = crate::values::golden_values("kafka");
+        assert_eq!(v["resources"]["requests"]["cpu"], "200m");
+        assert_eq!(v["resources"]["requests"]["memory"], "384Mi");
+        assert_eq!(v["resources"]["limits"]["cpu"], "1");
+        assert_eq!(v["resources"]["limits"]["memory"], "384Mi");
+    }
+
+    #[test]
     fn openfga_golden_values_mirror_the_platform_shape() {
         let o = golden_values("openfga");
         assert_eq!(
