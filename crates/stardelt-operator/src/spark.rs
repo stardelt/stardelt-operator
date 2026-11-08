@@ -77,6 +77,8 @@ pub fn service_account(namespace: &str) -> ServiceAccount {
     }
 }
 
+/// The `deletecollection` grants are what Spark's Kubernetes client needs to clean up after a
+/// driver exits.
 pub fn role(namespace: &str) -> Role {
     Role {
         metadata: meta_with_name_labels(NAME, namespace),
@@ -97,7 +99,13 @@ pub fn role(namespace: &str) -> Role {
             PolicyRule {
                 api_groups: Some(vec!["".into()]),
                 resources: Some(vec!["services".into()]),
-                verbs: vec!["get".into(), "create".into(), "delete".into()],
+                verbs: vec![
+                    "get".into(),
+                    "list".into(),
+                    "create".into(),
+                    "delete".into(),
+                    "deletecollection".into(),
+                ],
                 ..PolicyRule::default()
             },
             PolicyRule {
@@ -109,6 +117,19 @@ pub fn role(namespace: &str) -> Role {
                     "create".into(),
                     "update".into(),
                     "delete".into(),
+                    "deletecollection".into(),
+                ],
+                ..PolicyRule::default()
+            },
+            PolicyRule {
+                api_groups: Some(vec!["".into()]),
+                resources: Some(vec!["persistentvolumeclaims".into()]),
+                verbs: vec![
+                    "get".into(),
+                    "list".into(),
+                    "create".into(),
+                    "delete".into(),
+                    "deletecollection".into(),
                 ],
                 ..PolicyRule::default()
             },
@@ -454,7 +475,7 @@ mod tests {
     fn the_role_manages_pods_and_nothing_cluster_wide() {
         let r = role("stardelt");
         let rules = r.rules.as_ref().unwrap();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 4);
         // pods
         assert_eq!(rules[0].api_groups.as_ref().unwrap(), &vec!["".to_string()]);
         assert_eq!(
@@ -481,8 +502,10 @@ mod tests {
             rules[1].verbs,
             vec![
                 "get".to_string(),
+                "list".to_string(),
                 "create".to_string(),
-                "delete".to_string()
+                "delete".to_string(),
+                "deletecollection".to_string()
             ]
         );
         // configmaps
@@ -497,7 +520,23 @@ mod tests {
                 "list".to_string(),
                 "create".to_string(),
                 "update".to_string(),
-                "delete".to_string()
+                "delete".to_string(),
+                "deletecollection".to_string()
+            ]
+        );
+        // persistentvolumeclaims
+        assert_eq!(
+            rules[3].resources.as_ref().unwrap(),
+            &vec!["persistentvolumeclaims".to_string()]
+        );
+        assert_eq!(
+            rules[3].verbs,
+            vec![
+                "get".to_string(),
+                "list".to_string(),
+                "create".to_string(),
+                "delete".to_string(),
+                "deletecollection".to_string()
             ]
         );
         // no cluster wide
