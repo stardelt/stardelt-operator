@@ -8,6 +8,7 @@
 //! cluster.
 
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 
 /// One component to install.
@@ -147,6 +148,17 @@ impl HelmRelease {
             "json".into(),
         ]
     }
+
+    /// `helm get manifest` — the rendered objects of the deployed release.
+    pub fn manifest_args(&self) -> Vec<String> {
+        vec![
+            "get".into(),
+            "manifest".into(),
+            self.name.clone(),
+            "--namespace".into(),
+            self.namespace.clone(),
+        ]
+    }
 }
 
 /// True when `helm status -o json` output reports the release as `deployed`.
@@ -159,6 +171,43 @@ pub fn is_deployed(status_json: &str) -> bool {
 /// True when any revision in `helm history -o json` output carries [`OWNER_MARKER`].
 pub fn is_owned(history_json: &str) -> bool {
     history_json.contains(OWNER_MARKER)
+}
+
+/// One workload a Helm release rendered: enough to scale it and to find it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedWorkload {
+    /// `Deployment` or `StatefulSet`.
+    pub kind: String,
+    pub name: String,
+}
+
+/// The Deployments and StatefulSets in a `helm get manifest` document, in manifest
+/// order. Every other kind is ignored, including empty documents (the output starts
+/// with a `---` separator and a comment).
+pub fn rendered_workloads(manifest: &str) -> anyhow::Result<Vec<RenderedWorkload>> {
+    let mut workloads = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(manifest) {
+        let value = serde_yaml::Value::deserialize(document)?;
+        let Some(kind) = value.get("kind").and_then(|kind| kind.as_str()) else {
+            continue;
+        };
+        if kind != "Deployment" && kind != "StatefulSet" {
+            continue;
+        }
+        let name = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("name"))
+            .and_then(|name| name.as_str())
+            .unwrap_or_default();
+        if name.is_empty() {
+            anyhow::bail!("a rendered {kind} has no metadata.name");
+        }
+        workloads.push(RenderedWorkload {
+            kind: kind.to_string(),
+            name: name.to_string(),
+        });
+    }
+    Ok(workloads)
 }
 
 /// Runs helm. `Vec<String>` args (no shell), so nothing is interpolated.
@@ -454,5 +503,37 @@ mod tests {
                 "json"
             ]
         );
+    }
+
+    #[test]
+    fn manifest_args_name_the_release_and_namespace() {
+        assert_eq!(
+            release(false).manifest_args(),
+            vec!["get", "manifest", "seaweedfs", "--namespace", "stardelt"]
+        );
+    }
+
+    #[test]
+    fn rendered_workloads_names_deployments_and_statefulsets() {
+        let manifest = "---\napiVersion: v1\nkind: Service\nmetadata:\n  name: seaweedfs\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: seaweedfs-master\n  namespace: stardelt\n---\napiVersion: apps/v1\nkind: StatefulSet\nmetadata:\n  name: seaweedfs-volume\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: seaweedfs-config\n";
+        assert_eq!(
+            rendered_workloads(manifest).expect("parse manifest"),
+            vec![
+                RenderedWorkload {
+                    kind: "Deployment".into(),
+                    name: "seaweedfs-master".into()
+                },
+                RenderedWorkload {
+                    kind: "StatefulSet".into(),
+                    name: "seaweedfs-volume".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rendered_workload_without_a_name_is_an_error() {
+        let manifest = "apiVersion: apps/v1\nkind: Deployment\nmetadata: {}\n";
+        assert!(rendered_workloads(manifest).is_err());
     }
 }
