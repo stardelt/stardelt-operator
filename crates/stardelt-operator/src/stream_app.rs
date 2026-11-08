@@ -257,6 +257,39 @@ fn now_rfc3339() -> String {
     k8s_openapi::jiff::Timestamp::now().to_string()
 }
 
+/// How long a just-(re)submitted application counts as `Restarting`. Spark resubmits a
+/// failed streaming app within seconds; a submission that has run this long is healthy
+/// again even though its cumulative `executionAttempts` stays > 1 (operator#322, this ticket).
+const RESTART_WINDOW_SECS: i64 = 600;
+
+/// The `phase` and `Ready` reason for a `SparkApplication` status.
+pub fn stream_state(
+    state: Option<&str>,
+    execution_attempts: i64,
+    last_submission: Option<&str>,
+    now: k8s_openapi::jiff::Timestamp,
+) -> (&'static str, &'static str) {
+    match state {
+        Some("RUNNING") | Some("SUBMITTED") => {
+            let fresh = last_submission
+                .and_then(|s| s.parse::<k8s_openapi::jiff::Timestamp>().ok())
+                .map(|t| {
+                    let age = now.as_second() - t.as_second();
+                    (0..RESTART_WINDOW_SECS).contains(&age)
+                })
+                .unwrap_or(false);
+            if execution_attempts > 1 && fresh {
+                ("Running", "Restarting")
+            } else {
+                ("Running", "Running")
+            }
+        }
+        Some("COMPLETED") => ("Stopped", "Stopped"),
+        Some("FAILED") | Some("SUBMISSION_FAILED") => ("Failed", "Failed"),
+        _ => ("Pending", "Pending"),
+    }
+}
+
 /// The v2 controller refuses to retry when the interval fields are absent (`invalid retry
 /// interval`), even when `type` is set, so both failure paths carry explicit values.
 fn restart_policy(restart: &str) -> serde_json::Value {
@@ -470,20 +503,18 @@ pub async fn reconcile_stream_app(
                 .and_then(|s| s.get("executionAttempts"))
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            match state {
-                Some("RUNNING") | Some("SUBMITTED") => {
-                    if execution_attempts > 1 {
-                        ("Running".to_string(), "Restarting".to_string(), err_msg)
-                    } else {
-                        ("Running".to_string(), "Running".to_string(), None)
-                    }
-                }
-                Some("COMPLETED") => ("Stopped".to_string(), "Stopped".to_string(), None),
-                Some("FAILED") | Some("SUBMISSION_FAILED") => {
-                    ("Failed".to_string(), "Failed".to_string(), err_msg)
-                }
-                _ => ("Pending".to_string(), "Pending".to_string(), None),
-            }
+            let last_submission = obj
+                .data
+                .get("status")
+                .and_then(|s| s.get("lastSubmissionAttemptTime"))
+                .and_then(|v| v.as_str());
+            let (phase, reason) = stream_state(
+                state,
+                execution_attempts,
+                last_submission,
+                k8s_openapi::jiff::Timestamp::now(),
+            );
+            (phase.to_string(), reason.to_string(), err_msg)
         }
         Err(e) if is_not_found(&e) => ("Pending".to_string(), "Pending".to_string(), None),
         Err(e) => return Err(e),
@@ -1016,7 +1047,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_crash_looping_running_application_reports_restarting() {
-        let (client, requests) = mock_client(|method, path, _body| {
+        let recent = k8s_openapi::jiff::Timestamp::now().to_string();
+        let (client, requests) = mock_client(move |method, path, _body| {
             if method == "GET" && path.contains("/connections/kafka-bus") {
                 return (
                     200,
@@ -1026,7 +1058,9 @@ mod tests {
             if method == "GET" && path.contains("/sparkapplications/orders") {
                 return (
                     200,
-                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data"},"status":{"applicationState":{"state":"RUNNING","errorMessage":"boom"},"executionAttempts":4}}"#.into(),
+                    format!(
+                        r#"{{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{{"name":"orders","namespace":"data"}},"status":{{"applicationState":{{"state":"RUNNING","errorMessage":"boom"}},"executionAttempts":4,"lastSubmissionAttemptTime":"{recent}"}}}}"#
+                    ),
                 );
             }
             if method == "PATCH" && path.contains("/streamapps/orders/status") {
@@ -1058,5 +1092,72 @@ mod tests {
         assert!(log.contains("\"phase\":\"Running\""), "{log}");
         assert!(log.contains("\"reason\":\"Restarting\""), "{log}");
         assert!(log.contains("\"lastError\":\"boom\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_has_run_for_a_while_reports_running() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/connections/kafka-bus") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Connection","metadata":{"name":"kafka-bus","namespace":"data"},"spec":{"scope":"group","ownerGroup":"a","type":"kafka","config":{"bootstrapServers":"kafka:9092"},"secret":{"name":"s","keys":["token"]}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkapplications/orders") {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data"},"status":{"applicationState":{"state":"RUNNING","errorMessage":"boom"},"executionAttempts":4,"lastSubmissionAttemptTime":"2020-01-01T00:00:00Z"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/streamapps/orders/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"connectionRef":"kafka-bus","topic":"orders.v1"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge","mergeKeys":["id"]}},"status":{"phase":"Running"}}"#.into(),
+                );
+            }
+            if method == "PATCH" || method == "POST" || method == "PUT" || method == "CREATE" {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"orders-job","namespace":"data"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"v1","kind":"Status","status":"Success"}"#.into(),
+            )
+        });
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let action = reconcile_stream_app(Arc::new(stream_app(false)), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(log.contains("\"phase\":\"Running\""), "{log}");
+        assert!(log.contains("\"reason\":\"Running\""), "{log}");
+        assert!(!log.contains("\"reason\":\"Restarting\""), "{log}");
+    }
+
+    #[test]
+    fn stream_state_reports_recovered_stream_as_running() {
+        let now = k8s_openapi::jiff::Timestamp::now();
+        assert_eq!(
+            stream_state(Some("RUNNING"), 8, None, now),
+            ("Running", "Running")
+        );
+        assert_eq!(
+            stream_state(Some("RUNNING"), 1, Some(&now.to_string()), now),
+            ("Running", "Running")
+        );
+        assert_eq!(
+            stream_state(Some("FAILED"), 2, None, now),
+            ("Failed", "Failed")
+        );
+        assert_eq!(
+            stream_state(Some("COMPLETED"), 1, None, now),
+            ("Stopped", "Stopped")
+        );
     }
 }
