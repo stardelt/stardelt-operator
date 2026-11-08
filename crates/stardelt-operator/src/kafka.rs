@@ -24,11 +24,14 @@ fn meta(namespace: &str) -> ObjectMeta {
     }
 }
 
-/// `KafkaNodePool` `kafka`: one node that is both controller and broker. Ephemeral storage in
-/// the demo profile (a restart loses topics, D42 accepts that); a 10Gi claim in `full`.
+/// `KafkaNodePool` `kafka`: one node that is both controller and broker. The demo profile keeps a
+/// 5Gi claim with `deleteClaim: false` — the same as the platform's `manifests/kafka.yaml`, so a
+/// broker restart does not delete the topics a `StreamApp` reads; `full` keeps 10Gi.
 pub fn node_pool(namespace: &str, profile: Profile) -> DynamicObject {
     let storage = match profile {
-        Profile::Demo => json!({"type": "ephemeral"}),
+        Profile::Demo => {
+            json!({"type": "persistent-claim", "size": "5Gi", "deleteClaim": false})
+        }
         _ => json!({"type": "persistent-claim", "size": "10Gi", "deleteClaim": false}),
     };
     DynamicObject {
@@ -105,7 +108,10 @@ mod tests {
         let pool = node_pool("data", Profile::Demo);
         assert_eq!(pool.data["spec"]["replicas"], 1);
         assert_eq!(pool.data["spec"]["roles"], json!(["controller", "broker"]));
-        assert_eq!(pool.data["spec"]["storage"]["type"], "ephemeral");
+        assert_eq!(
+            pool.data["spec"]["storage"],
+            json!({"type": "persistent-claim", "size": "5Gi", "deleteClaim": false})
+        );
         let labels = pool.metadata.labels.as_ref().expect("labels");
         assert_eq!(labels.get("strimzi.io/cluster"), Some(&"kafka".to_string()));
     }
