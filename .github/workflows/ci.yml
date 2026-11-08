@@ -36,5 +36,8 @@ jobs:
       - name: Generated files are current
         run: cargo run --bin crdgen && git diff --exit-code chart/crds schemas
 
+      - name: README lists every served CRD
+        run: bash scripts/check-readme-crds.sh
+
       - name: Chart pins agree with stardelt-platform
         run: bash scripts/check-platform-pins.sh
