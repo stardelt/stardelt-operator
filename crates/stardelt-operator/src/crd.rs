@@ -600,6 +600,15 @@ pub struct SparkCompute {
     pub enabled: bool,
 }
 
+/// The operator's switches for one resource (design: operator#64). `stopped`
+/// is not part of this struct yet; it lands with its own ticket.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct ClusterOperation {
+    /// Stop reconciling: the operator writes `Paused` and applies nothing.
+    #[serde(default, rename = "reconciliationPaused")]
+    pub reconciliation_paused: bool,
+}
+
 /// A managed lakehouse: catalog + storage (+ query) on object storage.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 #[kube(
@@ -625,6 +634,9 @@ pub struct LakehouseSpec {
     /// Lakehouse can never silently clobber an existing install.
     #[serde(default)]
     pub adopt: bool,
+    /// Freeze this resource: no cluster changes, status phase `Paused`.
+    #[serde(default, rename = "clusterOperation")]
+    pub cluster_operation: ClusterOperation,
     /// What happens to the data when this resource is deleted (decision D18). Defaults to Retain.
     #[serde(default, rename = "deletionPolicy")]
     pub deletion_policy: DeletionPolicy,
