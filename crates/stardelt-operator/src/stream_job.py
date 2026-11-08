@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 
@@ -63,8 +63,14 @@ def merge_batch(batch: DataFrame, keys: list[str], target: str) -> None:
     # messages for one measurement time). Iceberg's MERGE refuses a source with duplicate
     # ON keys (MERGE_CARDINALITY_VIOLATION) and the checkpoint replays the same batch, so
     # the stream would fail for ever. The sink is a current-state table: keep one row per
-    # key and let the MERGE update it.
-    batch = batch.dropDuplicates(keys)
+    # key and let the MERGE update it. The row with the *newest* Kafka offset wins, so a
+    # replayed or superseded message cannot overwrite a newer value.
+    window = Window.partitionBy(*keys).orderBy(F.col("_kafka_offset").desc())
+    batch = (
+        batch.withColumn("_row", F.row_number().over(window))
+        .where(F.col("_row") == 1)
+        .drop("_row", "_kafka_offset")
+    )
     batch.createOrReplaceTempView("batch")
     on = " AND ".join(f"t.{k} = s.{k}" for k in keys)
     columns = batch.columns
@@ -110,18 +116,19 @@ def main() -> None:
         )
 
     parsed = raw.select(
-        F.from_json(F.col("value").cast("string"), json_schema(sink_schema)).alias("r")
-    ).select("r.*")
-    rows = parsed.select(
-        *[
-            F.to_timestamp(
-                F.regexp_replace(F.regexp_replace(F.col(f.name), "T", " "), "Z$", "")
-            ).alias(f.name)
-            if type(f.dataType).__name__ in ("TimestampType", "TimestampNTZType")
-            else F.col(f.name)
-            for f in sink_schema.fields
-        ]
-    )
+        F.from_json(F.col("value").cast("string"), json_schema(sink_schema)).alias("r"),
+        F.col("offset").alias("_kafka_offset"),
+    ).select("r.*", "_kafka_offset")
+    columns = [
+        F.to_timestamp(
+            F.regexp_replace(F.regexp_replace(F.col(f.name), "T", " "), "Z$", "")
+        ).alias(f.name)
+        if type(f.dataType).__name__ in ("TimestampType", "TimestampNTZType")
+        else F.col(f.name)
+        for f in sink_schema.fields
+    ]
+    rows = parsed.select(*columns)
+    merge_rows = parsed.select(*columns, F.col("_kafka_offset"))
 
     if a.mode == "append":
         (
@@ -136,7 +143,7 @@ def main() -> None:
     keys = [k for k in a.merge_keys.split(",") if k]
     if not keys:
         raise SystemExit("--mode merge needs --merge-keys")
-    rows.writeStream.foreachBatch(
+    merge_rows.writeStream.foreachBatch(
         lambda batch, _id: merge_batch(batch, keys, target)
     ).option("checkpointLocation", a.checkpoint).start().awaitTermination()
 

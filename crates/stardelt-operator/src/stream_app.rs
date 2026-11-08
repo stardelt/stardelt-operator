@@ -836,8 +836,8 @@ mod tests {
         assert!(script.starts_with("\"\"\"A StreamApp:"), "{script}");
         assert!(script.contains("from_json"));
         assert!(
-            script.contains("batch = batch.dropDuplicates(keys)"),
-            "a duplicate merge key must be deduplicated before the MERGE"
+            script.contains("row_number().over(window)"),
+            "a duplicate merge key must keep the row with the newest Kafka offset"
         );
         // Both sink modes must wait for the query: `append` used to return from main()
         // after `toTable()`, so the driver exited after the first batch (this ticket).
