@@ -397,6 +397,36 @@ fn ready_condition(
     }
 }
 
+/// The `status` half of the merge patch. `lastError` and `lastCheckpointAt` are serialized as
+/// an explicit JSON `null` when they are absent: the `StreamAppStatus` struct skips `None`, and a
+/// merge patch that omits a key leaves the previous value in place (operator#362).
+fn status_patch(
+    phase: &str,
+    reason: &str,
+    generation: Option<i64>,
+    previous: Option<&Condition>,
+    last_error: Option<String>,
+    attempts: Option<i64>,
+    last_submitted_at: Option<String>,
+) -> serde_json::Value {
+    let now = now_rfc3339();
+    let status = StreamAppStatus {
+        phase: phase.into(),
+        last_checkpoint_at: None,
+        last_error: last_error.clone(),
+        attempts,
+        last_submitted_at,
+        conditions: vec![ready_condition(phase, reason, generation, previous, &now)],
+        observed_generation: generation,
+    };
+    let mut value = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
+    if last_error.is_none() {
+        value["lastError"] = serde_json::Value::Null;
+    }
+    value["lastCheckpointAt"] = serde_json::Value::Null;
+    value
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn patch_stream_status(
     apps: &Api<StreamApp>,
@@ -409,16 +439,15 @@ async fn patch_stream_status(
     attempts: Option<i64>,
     last_submitted_at: Option<String>,
 ) -> Result<(), kube::Error> {
-    let now = now_rfc3339();
-    let status = StreamAppStatus {
-        phase: phase.into(),
-        last_checkpoint_at: None,
+    let status = status_patch(
+        phase,
+        reason,
+        generation,
+        previous,
         last_error,
         attempts,
         last_submitted_at,
-        conditions: vec![ready_condition(phase, reason, generation, previous, &now)],
-        observed_generation: generation,
-    };
+    );
     apps.patch_status(
         name,
         &PatchParams::default(),
@@ -848,6 +877,29 @@ mod tests {
             internal_bootstrap("stardelt"),
             "kafka-kafka-bootstrap.stardelt.svc.cluster.local:9092"
         );
+    }
+
+    #[test]
+    fn a_cleared_error_is_an_explicit_null_in_the_patch() {
+        let patch = status_patch("Running", "Running", Some(4), None, None, Some(1), None);
+        assert_eq!(patch["lastError"], serde_json::Value::Null);
+        assert!(
+            patch.get("lastError").is_some(),
+            "the key must be present; a merge patch that omits it keeps the old sentence"
+        );
+        assert_eq!(patch["lastCheckpointAt"], serde_json::Value::Null);
+        assert_eq!(patch["phase"], "Running");
+
+        let with_error = status_patch(
+            "Failed",
+            "Failed",
+            Some(4),
+            None,
+            Some("boom".into()),
+            Some(1),
+            None,
+        );
+        assert_eq!(with_error["lastError"], "boom");
     }
 
     #[test]
