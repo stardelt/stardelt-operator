@@ -5,9 +5,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{DeleteParams, DynamicObject, ObjectMeta, Patch, PatchParams, TypeMeta};
+use kube::api::{
+    DeleteParams, DynamicObject, ListParams, ObjectMeta, Patch, PatchParams, TypeMeta,
+};
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 use serde_json::json;
@@ -270,6 +272,12 @@ fn now_rfc3339() -> String {
 /// failed streaming app within seconds; a submission that has run this long is healthy
 /// again even though its cumulative `executionAttempts` stays > 1 (operator#322, this ticket).
 const RESTART_WINDOW_SECS: i64 = 600;
+/// A `PENDING_RERUN` SparkApplication with no pod is only resubmitted after this many
+/// seconds, so a normal restart (the Spark operator recreates the driver) is not cut short.
+const PENDING_RERUN_GRACE_SECS: i64 = 120;
+/// Never resubmit more than this many times without the counter being reset by a run.
+const PENDING_RERUN_MAX_RECOVERIES: i64 = 3;
+const PENDING_RERUN_ANNOTATION: &str = "stardelt.io/pending-rerun-recoveries";
 
 /// The `phase` and `Ready` reason for a `SparkApplication` status.
 pub fn stream_state(
@@ -297,6 +305,19 @@ pub fn stream_state(
         Some("FAILED") | Some("SUBMISSION_FAILED") => ("Failed", "Failed"),
         _ => ("Pending", "Pending"),
     }
+}
+
+/// Whether a `PENDING_RERUN` application is wedged: no pod of any kind is left and the
+/// object is older than the grace period. A missing creation timestamp is *not* wedged.
+pub fn pending_rerun_is_wedged(
+    state: Option<&str>,
+    pod_count: usize,
+    created: Option<i64>,
+    now: i64,
+) -> bool {
+    state == Some("PENDING_RERUN")
+        && pod_count == 0
+        && created.is_some_and(|c| now - c > PENDING_RERUN_GRACE_SECS)
 }
 
 /// The v2 controller refuses to retry when the interval fields are absent (`invalid retry
@@ -526,16 +547,78 @@ pub async fn reconcile_stream_app(
                 .and_then(|s| s.get("lastSubmissionAttemptTime"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let (phase, reason) = stream_state(
-                state,
-                execution_attempts,
-                last_submission.as_deref(),
-                k8s_openapi::jiff::Timestamp::now(),
-            );
+            let now = k8s_openapi::jiff::Timestamp::now();
+            let (mut phase, mut reason) =
+                stream_state(state, execution_attempts, last_submission.as_deref(), now);
+            let mut last_error = err_msg;
+
+            let recoveries = app
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(PENDING_RERUN_ANNOTATION))
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            let created = obj
+                .metadata
+                .creation_timestamp
+                .as_ref()
+                .map(|t| t.0.as_second());
+
+            if state == Some("PENDING_RERUN") {
+                let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
+                let selector = format!("sparkoperator.k8s.io/app-name={name}");
+                let pod_count = pods
+                    .list(&ListParams::default().labels(&selector))
+                    .await?
+                    .items
+                    .len();
+                if pending_rerun_is_wedged(state, pod_count, created, now.as_second()) {
+                    if recoveries >= PENDING_RERUN_MAX_RECOVERIES {
+                        phase = "Failed";
+                        reason = "Failed";
+                        last_error = Some(format!(
+                            "the Spark application stayed in PENDING_RERUN with no pods after \
+                             {PENDING_RERUN_MAX_RECOVERIES} resubmissions"
+                        ));
+                    } else {
+                        let mut annotations = serde_json::Map::new();
+                        annotations.insert(
+                            PENDING_RERUN_ANNOTATION.to_string(),
+                            serde_json::Value::String((recoveries + 1).to_string()),
+                        );
+                        apps.patch(
+                            &name,
+                            &PatchParams::default(),
+                            &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
+                        )
+                        .await?;
+                        match spark_api.delete(&name, &DeleteParams::default()).await {
+                            Ok(_) => {}
+                            Err(e) if is_not_found(&e) => {}
+                            Err(e) => return Err(e),
+                        }
+                        tracing::warn!(
+                            stream = %name, %namespace, recoveries = recoveries + 1,
+                            "resubmitting a Spark application wedged in PENDING_RERUN"
+                        );
+                    }
+                }
+            } else if recoveries > 0 {
+                apps.patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(json!({
+                        "metadata": { "annotations": { PENDING_RERUN_ANNOTATION: "0" } }
+                    })),
+                )
+                .await?;
+            }
+
             (
                 phase.to_string(),
                 reason.to_string(),
-                err_msg,
+                last_error,
                 Some(execution_attempts),
                 last_submission,
             )
@@ -1114,6 +1197,165 @@ mod tests {
             log.contains("\"lastError\":\"boom\"") || log.contains("boom"),
             "{log}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_wedged_pending_rerun_application_is_resubmitted() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/connections/kafka-bus") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Connection","metadata":{"name":"kafka-bus","namespace":"data"},"spec":{"scope":"group","ownerGroup":"a","type":"kafka","config":{"bootstrapServers":"kafka:9092"},"secret":{"name":"s","keys":["token"]}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkapplications/orders") {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data","creationTimestamp":"2020-01-01T00:00:00Z"},"status":{"applicationState":{"state":"PENDING_RERUN"}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/pods") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/streamapps/orders/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"connectionRef":"kafka-bus","topic":"orders.v1"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge","mergeKeys":["id"]}},"status":{"phase":"Pending"}}"#.into(),
+                );
+            }
+            if (method == "PATCH" || method == "POST") && path.contains("/streamapps/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"connectionRef":"kafka-bus","topic":"orders.v1"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge","mergeKeys":["id"]}}}"#.into(),
+                );
+            }
+            if (method == "PATCH" || method == "POST") && path.contains("/configmaps/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"orders-job","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "PATCH" || method == "POST" {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"v1","kind":"Status","status":"Success"}"#.into(),
+            )
+        });
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let action = reconcile_stream_app(Arc::new(stream_app(false)), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(
+            log.contains("DELETE") && log.contains("/sparkapplications/orders"),
+            "{log}"
+        );
+        assert!(log.contains("pending-rerun-recoveries"), "{log}");
+        assert!(log.contains("\"phase\":\"Pending\""), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_wedged_pending_rerun_application_stops_after_three_resubmissions() {
+        let mut app = stream_app(false);
+        app.metadata.annotations = Some(std::collections::BTreeMap::from([(
+            PENDING_RERUN_ANNOTATION.to_string(),
+            "3".to_string(),
+        )]));
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/connections/kafka-bus") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Connection","metadata":{"name":"kafka-bus","namespace":"data"},"spec":{"scope":"group","ownerGroup":"a","type":"kafka","config":{"bootstrapServers":"kafka:9092"},"secret":{"name":"s","keys":["token"]}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkapplications/orders") {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data","creationTimestamp":"2020-01-01T00:00:00Z"},"status":{"applicationState":{"state":"PENDING_RERUN"}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/pods") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/streamapps/orders/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"connectionRef":"kafka-bus","topic":"orders.v1"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge","mergeKeys":["id"]}},"status":{"phase":"Failed"}}"#.into(),
+                );
+            }
+            if (method == "PATCH" || method == "POST") && path.contains("/streamapps/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"connectionRef":"kafka-bus","topic":"orders.v1"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge","mergeKeys":["id"]}}}"#.into(),
+                );
+            }
+            if (method == "PATCH" || method == "POST") && path.contains("/configmaps/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"orders-job","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "PATCH" || method == "POST" {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1beta2","kind":"SparkApplication","metadata":{"name":"orders","namespace":"data"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"v1","kind":"Status","status":"Success"}"#.into(),
+            )
+        });
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let action = reconcile_stream_app(Arc::new(app), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(!log.contains("DELETE "), "{log}");
+        assert!(log.contains("\"phase\":\"Failed\""), "{log}");
+        assert!(log.contains("PENDING_RERUN"), "{log}");
+    }
+
+    #[test]
+    fn pending_rerun_needs_no_pod_and_two_minutes() {
+        assert!(pending_rerun_is_wedged(
+            Some("PENDING_RERUN"),
+            0,
+            Some(0),
+            121
+        ));
+        assert!(!pending_rerun_is_wedged(
+            Some("PENDING_RERUN"),
+            1,
+            Some(0),
+            999
+        ));
+        assert!(!pending_rerun_is_wedged(
+            Some("PENDING_RERUN"),
+            0,
+            None,
+            999
+        ));
+        assert!(!pending_rerun_is_wedged(Some("RUNNING"), 0, Some(0), 999));
     }
 
     #[tokio::test]
