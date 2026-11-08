@@ -27,6 +27,20 @@
           },
           "type": "object"
         },
+        "clusterOperation": {
+          "default": {
+            "reconciliationPaused": false
+          },
+          "description": "Freeze this resource: no cluster changes, status phase `Paused`.",
+          "properties": {
+            "reconciliationPaused": {
+              "default": false,
+              "description": "Stop reconciling: the operator writes `Paused` and applies nothing.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
         "compute": {
           "default": {
             "spark": {

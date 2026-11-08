@@ -870,6 +870,33 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
         return delete_lakehouse(&lh, &ctx).await;
     }
 
+    if lh.spec.cluster_operation.reconciliation_paused {
+        let phase = "Paused";
+        let previous = lh
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
+        let components = lh
+            .status
+            .as_ref()
+            .map(|s| s.components.clone())
+            .unwrap_or_default();
+        let status = LakehouseStatus {
+            phase: phase.into(),
+            conditions: vec![ready_condition(
+                phase,
+                lh.metadata.generation,
+                previous,
+                &now_rfc3339(),
+            )],
+            observed_generation: lh.metadata.generation,
+            components,
+        };
+        patch_lakehouse_status(&ctx, &lh, status).await?;
+        tracing::info!(lakehouse = %name, %namespace, "reconciliation paused; nothing was applied");
+        return Ok(Action::await_change());
+    }
+
     // v1alpha1 supports exactly one Lakehouse per namespace (decision D18):
     // release names are stable, so a second resource would Helm-upgrade the same
     // releases and apply the same Secret/Cluster names as the first. The oldest
@@ -2697,5 +2724,38 @@ mod tests {
             .await
             .expect("values");
         assert!(trino["coordinator"]["annotations"].is_null());
+    }
+    #[tokio::test]
+    async fn a_paused_lakehouse_writes_paused_and_applies_nothing() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse: Lakehouse = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": { "name": "main", "namespace": "stardelt", "generation": 3 },
+            "spec": { "clusterOperation": { "reconciliationPaused": true } },
+            "status": { "phase": "Ready", "observedGeneration": 2, "components": [] }
+        }))
+        .expect("deserialize Lakehouse");
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile a paused Lakehouse");
+
+        let status = patched_status(&requests, "lakehouses");
+        assert_eq!(status["phase"], json!("Paused"));
+        assert_eq!(status["observedGeneration"], json!(3));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Paused"));
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a paused Lakehouse must not run helm"
+        );
     }
 }

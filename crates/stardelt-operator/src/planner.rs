@@ -248,6 +248,7 @@ mod tests {
             dry_run: true,
             component_values: Default::default(),
             adopt: false,
+            cluster_operation: Default::default(),
             deletion_policy: Default::default(),
             compute: Default::default(),
         }
