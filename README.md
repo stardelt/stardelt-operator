@@ -6,12 +6,13 @@ comes up from a small set of YAML files.
 
 ## Status
 
-**Pre-alpha.** The CRD types, the reconcile *planner* and a controller skeleton are in place
-and unit-tested. Applying the upstream charts (the per-plug adapters) is the next milestone —
-today the controller computes the component plan and writes a truthful status. The controller
-watches `PlatformInstance`, `Lakehouse`, `IngestionSource`, `Pipeline`, `Connection` and
-`ServicePrincipal` (phase 1: it validates the principal and checks its credentials Secret; it does
-not call the identity provider).
+**Pre-alpha.** The CRDs, the reconcile planner and the controllers are in place and unit-tested.
+The controllers apply the components' Helm releases with golden values (CNPG, SeaweedFS,
+Lakekeeper, Trino, Keycloak, Nova, Airflow, JupyterHub, Superset, OpenFGA, Strimzi Kafka and the
+Kubeflow Spark operator) and write a truthful status. The Makefile and the umbrella chart remain
+the transitional dev install until the operator path is proven on a fresh node
+(`stardelt-platform#293`). The controllers watch `PlatformInstance`, `Lakehouse`, `Connection`,
+`ServicePrincipal` and `StreamApp`; the other kinds have CRDs and no controller yet.
 
 ## CRDs
 
@@ -23,9 +24,12 @@ not call the identity provider).
 | `Pipeline` | namespaced | ordered `sql` / `notebook` / `python` / `dbt` / `quality` steps on one engine (`airflow` / `spark`) |
 | `Connection` | namespaced | a typed connection to an outside system: settings in the resource, credentials in the secret store (types: `postgresql`, `mysql`, `sqlserver`, `oracle`, `rest-api`, `s3`, `kafka`, `sftp`, `generic`); validated at admission and synced into the Secret `conn-<name>` through External Secrets |
 | `Volume` | namespaced | a governed folder of files in the object store with an owner group and grants (`read` / `write` / `manage`), on managed or external storage; the resource is validated, nothing reconciles it yet |
+| `Catalog` | namespaced | a data domain: a catalog with its storage location, an owner group and grants |
+| `SqlWarehouse` | namespaced | a compute class for SQL: size, caps and the groups that may use it |
+| `ServicePrincipal` | namespaced | a non-human identity (client credentials) for pipelines, maintenance and collectors |
+| `StreamApp` | namespaced | a streaming app: a Kafka topic in, an Iceberg table out (D42) |
 
-`StreamApp` and the ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see
-the master spec §5).
+The ML plugs (`ModelRegistry`, `ModelService`, `ModelEndpoint`) are planned (see the master spec §5).
 
 ### Pillars
 
@@ -38,7 +42,7 @@ the master spec §5).
 | `notebooks` | `false` | JupyterHub (chart `jupyterhub/jupyterhub`, pinned like every other component) |
 | `pipelines` | `false` | Airflow (chart `apache-airflow/airflow`, pinned like every other component) — scheduled pipelines and jobs; Nova's Pipelines page needs it |
 | `dashboards` | `false` | Superset (chart `superset/superset`, pinned like every other component) — BI dashboards over Trino, sign-in through the platform IdP |
-| `streaming` | `false` | reserved for Kafka + Flink |
+| `streaming` | `false` | Strimzi Kafka and the Kubeflow Spark operator; a `StreamApp` then runs on the pillar's bus (D42) |
 | `ml` | `false` | reserved for the ML plugs |
 
 ```yaml
