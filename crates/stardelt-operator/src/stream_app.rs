@@ -13,6 +13,7 @@ use kube::api::{
 use kube::runtime::controller::Action;
 use kube::{Api, ResourceExt};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::controller::Context;
 use crate::crd::{
@@ -39,6 +40,44 @@ fn labels() -> BTreeMap<String, String> {
     ])
 }
 
+/// The first twelve hex characters of sha256 over the job script this binary embeds. It is
+/// written as an annotation on the `SparkApplication` so an operator upgrade that changes
+/// `stream_job.py` is visible on the live object, and the reconciler can resubmit an
+/// application that an older binary submitted instead of leaving it on the old code.
+pub fn job_script_hash() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(include_str!("stream_job.py").as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// True when the live `SparkApplication` was written by a binary whose job script differs
+/// from this one: an application without the annotation predates the annotation itself.
+/// Only an application this operator created is considered; anything else is left alone.
+fn job_script_changed(app: &DynamicObject) -> bool {
+    let ours = app
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get("app.kubernetes.io/managed-by"))
+        .map(String::as_str)
+        == Some(FIELD_MANAGER);
+    if !ours {
+        return false;
+    }
+    let running = app
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(JOB_SCRIPT_ANNOTATION))
+        .map(String::as_str);
+    running != Some(job_script_hash().as_str())
+}
+
 pub fn job_config_map(namespace: &str, app: &str, owner: &OwnerReference) -> ConfigMap {
     ConfigMap {
         metadata: ObjectMeta {
@@ -55,7 +94,6 @@ pub fn job_config_map(namespace: &str, app: &str, owner: &OwnerReference) -> Con
         ..Default::default()
     }
 }
-
 pub fn checkpoint_for(spec: &StreamAppSpec, namespace: &str, app: &str) -> String {
     match spec.sink.checkpoint_prefix.as_deref() {
         Some(prefix) => format!("s3a://lakehouse/{prefix}"),
@@ -218,6 +256,10 @@ pub fn spark_application(
             name: Some(app.to_string()),
             namespace: Some(namespace.to_string()),
             labels: Some(labels()),
+            annotations: Some(BTreeMap::from([(
+                JOB_SCRIPT_ANNOTATION.to_string(),
+                job_script_hash(),
+            )])),
             owner_references: Some(vec![owner.clone()]),
             ..Default::default()
         },
@@ -298,6 +340,10 @@ const PENDING_RERUN_GRACE_SECS: i64 = 120;
 /// Never resubmit more than this many times without the counter being reset by a run.
 const PENDING_RERUN_MAX_RECOVERIES: i64 = 3;
 const PENDING_RERUN_ANNOTATION: &str = "stardelt.io/pending-rerun-recoveries";
+/// The job script a `SparkApplication` was submitted with (`job_script_hash`). The spec does
+/// not change when `stream_job.py` does, so this annotation is what tells a running stream
+/// apart from one an older operator submitted.
+const JOB_SCRIPT_ANNOTATION: &str = "stardelt.io/job-script";
 
 /// The `phase` and `Ready` reason for a `SparkApplication` status.
 pub fn stream_state(
@@ -584,7 +630,26 @@ pub async fn reconcile_stream_app(
         &namespace,
         &objects::spark_application_resource(),
     );
-    if spark_api.get_opt(&name).await?.is_none() {
+    if let Some(existing) = spark_api.get_opt(&name).await? {
+        // The job script lives in a ConfigMap, so a new `stream_job.py` does not change the
+        // SparkApplication's spec: a stream submitted by an older binary keeps running the
+        // old code until it happens to fail. A fix that reaches the operator and not the
+        // running stream is not live (operator#372/#373 fixed the dedupe while the two live
+        // streams still ran the previous script). Delete and let the next reconcile apply
+        // the current one; the `old_pods` wait below then lets the previous driver end first.
+        if job_script_changed(&existing) {
+            tracing::info!(
+                stream = %name, %namespace, script = %job_script_hash(),
+                "the running application carries a different job script; resubmitting it"
+            );
+            match spark_api.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(e) => return Err(e),
+            }
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
+    } else {
         let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
         let selector = format!("sparkoperator.k8s.io/app-name={name}");
         let old_pods = pods
@@ -860,6 +925,115 @@ mod tests {
         assert!(
             !script.contains("dropDuplicates"),
             "dropDuplicates keeps an arbitrary row (#368); the newest offset must win: {script}"
+        );
+    }
+
+    #[test]
+    fn the_job_script_hash_is_the_first_twelve_hex_of_sha256() {
+        let mut hasher = Sha256::new();
+        hasher.update(include_str!("stream_job.py").as_bytes());
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .take(6)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(job_script_hash(), expected);
+        assert_eq!(job_script_hash().len(), 12);
+    }
+
+    #[test]
+    fn a_spark_application_carries_the_job_script_annotation() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let app = spark_application("data", "orders", &s, "kafka:9092", "s3a://c/p", &owner())
+            .expect("ok");
+        let annotation = app
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("stardelt.io/job-script"))
+            .expect("the job script annotation");
+        assert_eq!(annotation, &job_script_hash());
+        assert!(
+            !job_script_changed(&app),
+            "the app this binary builds is current"
+        );
+    }
+
+    #[test]
+    fn an_application_from_an_older_binary_is_resubmitted() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let app = spark_application("data", "orders", &s, "kafka:9092", "s3a://c/p", &owner())
+            .expect("ok");
+
+        let mut missing = app.clone();
+        missing.metadata.annotations = None;
+        assert!(
+            job_script_changed(&missing),
+            "an application without the annotation predates it and must be resubmitted"
+        );
+
+        let mut stale = app.clone();
+        stale.metadata.annotations = Some(BTreeMap::from([(
+            "stardelt.io/job-script".to_string(),
+            "000000000000".to_string(),
+        )]));
+        assert!(
+            job_script_changed(&stale),
+            "a different hash means a script this binary does not carry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_running_application_with_an_older_job_script_is_deleted() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/connections/kafka-bus") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Connection","metadata":{"name":"kafka-bus","namespace":"data"},"spec":{"scope":"group","ownerGroup":"a","type":"kafka","config":{"bootstrapServers":"kafka:9092"},"secret":{"name":"s","keys":["token"]}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkapplications/orders") {
+                return (
+                    200,
+                    json!({
+                        "apiVersion": "sparkoperator.k8s.io/v1beta2",
+                        "kind": "SparkApplication",
+                        "metadata": {
+                            "name": "orders",
+                            "namespace": "data",
+                            "labels": {"app.kubernetes.io/managed-by": "stardelt-operator"},
+                            "annotations": {"stardelt.io/job-script": "000000000000"},
+                        },
+                    })
+                    .to_string(),
+                );
+            }
+            if method == "DELETE" && path.contains("/sparkapplications/orders") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"Status","status":"Success"}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"orders-job","namespace":"data"}}"#.into(),
+            )
+        });
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let action = reconcile_stream_app(Arc::new(stream_app(false)), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(5)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(
+            log.contains(
+                "DELETE /apis/sparkoperator.k8s.io/v1beta2/namespaces/data/sparkapplications/orders"
+            ),
+            "a stale job script must delete the application: {log}"
         );
     }
 
