@@ -84,7 +84,12 @@ pub fn client_payload(name: &str, spec: &ServicePrincipalSpec) -> serde_json::Va
         "serviceAccountsEnabled": true,
         "redirectUris": [],
         "webOrigins": [],
-        "attributes": { "stardelt-managed": "principal" },
+        // #334: Iceberg's OAuth2 refresh at 300 s fails with invalid_client; a token that
+        // outlives a demo stream never needs to refresh (the jupyterhub client does the same).
+        "attributes": {
+            "stardelt-managed": "principal",
+            "access.token.lifespan": "28800"
+        },
         "protocolMappers": mappers
     })
 }
@@ -698,6 +703,7 @@ mod tests {
         assert_eq!(payload["publicClient"], false);
         assert_eq!(payload["clientAuthenticatorType"], "client-secret");
         assert_eq!(payload["attributes"]["stardelt-managed"], "principal");
+        assert_eq!(payload["attributes"]["access.token.lifespan"], "28800");
         let mappers = payload["protocolMappers"].as_array().expect("mappers");
         let names: Vec<&str> = mappers
             .iter()
