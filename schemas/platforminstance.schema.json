@@ -13,6 +13,20 @@
           "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$",
           "type": "string"
         },
+        "clusterOperation": {
+          "default": {
+            "reconciliationPaused": false
+          },
+          "description": "Freeze this resource: no cluster changes, status phase `Paused` (operator#64).",
+          "properties": {
+            "reconciliationPaused": {
+              "default": false,
+              "description": "Stop reconciling: the operator writes `Paused` and applies nothing.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
         "dryRun": {
           "default": true,
           "description": "Plan only (no cluster changes) until explicitly disabled. Safe default.",

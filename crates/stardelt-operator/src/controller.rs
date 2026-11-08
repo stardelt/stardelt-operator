@@ -1119,6 +1119,38 @@ async fn reconcile_platform(
     ctx: Arc<Context>,
 ) -> Result<Action, kube::Error> {
     let name = instance.name_any();
+    if instance.spec.cluster_operation.reconciliation_paused {
+        let phase = "Paused";
+        let prev = instance
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
+        let components = instance
+            .status
+            .as_ref()
+            .map(|s| s.components.clone())
+            .unwrap_or_default();
+        let status = PlatformInstanceStatus {
+            phase: phase.into(),
+            conditions: vec![ready_condition(
+                phase,
+                instance.metadata.generation,
+                prev,
+                &now_rfc3339(),
+            )],
+            observed_generation: instance.metadata.generation,
+            components,
+        };
+        let api: Api<PlatformInstance> = Api::all(ctx.client.clone());
+        api.patch_status(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "status": status })),
+        )
+        .await?;
+        tracing::info!(instance = %name, "reconciliation paused; nothing was applied");
+        return Ok(Action::await_change());
+    }
     let plan = plan_platform(&instance.spec);
     let overrides = OverridesContext {
         // PlatformInstance is cluster-scoped: valuesFrom refs must name their
@@ -2756,6 +2788,40 @@ mod tests {
         assert!(
             helm.calls.lock().expect("calls poisoned").is_empty(),
             "a paused Lakehouse must not run helm"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_platform_instance_writes_paused_and_applies_nothing() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance: PlatformInstance = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster", "generation": 4 },
+            "spec": { "clusterOperation": { "reconciliationPaused": true } },
+            "status": { "phase": "Ready", "observedGeneration": 3, "components": [] }
+        }))
+        .expect("deserialize PlatformInstance");
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("reconcile a paused PlatformInstance");
+
+        let status = patched_status(&requests, "platforminstances");
+        assert_eq!(status["phase"], json!("Paused"));
+        assert_eq!(status["observedGeneration"], json!(4));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Paused"));
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a paused PlatformInstance must not run helm"
         );
     }
 }
