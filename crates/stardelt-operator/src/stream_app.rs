@@ -340,6 +340,14 @@ pub fn pending_rerun_is_wedged(
         && created.is_some_and(|c| now - c > PENDING_RERUN_GRACE_SECS)
 }
 
+/// Whether a recovery must wait before the SparkApplication is re-applied: the app was
+/// deleted (a recovery) and a pod of the previous submission still exists. Re-applying
+/// now makes spark-submit create a driver pod with two controller ownerReferences
+/// (the old app's UID and the new one), which the API server refuses with 422.
+pub fn recovery_must_wait(app_missing: bool, old_pods: usize) -> bool {
+    app_missing && old_pods > 0
+}
+
 /// The scheduler's sentence for a pod it cannot place, or `None` when the pod is
 /// schedulable or has already run. A driver can be `RUNNING` while every executor waits
 /// like this (for example "0/1 nodes are available: 1 Insufficient cpu"), and Spark
@@ -571,6 +579,23 @@ pub async fn reconcile_stream_app(
     }
     let cm = job_config_map(&namespace, &name, &owner);
     objects::apply(&ctx.client, &namespace, &cm, false).await?;
+    let spark_api: Api<DynamicObject> = Api::namespaced_with(
+        ctx.client.clone(),
+        &namespace,
+        &objects::spark_application_resource(),
+    );
+    if spark_api.get_opt(&name).await?.is_none() {
+        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
+        let selector = format!("sparkoperator.k8s.io/app-name={name}");
+        let old_pods = pods
+            .list(&ListParams::default().labels(&selector))
+            .await?
+            .items
+            .len();
+        if recovery_must_wait(true, old_pods) {
+            return Ok(Action::requeue(Duration::from_secs(5)));
+        }
+    }
     let spark = spark_application(
         &namespace,
         &name,
@@ -589,11 +614,6 @@ pub async fn reconcile_stream_app(
     )
     .await?;
 
-    let spark_api: Api<DynamicObject> = Api::namespaced_with(
-        ctx.client.clone(),
-        &namespace,
-        &objects::spark_application_resource(),
-    );
     let (phase, reason, last_error, attempts, last_submitted_at) = match spark_api.get(&name).await
     {
         Ok(obj) => {
@@ -1506,6 +1526,16 @@ mod tests {
             999
         ));
         assert!(!pending_rerun_is_wedged(Some("RUNNING"), 0, Some(0), 999));
+    }
+
+    #[test]
+    fn a_recovery_waits_for_the_old_pods() {
+        assert!(recovery_must_wait(true, 1));
+        assert!(!recovery_must_wait(true, 0));
+        assert!(
+            !recovery_must_wait(false, 1),
+            "a live app is never held back"
+        );
     }
 
     #[test]
