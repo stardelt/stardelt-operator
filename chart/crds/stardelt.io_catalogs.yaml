@@ -70,6 +70,74 @@ spec:
                 required:
                 - name
                 type: object
+              maintenance:
+                default:
+                  excludeTables: []
+                  expireSnapshots:
+                    retention: 7d
+                  optimize:
+                    fileSizeThreshold: 128MB
+                    minSmallFiles: 20
+                  removeOrphanFiles:
+                    retention: 7d
+                  schedule: 0 2 * * *
+                description: |-
+                  The automatic Iceberg maintenance policy (platform#129): compaction, snapshot expiry and
+                  orphan-file removal, daily at 02:00 unless changed. On by default.
+                properties:
+                  excludeTables:
+                    default: []
+                    description: Tables (`schema.table`) this policy never touches.
+                    items:
+                      type: string
+                    maxItems: 100
+                    type: array
+                  expireSnapshots:
+                    default:
+                      retention: 7d
+                    description: |-
+                      Snapshot expiry. The engine's minimum is 7 days (`iceberg.expire-snapshots.min-retention`),
+                      so `retention` is a minimum, not a preference.
+                    properties:
+                      retention:
+                        default: 7d
+                        pattern: ^[1-9][0-9]*d$
+                        type: string
+                    type: object
+                  optimize:
+                    default:
+                      fileSizeThreshold: 128MB
+                      minSmallFiles: 20
+                    description: 'Compaction: files smaller than the threshold are rewritten when at least `minSmallFiles` exist.'
+                    properties:
+                      fileSizeThreshold:
+                        default: 128MB
+                        pattern: ^[1-9][0-9]*(MB|GB)$
+                        type: string
+                      minSmallFiles:
+                        default: 20
+                        format: int32
+                        minimum: 0.0
+                        type: integer
+                    type: object
+                  removeOrphanFiles:
+                    default:
+                      retention: 7d
+                    description: |-
+                      Orphan-file removal. The engine's minimum is 7 days
+                      (`iceberg.remove-orphan-files.min-retention`).
+                    properties:
+                      retention:
+                        default: 7d
+                        pattern: ^[1-9][0-9]*d$
+                        type: string
+                    type: object
+                  schedule:
+                    default: 0 2 * * *
+                    description: Five-field cron; the default is 02:00 every day.
+                    pattern: ^(\S+\s+){4}\S+$
+                    type: string
+                type: object
               managedAccess:
                 default: false
                 description: 'True: the owner cannot grant on this catalog; only platform administrators can.'
