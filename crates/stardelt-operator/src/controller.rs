@@ -2789,6 +2789,18 @@ mod tests {
             helm.calls.lock().expect("calls poisoned").is_empty(),
             "a paused Lakehouse must not run helm"
         );
+        let writes: Vec<String> = requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|r| r.method != "GET")
+            .map(|r| format!("{} {}", r.method, r.path))
+            .collect();
+        assert_eq!(
+            writes,
+            vec!["PATCH /apis/stardelt.io/v1alpha1/namespaces/stardelt/lakehouses/main/status"],
+            "a paused Lakehouse must write nothing but its own status"
+        );
     }
 
     #[tokio::test]
