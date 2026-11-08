@@ -179,6 +179,15 @@ pub fn spark_application(
         json!(format!("{s3_secret}:secret-key"));
     spark_conf["spark.kubernetes.executor.secretKeyRef.AWS_REGION"] =
         json!(format!("{s3_secret}:region"));
+    // The executor may refresh the catalog token (OAuth2Util.AuthSession), so it needs the
+    // same catalog identity as the driver (#341). Client id/secret come from the principal
+    // Secret; the token URL is not secret-backed (the driver passes it as a literal value),
+    // so it is injected as a plain executor env var rather than a secretKeyRef.
+    spark_conf["spark.kubernetes.executor.secretKeyRef.CATALOG_CLIENT_ID"] =
+        json!(format!("{sp}:client-id"));
+    spark_conf["spark.kubernetes.executor.secretKeyRef.CATALOG_CLIENT_SECRET"] =
+        json!(format!("{sp}:client-secret"));
+    spark_conf["spark.executorEnv.CATALOG_TOKEN_URL"] = json!(token_url);
 
     Ok(DynamicObject {
         types: Some(TypeMeta {
@@ -864,6 +873,36 @@ mod tests {
             "http://keycloak:8080/realms/stardelt/protocol/openid-connect/token"
         );
         assert!(token.get("valueFrom").is_none());
+
+        // The executor needs the same catalog identity for token refresh (#341).
+        // Secret-backed values are injected as secretKeyRefs (never literal); the token URL
+        // is not secret-backed and is injected as a plain executor env var.
+        let conf = &a.data["spec"]["sparkConf"];
+        let executor_secret_backed = [
+            (
+                "spark.kubernetes.executor.secretKeyRef.CATALOG_CLIENT_ID",
+                "sp-pipeline-analysts:client-id",
+            ),
+            (
+                "spark.kubernetes.executor.secretKeyRef.CATALOG_CLIENT_SECRET",
+                "sp-pipeline-analysts:client-secret",
+            ),
+        ];
+        for (key, ref_value) in executor_secret_backed {
+            assert!(
+                conf.get(key).is_some(),
+                "executor catalog identity missing: {key}"
+            );
+            assert_eq!(
+                conf[key], ref_value,
+                "{key} must reference the principal Secret, not a literal secret value"
+            );
+        }
+        assert_eq!(
+            conf["spark.executorEnv.CATALOG_TOKEN_URL"],
+            "http://keycloak:8080/realms/stardelt/protocol/openid-connect/token",
+            "executor needs the catalog token URL"
+        );
     }
 
     #[test]
