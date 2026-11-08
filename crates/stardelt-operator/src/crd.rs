@@ -2180,7 +2180,7 @@ pub struct OptimizeSpec {
     #[schemars(regex(pattern = r"^[1-9][0-9]*(MB|GB)$"))]
     pub file_size_threshold: String,
     #[serde(default = "default_min_small_files", rename = "minSmallFiles")]
-    #[schemars(range(min = 0))]
+    #[schemars(range(min = 1))]
     pub min_small_files: i32,
 }
 
@@ -2202,20 +2202,22 @@ impl Default for OptimizeSpec {
 }
 
 /// Snapshot expiry. The engine's minimum is 7 days (`iceberg.expire-snapshots.min-retention`),
-/// so `retention` is a minimum, not a preference.
+/// so `retention` is a minimum, not a preference. The schema refuses a shorter retention;
+/// `MaintenanceSpec::validate` repeats the rule because no controller runs it yet.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
 pub struct ExpireSnapshotsSpec {
     #[serde(default = "default_retention")]
-    #[schemars(regex(pattern = r"^[1-9][0-9]*d$"))]
+    #[schemars(regex(pattern = r"^([7-9]|[1-9][0-9]+)d$"))]
     pub retention: String,
 }
 
 /// Orphan-file removal. The engine's minimum is 7 days
-/// (`iceberg.remove-orphan-files.min-retention`).
+/// (`iceberg.remove-orphan-files.min-retention`). The schema refuses a shorter retention;
+/// `MaintenanceSpec::validate` repeats the rule because no controller runs it yet.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
 pub struct RemoveOrphanFilesSpec {
     #[serde(default = "default_retention")]
-    #[schemars(regex(pattern = r"^[1-9][0-9]*d$"))]
+    #[schemars(regex(pattern = r"^([7-9]|[1-9][0-9]+)d$"))]
     pub retention: String,
 }
 
@@ -4236,6 +4238,19 @@ mod tests {
             yaml.contains("0 2 * * *"),
             "the default schedule is in the schema"
         );
+        let crd: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        let maintenance = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["maintenance"]["properties"];
+        assert_eq!(
+            maintenance["optimize"]["properties"]["minSmallFiles"]["minimum"],
+            1.0
+        );
+        for field in ["expireSnapshots", "removeOrphanFiles"] {
+            assert_eq!(
+                maintenance[field]["properties"]["retention"]["pattern"], "^([7-9]|[1-9][0-9]+)d$",
+                "{field} must refuse a retention under the engine's 7-day minimum"
+            );
+        }
     }
 
     fn warehouse(spec: serde_json::Value) -> SqlWarehouse {

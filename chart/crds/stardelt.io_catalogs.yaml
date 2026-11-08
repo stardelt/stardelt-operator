@@ -97,11 +97,12 @@ spec:
                       retention: 7d
                     description: |-
                       Snapshot expiry. The engine's minimum is 7 days (`iceberg.expire-snapshots.min-retention`),
-                      so `retention` is a minimum, not a preference.
+                      so `retention` is a minimum, not a preference. The schema refuses a shorter retention;
+                      `MaintenanceSpec::validate` repeats the rule because no controller runs it yet.
                     properties:
                       retention:
                         default: 7d
-                        pattern: ^[1-9][0-9]*d$
+                        pattern: ^([7-9]|[1-9][0-9]+)d$
                         type: string
                     type: object
                   optimize:
@@ -117,7 +118,7 @@ spec:
                       minSmallFiles:
                         default: 20
                         format: int32
-                        minimum: 0.0
+                        minimum: 1.0
                         type: integer
                     type: object
                   removeOrphanFiles:
@@ -125,11 +126,12 @@ spec:
                       retention: 7d
                     description: |-
                       Orphan-file removal. The engine's minimum is 7 days
-                      (`iceberg.remove-orphan-files.min-retention`).
+                      (`iceberg.remove-orphan-files.min-retention`). The schema refuses a shorter retention;
+                      `MaintenanceSpec::validate` repeats the rule because no controller runs it yet.
                     properties:
                       retention:
                         default: 7d
-                        pattern: ^[1-9][0-9]*d$
+                        pattern: ^([7-9]|[1-9][0-9]+)d$
                         type: string
                     type: object
                   schedule:
