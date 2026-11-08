@@ -657,7 +657,13 @@ pub async fn reconcile_stream_app(
             .await?
             .items
             .len();
-        if recovery_must_wait(true, old_pods) {
+        // The label list can miss a driver pod that is terminating (its labels are already
+        // gone or the cache is behind) or one the Spark operator recreated for the deleted
+        // application: `spark-submit` then collides on the pod name and the stream flashes
+        // `Failed` with "driver pod already exist" (operator#378). A pod fetched by name
+        // still exists while it carries a `deletionTimestamp`.
+        let driver = pods.get_opt(&format!("{name}-driver")).await?;
+        if recovery_must_wait(true, old_pods) || driver.is_some() {
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
     }
@@ -1034,6 +1040,72 @@ mod tests {
                 "DELETE /apis/sparkoperator.k8s.io/v1beta2/namespaces/data/sparkapplications/orders"
             ),
             "a stale job script must delete the application: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_terminating_driver_pod_holds_a_resubmit_back() {
+        // After the script-hash delete the application is gone, but the old driver pod can
+        // still be terminating and invisible to the label list. Re-applying now makes
+        // `spark-submit` fail with "driver pod already exist" (operator#378).
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/connections/kafka-bus") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Connection","metadata":{"name":"kafka-bus","namespace":"data"},"spec":{"scope":"group","ownerGroup":"a","type":"kafka","config":{"bootstrapServers":"kafka:9092"},"secret":{"name":"s","keys":["token"]}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/pods") {
+                return (200, r#"{"items":[]}"#.into());
+            }
+            if method == "GET" && path.ends_with("/pods/orders-driver") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"orders-driver","namespace":"data","deletionTimestamp":"2026-11-08T19:46:00Z"},"status":{"phase":"Running"}}"#.into(),
+                );
+            }
+            if method != "GET" && path.contains("/sparkapplications/orders") {
+                // Only reached when the wait is broken: the reconcile must not write here.
+                return (
+                    200,
+                    json!({
+                        "apiVersion": "sparkoperator.k8s.io/v1beta2",
+                        "kind": "SparkApplication",
+                        "metadata": {"name": "orders", "namespace": "data"},
+                    })
+                    .to_string(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkapplications/orders") {
+                return (
+                    404,
+                    r#"{"kind":"Status","status":"Failure","reason":"NotFound","code":404}"#.into(),
+                );
+            }
+            if path.contains("/streamapps/orders") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"StreamApp","metadata":{"name":"orders","namespace":"data"},"spec":{"source":{"topic":"orders.v1","format":"json"},"sink":{"catalog":"shared","table":"sales.orders","mode":"merge"},"engine":"spark"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"orders-job","namespace":"data"}}"#.into(),
+            )
+        });
+        let ctx = Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        });
+        let action = reconcile_stream_app(Arc::new(stream_app(false)), ctx)
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(5)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(
+            !log.contains("POST /apis/sparkoperator.k8s.io/")
+                && !log.contains("PATCH /apis/sparkoperator.k8s.io/"),
+            "a terminating driver pod must hold the resubmit back: {log}"
         );
     }
 
