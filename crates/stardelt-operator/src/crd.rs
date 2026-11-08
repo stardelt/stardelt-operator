@@ -2147,6 +2147,32 @@ impl Default for MaintenanceSpec {
     }
 }
 
+impl MaintenanceSpec {
+    /// The rules the engine enforces at run time, repeated here so a bad policy is refused when
+    /// the resource is written. Trino's `iceberg.expire-snapshots.min-retention` and
+    /// `iceberg.remove-orphan-files.min-retention` are 7 days; a smaller value fails every run.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.optimize.min_small_files < 1 {
+            return Err("maintenance.optimize.minSmallFiles must be at least 1".to_string());
+        }
+        for (field, value) in [
+            ("expireSnapshots", &self.expire_snapshots.retention),
+            ("removeOrphanFiles", &self.remove_orphan_files.retention),
+        ] {
+            let days = value
+                .strip_suffix('d')
+                .and_then(|d| d.parse::<u32>().ok())
+                .ok_or_else(|| format!("maintenance.{field}.retention must look like `7d`"))?;
+            if days < 7 {
+                return Err(format!(
+                    "maintenance.{field}.retention must be at least 7d (the engine's minimum)"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Compaction: files smaller than the threshold are rewritten when at least `minSmallFiles` exist.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
 pub struct OptimizeSpec {
@@ -2313,6 +2339,7 @@ impl CatalogDomainSpec {
         {
             return Err("storage.keyPrefix must not contain .. or //".to_string());
         }
+        self.maintenance.validate()?;
         Ok(())
     }
 }
@@ -4171,6 +4198,26 @@ mod tests {
         assert_eq!(m.expire_snapshots.retention, "7d");
         assert_eq!(m.remove_orphan_files.retention, "7d");
         assert!(m.exclude_tables.is_empty());
+    }
+
+    #[test]
+    fn catalog_maintenance_refuses_what_the_engine_refuses() {
+        let mut m = MaintenanceSpec::default();
+        assert!(m.validate().is_ok());
+
+        m.optimize.min_small_files = 0;
+        assert!(m.validate().unwrap_err().contains("minSmallFiles"));
+        m.optimize.min_small_files = 20;
+
+        m.expire_snapshots.retention = "6d".to_string();
+        assert!(m.validate().unwrap_err().contains("at least 7d"));
+        m.expire_snapshots.retention = "7d".to_string();
+
+        m.remove_orphan_files.retention = "1d".to_string();
+        assert!(m.validate().unwrap_err().contains("at least 7d"));
+        m.remove_orphan_files.retention = "30d".to_string();
+
+        assert!(m.validate().is_ok());
     }
 
     #[test]
