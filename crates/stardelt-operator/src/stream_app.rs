@@ -336,21 +336,22 @@ pub fn pending_rerun_is_wedged(
         && created.is_some_and(|c| now - c > PENDING_RERUN_GRACE_SECS)
 }
 
-/// A pod the scheduler cannot place: `Pending` with the `PodScheduled` condition `False`
-/// (for example "0/1 nodes are available: 1 Insufficient cpu"). A driver can be `RUNNING`
-/// while every executor waits like this, and Spark reports the application as healthy —
-/// so the stream must say it is not doing work (`#320`'s observability sibling).
-pub fn pod_unschedulable(pod: &Pod) -> bool {
-    let Some(status) = pod.status.as_ref() else {
-        return false;
-    };
+/// The scheduler's sentence for a pod it cannot place, or `None` when the pod is
+/// schedulable or has already run. A driver can be `RUNNING` while every executor waits
+/// like this (for example "0/1 nodes are available: 1 Insufficient cpu"), and Spark
+/// reports the application as healthy — so the stream must say it is not doing work.
+pub fn unschedulable_message(pod: &Pod) -> Option<String> {
+    let status = pod.status.as_ref()?;
     if status.phase.as_deref() != Some("Pending") {
-        return false;
+        return None;
     }
-    status.conditions.as_ref().is_some_and(|conditions| {
-        conditions
-            .iter()
-            .any(|c| c.type_ == "PodScheduled" && c.status == "False")
+    let conditions = status.conditions.as_deref()?;
+    conditions.iter().find_map(|c| {
+        (c.type_ == "PodScheduled" && c.status == "False").then(|| {
+            c.message
+                .clone()
+                .unwrap_or_else(|| "the executor is not schedulable".to_string())
+        })
     })
 }
 
@@ -660,13 +661,21 @@ pub async fn reconcile_stream_app(
 
             // A driver can be RUNNING while its executor cannot be scheduled. Spark keeps
             // the application healthy, so without this the stream reads as Running while
-            // it processes nothing. Nova shows the Ready reason as a badge.
+            // it processes nothing. Nova shows the Ready reason as a badge and this
+            // sentence in its Last error column.
             if phase == "Running" && reason == "Running" {
                 let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace);
                 let selector = format!("sparkoperator.k8s.io/app-name={name},spark-role=executor");
                 let executors = pods.list(&ListParams::default().labels(&selector)).await?;
-                if executors.items.iter().any(pod_unschedulable) {
+                if let Some(sentence) = executors.items.iter().find_map(unschedulable_message) {
                     reason = "ExecutorsUnschedulable";
+                    if last_error.is_none() {
+                        let mut text = sentence;
+                        if text.len() > 400 {
+                            text.truncate(400);
+                        }
+                        last_error = Some(text);
+                    }
                 }
             }
 
@@ -1439,24 +1448,33 @@ mod tests {
     }
 
     #[test]
-    fn a_pending_executor_is_unschedulable() {
+    fn a_pending_executor_reports_the_scheduler_message() {
         use k8s_openapi::api::core::v1::{Pod, PodCondition, PodStatus};
-        let pod = |phase: &str, scheduled: &str| Pod {
+        let pod = |phase: &str, scheduled: &str, message: Option<&str>| Pod {
             status: Some(PodStatus {
                 phase: Some(phase.into()),
                 conditions: Some(vec![PodCondition {
                     type_: "PodScheduled".into(),
                     status: scheduled.into(),
+                    message: message.map(str::to_string),
                     ..Default::default()
                 }]),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(pod_unschedulable(&pod("Pending", "False")));
-        assert!(!pod_unschedulable(&pod("Pending", "True")));
-        assert!(!pod_unschedulable(&pod("Running", "True")));
-        assert!(!pod_unschedulable(&Pod::default()));
+        let why = Some("0/1 nodes are available: 1 Insufficient cpu.");
+        assert_eq!(
+            unschedulable_message(&pod("Pending", "False", why)).as_deref(),
+            why
+        );
+        assert_eq!(
+            unschedulable_message(&pod("Pending", "False", None)).as_deref(),
+            Some("the executor is not schedulable")
+        );
+        assert!(unschedulable_message(&pod("Pending", "True", None)).is_none());
+        assert!(unschedulable_message(&pod("Running", "True", None)).is_none());
+        assert!(unschedulable_message(&Pod::default()).is_none());
     }
 
     #[tokio::test]
