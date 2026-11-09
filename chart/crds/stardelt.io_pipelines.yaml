@@ -166,6 +166,8 @@ spec:
                     rule: self.kind != 'notebook' || !has(self.config) || self.config.all(k, k in ['notebook', 'objectVersion', 'params'])
                   - message: notebook params must be a JSON object string of at most 4096 characters
                     rule: self.kind != 'notebook' || !has(self.config) || !('params' in self.config) || self.config['params'].size() <= 4096
+                  - message: 'a sql task cannot name a connection: it runs inside the engine'
+                    rule: self.kind != 'sql' || !has(self.connection)
                 maxItems: 30
                 minItems: 1
                 type: array
