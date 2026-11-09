@@ -60,6 +60,20 @@ pub fn preset(size: SparkClusterSize) -> (i32, &'static str, i32, &'static str, 
     }
 }
 
+/// The Spark operator's webhook wants Spark's own unit (`2g`, `512m`), not a Kubernetes
+/// quantity (`2Gi`, `512Mi`). The suffixes mean the same binary multiples.
+fn webhook_memory(quantity: &str) -> Result<String, String> {
+    if let Some(number) = quantity.strip_suffix("Gi") {
+        Ok(format!("{number}g"))
+    } else if let Some(number) = quantity.strip_suffix("Mi") {
+        Ok(format!("{number}m"))
+    } else {
+        Err(format!(
+            "unsupported memory unit in `{quantity}`; use Mi or Gi"
+        ))
+    }
+}
+
 fn labels(name: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -99,6 +113,8 @@ pub fn spark_connect(
         .as_ref()
         .and_then(|e| e.memory.clone())
         .unwrap_or_else(|| exec_mem.to_string());
+    let driver_mem = webhook_memory(&driver_mem)?;
+    let exec_mem = webhook_memory(&exec_mem)?;
     let max_executors = spec.max_executors.unwrap_or(max_executors);
 
     let mut env = Vec::new();
@@ -582,16 +598,40 @@ mod tests {
         assert_eq!(object.data.pointer("/spec/server/cores"), Some(&json!(3)));
         assert_eq!(
             object.data.pointer("/spec/server/memory"),
-            Some(&json!("4Gi"))
+            Some(&json!("4g"))
         );
         assert_eq!(object.data.pointer("/spec/executor/cores"), Some(&json!(2)));
         assert_eq!(
             object.data.pointer("/spec/executor/memory"),
-            Some(&json!("6Gi"))
+            Some(&json!("6g"))
         );
         assert_eq!(
             object.data.pointer("/spec/dynamicAllocation/maxExecutors"),
             Some(&json!(6))
+        );
+    }
+
+    #[test]
+    fn a_built_connect_carries_the_spark_operators_memory_unit() {
+        let object = spark_connect("trial", "data", &spec(), &runtime(), &owner()).expect("build");
+        assert_eq!(
+            object.data.pointer("/spec/server/memory"),
+            Some(&json!("2g"))
+        );
+        assert_eq!(
+            object.data.pointer("/spec/executor/memory"),
+            Some(&json!("2g"))
+        );
+
+        let mut s = spec();
+        s.driver = Some(SparkResources {
+            cores: None,
+            memory: Some("512Mi".into()),
+        });
+        let object = spark_connect("trial", "data", &s, &runtime(), &owner()).expect("build");
+        assert_eq!(
+            object.data.pointer("/spec/server/memory"),
+            Some(&json!("512m"))
         );
     }
 
