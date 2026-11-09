@@ -50,3 +50,29 @@ if _issuer:
         ),
         "REQUESTS_CA_BUNDLE": "/etc/stardelt/trino-ca/ca.crt",
     }
+
+
+# The platform's 15-framing: Nova may frame the hub and every spawned server.
+_nova = os.environ.get("STARDELT_NOVA_URL", "").rstrip("/")
+if _nova:
+    c.JupyterHub.tornado_settings = {
+        **c.JupyterHub.tornado_settings,
+        "headers": {
+            **c.JupyterHub.tornado_settings.get("headers", {}),
+            "Content-Security-Policy": (
+                f"frame-ancestors 'self' {_nova}; "
+                "report-uri /hub/security/csp-report"
+            ),
+        },
+    }
+
+    # The single-user server, told at spawn what it may be framed by. Merge into
+    # the environment `20-notebook-identity` may already have set.
+    c.KubeSpawner.environment = {
+        **(c.KubeSpawner.environment or {}),
+        "STARDELT_NOVA_ORIGIN": _nova,
+    }
+
+    _cookies = {"SameSite": "None", "Secure": True}
+    c.JupyterHub.tornado_settings["cookie_options"] = _cookies
+    c.Spawner.cookie_options = _cookies
