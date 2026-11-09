@@ -680,23 +680,45 @@ mod tests {
     fn every_profile_keeps_seaweedfs_on_a_pvc() {
         for profile in [Profile::Demo, Profile::Full, Profile::Airgap] {
             let values = effective_values("seaweedfs", profile, None, None);
-            assert_eq!(
-                values["volume"]["dataDirs"][0]["type"],
-                serde_json::json!("persistentVolumeClaim"),
-                "profile {profile:?} dropped the PVC"
-            );
+            for pointer in [
+                "/volume/dataDirs/0/type",
+                "/master/data/type",
+                "/filer/data/type",
+            ] {
+                assert_eq!(
+                    values.pointer(pointer),
+                    Some(&serde_json::json!("persistentVolumeClaim")),
+                    "profile {profile:?} dropped the PVC at {pointer}"
+                );
+            }
+            // The chart has no default size for the PVC type, so an empty request
+            // renders as `storage:` with no value and the API server refuses it.
+            for pointer in [
+                "/master/data/size",
+                "/volume/dataDirs/0/size",
+                "/filer/data/size",
+            ] {
+                let size = values
+                    .pointer(pointer)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                assert!(
+                    !size.is_empty(),
+                    "profile {profile:?}: {pointer} is empty, the PVC would be invalid"
+                );
+            }
         }
     }
 
     #[test]
-    fn full_profile_leaves_sizing_to_the_charts() {
-        for component in ["trino", "seaweedfs"] {
-            assert_eq!(
-                effective_values(component, Profile::Full, None, None),
-                golden_values(component),
-                "{component}: full adds no sizing of its own"
-            );
-        }
+    fn full_profile_leaves_the_trino_sizing_to_the_chart() {
+        // Trino only: the SeaweedFS chart does not size a PVC, so the golden
+        // values must carry one (see `every_profile_keeps_seaweedfs_on_a_pvc`).
+        assert_eq!(
+            effective_values("trino", Profile::Full, None, None),
+            golden_values("trino"),
+            "trino: full adds no sizing of its own"
+        );
     }
 
     #[test]
