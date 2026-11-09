@@ -352,7 +352,12 @@ mod tests {
         );
         assert_eq!(
             j["singleuser"]["storage"]["type"],
-            serde_json::json!("none")
+            serde_json::json!("dynamic")
+        );
+        assert_eq!(
+            j["singleuser"]["storage"]["capacity"],
+            serde_json::json!("2Gi"),
+            "platform#696: a stopped notebook server keeps the person's files"
         );
         assert_eq!(j["singleuser"]["defaultUrl"], serde_json::json!("/lab"));
     }

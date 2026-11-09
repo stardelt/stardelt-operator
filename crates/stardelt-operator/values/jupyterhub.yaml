@@ -85,7 +85,10 @@ singleuser:
     limit: 1G
   startTimeout: 300
   storage:
-    type: none
+    type: dynamic
+    capacity: 2Gi
+    dynamic:
+      storageClass: ""
     extraVolumes:
       - name: trino-ca
         secret:
