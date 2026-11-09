@@ -7,14 +7,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Event, EventSource, ObjectReference, Pod};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use kube::ResourceExt;
-use kube::api::{Api, DynamicObject, ObjectMeta, Patch, PatchParams, TypeMeta};
+use kube::api::{
+    Api, DynamicObject, ListParams, ObjectMeta, Patch, PatchParams, PostParams, TypeMeta,
+};
 use kube::runtime::controller::Action;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::controller::Context;
 use crate::crd::{SparkCluster, SparkClusterSize, SparkClusterSpec};
@@ -212,6 +214,7 @@ fn status_value(
     phase: &str,
     endpoint: Option<&str>,
     started_at: Option<&str>,
+    last_activity_at: Option<&str>,
     message: Option<&str>,
     generation: Option<i64>,
 ) -> serde_json::Value {
@@ -219,6 +222,7 @@ fn status_value(
         "phase": phase,
         "endpoint": endpoint,
         "startedAt": started_at,
+        "lastActivityAt": last_activity_at,
         "message": message,
         "observedGeneration": generation,
     })
@@ -246,6 +250,87 @@ fn phase_from_state(state: Option<&str>) -> &'static str {
         Some("failed") => "Failed",
         _ => "Starting",
     }
+}
+
+/// How often a busy cluster refreshes `lastActivityAt`. Longer than the 60 s poll, so a
+/// running job does not cause a status write per minute forever.
+pub const IDLE_HEARTBEAT_SECS: i64 = 300;
+
+/// What one idle poll writes and whether the cluster must stop. Pure: `now` is passed in,
+/// like `stream_app::stream_state`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct IdleDecision {
+    pub last_activity_at: Option<String>,
+    pub stop: bool,
+}
+
+pub fn idle_decision(
+    last_activity_at: Option<&str>,
+    active: bool,
+    idle_minutes: i32,
+    now: k8s_openapi::jiff::Timestamp,
+) -> IdleDecision {
+    let parsed = last_activity_at.and_then(|s| s.parse::<k8s_openapi::jiff::Timestamp>().ok());
+    if active {
+        let stale = parsed.is_none_or(|t| now.as_second() - t.as_second() >= IDLE_HEARTBEAT_SECS);
+        return IdleDecision {
+            last_activity_at: if stale {
+                Some(now.to_string())
+            } else {
+                last_activity_at.map(str::to_string)
+            },
+            stop: false,
+        };
+    }
+    let Some(t) = parsed else {
+        // First observation with no history: start the clock here, do not stop yet.
+        return IdleDecision {
+            last_activity_at: Some(now.to_string()),
+            stop: false,
+        };
+    };
+    IdleDecision {
+        last_activity_at: last_activity_at.map(str::to_string),
+        stop: idle_minutes > 0 && now.as_second() - t.as_second() >= i64::from(idle_minutes) * 60,
+    }
+}
+
+/// Whether the Spark Connect server of `name` has a live executor pod. `None` means
+/// "not observable yet" (the driver or its app selector is not there), never "idle".
+async fn executors_running(
+    client: &kube::Client,
+    namespace: &str,
+    server_pod: Option<&str>,
+) -> Result<Option<bool>, kube::Error> {
+    let Some(server_pod) = server_pod else {
+        return Ok(None);
+    };
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let driver = match pods.get(server_pod).await {
+        Ok(driver) => driver,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(selector) = driver
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("spark-app-selector"))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let executors = pods
+        .list(&ListParams::default().labels(&format!(
+            "spark-role=executor,spark-app-selector={selector}"
+        )))
+        .await?;
+    Ok(Some(
+        executors
+            .items
+            .iter()
+            .any(|pod| pod.metadata.deletion_timestamp.is_none()),
+    ))
 }
 
 fn endpoint_for(server_name: Option<&str>, name: &str, namespace: &str) -> String {
@@ -278,7 +363,7 @@ pub async fn reconcile_spark_cluster(
         patch_status(
             &clusters,
             &name,
-            status_value("Failed", None, None, Some(&message), generation),
+            status_value("Failed", None, None, None, Some(&message), generation),
         )
         .await?;
         tracing::info!(cluster = %name, %namespace, %message, "spark cluster is invalid");
@@ -295,7 +380,7 @@ pub async fn reconcile_spark_cluster(
                     patch_status(
                         &clusters,
                         &name,
-                        status_value("Stopping", None, None, None, generation),
+                        status_value("Stopping", None, None, None, None, generation),
                     )
                     .await?;
                     tracing::info!(cluster = %name, %namespace, "spark cluster stopping");
@@ -305,7 +390,7 @@ pub async fn reconcile_spark_cluster(
                     patch_status(
                         &clusters,
                         &name,
-                        status_value("Stopped", None, None, None, generation),
+                        status_value("Stopped", None, None, None, None, generation),
                     )
                     .await?;
                     tracing::info!(cluster = %name, %namespace, "spark cluster stopped");
@@ -329,7 +414,7 @@ pub async fn reconcile_spark_cluster(
             patch_status(
                 &clusters,
                 &name,
-                status_value("Failed", None, None, Some(&message), generation),
+                status_value("Failed", None, None, None, Some(&message), generation),
             )
             .await?;
             tracing::info!(cluster = %name, %namespace, %message, "spark cluster cannot start");
@@ -354,7 +439,7 @@ pub async fn reconcile_spark_cluster(
             patch_status(
                 &clusters,
                 &name,
-                status_value("Failed", None, None, Some(&message), generation),
+                status_value("Failed", None, None, None, Some(&message), generation),
             )
             .await?;
             tracing::info!(cluster = %name, %namespace, %message, "spark cluster cannot start");
@@ -374,7 +459,7 @@ pub async fn reconcile_spark_cluster(
             patch_status(
                 &clusters,
                 &name,
-                status_value("Failed", None, None, Some(&message), generation),
+                status_value("Failed", None, None, None, Some(&message), generation),
             )
             .await?;
             tracing::info!(cluster = %name, %namespace, %message, "spark cluster cannot start");
@@ -391,15 +476,19 @@ pub async fn reconcile_spark_cluster(
     )
     .await?;
 
-    let (phase, server_name) = match connects.get(&format!("spc-{name}")).await {
+    let (phase, server_name, server_pod) = match connects.get(&format!("spc-{name}")).await {
         Ok(live) => (
             phase_from_state(live.data.pointer("/status/state").and_then(|v| v.as_str())),
             live.data
                 .pointer("/status/server/serviceName")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            live.data
+                .pointer("/status/server/podName")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         ),
-        Err(e) if is_not_found(&e) => ("Starting", None),
+        Err(e) if is_not_found(&e) => ("Starting", None, None),
         Err(e) => return Err(e),
     };
 
@@ -413,6 +502,29 @@ pub async fn reconcile_spark_cluster(
         None
     };
 
+    let mut last_activity = previous.and_then(|s| s.last_activity_at.clone());
+    let mut stop_for_idle = false;
+    if phase == "Running" && spec.idle_stop_minutes > 0 {
+        match executors_running(&ctx.client, &namespace, server_pod.as_deref()).await {
+            Ok(Some(active)) => {
+                let decision = idle_decision(
+                    last_activity.as_deref(),
+                    active,
+                    spec.idle_stop_minutes,
+                    k8s_openapi::jiff::Timestamp::now(),
+                );
+                last_activity = decision.last_activity_at;
+                stop_for_idle = decision.stop;
+            }
+            Ok(None) => {
+                tracing::debug!(cluster = %name, %namespace, "idle check skipped: the driver pod is not observable")
+            }
+            Err(e) => {
+                tracing::warn!(cluster = %name, %namespace, error = %e, "idle check failed; not stopping")
+            }
+        }
+    }
+
     patch_status(
         &clusters,
         &name,
@@ -420,14 +532,69 @@ pub async fn reconcile_spark_cluster(
             phase,
             endpoint.as_deref(),
             started_at.as_deref(),
+            last_activity.as_deref(),
             None,
             generation,
         ),
     )
     .await?;
+
+    if stop_for_idle {
+        clusters
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({ "spec": { "state": "Stopped" } })),
+            )
+            .await?;
+        let now = k8s_openapi::jiff::Timestamp::now();
+        let events: Api<Event> = Api::namespaced(ctx.client.clone(), &namespace);
+        let event = Event {
+            metadata: ObjectMeta {
+                generate_name: Some(format!("{name}-idle-")),
+                namespace: Some(namespace.clone()),
+                ..Default::default()
+            },
+            involved_object: ObjectReference {
+                api_version: Some("stardelt.io/v1alpha1".into()),
+                kind: Some("SparkCluster".into()),
+                name: Some(name.clone()),
+                namespace: Some(namespace.clone()),
+                uid: cluster.uid(),
+                ..Default::default()
+            },
+            reason: Some("IdleStop".into()),
+            message: Some(format!(
+                "no job ran for {} minutes; the operator stopped the cluster",
+                spec.idle_stop_minutes
+            )),
+            type_: Some("Normal".into()),
+            source: Some(EventSource {
+                component: Some("stardelt-operator".into()),
+                host: None,
+            }),
+            first_timestamp: Some(Time(now)),
+            last_timestamp: Some(Time(now)),
+            count: Some(1),
+            ..Default::default()
+        };
+        // The event is informative; a refused create must not fail the reconcile.
+        if let Err(e) = events.create(&PostParams::default(), &event).await {
+            tracing::warn!(cluster = %name, %namespace, error = %e, "idle-stop event not created");
+        }
+        tracing::info!(cluster = %name, %namespace, minutes = spec.idle_stop_minutes, "spark cluster stopped after idle");
+        return Ok(Action::requeue(Duration::from_secs(10)));
+    }
+
     tracing::info!(cluster = %name, %namespace, %phase, "reconciled");
 
-    let requeue = if phase == "Starting" { 30 } else { 300 };
+    let requeue = if phase == "Starting" {
+        30
+    } else if phase == "Running" && spec.idle_stop_minutes > 0 {
+        60
+    } else {
+        300
+    };
     Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
@@ -889,7 +1056,8 @@ mod tests {
             reconcile_spark_cluster(Arc::new(cluster(SparkClusterState::Running)), ctx(client))
                 .await
                 .expect("reconcile");
-        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+        // A Running cluster with `idleStopMinutes > 0` is the 60 s idle poll (ticket #461).
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
         let log = requests.lock().expect("requests").join("\n");
         assert!(log.contains("\"phase\":\"Running\""), "{log}");
         assert!(
@@ -897,6 +1065,8 @@ mod tests {
             "{log}"
         );
         assert!(log.contains("\"startedAt\":\"20"), "{log}");
+        // The driver reports no pod, so the idle clock is not started.
+        assert!(log.contains("\"lastActivityAt\":null"), "{log}");
     }
 
     #[tokio::test]
@@ -1138,5 +1308,199 @@ mod tests {
         let log = requests.lock().expect("requests").join("\n");
         assert!(log.contains("is managed by the platform"), "{log}");
         assert!(!log.contains("/configmaps/"), "{log}");
+    }
+
+    const NOW: &str = "2026-11-09T12:00:00Z";
+
+    /// The wiring around the pure decision: an idle Running cluster is patched to `Stopped`
+    /// and gets one `IdleStop` event.
+    #[tokio::test]
+    async fn an_idle_running_cluster_is_stopped_with_an_event() {
+        let old = {
+            let now = k8s_openapi::jiff::Timestamp::now();
+            (now - std::time::Duration::from_secs(2 * 60 * 60)).to_string()
+        };
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/configmaps/stardelt-spark-runtimes") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-spark-runtimes","namespace":"data"},"data":{"spark-4.0-py3.12":"{\"image\":\"ghcr.io/example/spark@sha256:runtime\",\"sparkVersion\":\"4.0.1\",\"serviceAccount\":\"spark-runtime\",\"sparkConf\":{}}"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/pods/spc-trial-server-abc") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"spc-trial-server-abc","namespace":"data","labels":{"spark-app-selector":"app-1"}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/pods") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[]}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkconnects/spc-trial") {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1alpha1","kind":"SparkConnect","metadata":{"name":"spc-trial","namespace":"data"},"status":{"state":"Running","server":{"serviceName":"spc-trial-server","podName":"spc-trial-server-abc"}}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/sparkclusters/trial") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"SparkCluster","metadata":{"name":"trial","namespace":"data"},"spec":{"owner":{"group":"mobility-analytics"},"runtime":"spark-4.0-py3.12","state":"Running"},"status":{"phase":"Running"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
+            )
+        });
+        let mut c = cluster(SparkClusterState::Running);
+        c.status = Some(crate::crd::SparkClusterStatus {
+            phase: "Running".into(),
+            last_activity_at: Some(old.clone()),
+            ..Default::default()
+        });
+        let action = reconcile_spark_cluster(Arc::new(c), ctx(client))
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(10)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(
+            log.contains("PATCH /apis/stardelt.io/v1alpha1/namespaces/data/sparkclusters/trial")
+                && log.contains(r#""spec":{"state":"Stopped"}"#),
+            "{log}"
+        );
+        assert!(log.contains("POST") && log.contains("/events"), "{log}");
+        assert!(log.contains("\"reason\":\"IdleStop\""), "{log}");
+
+        // A busy cluster is not stopped and keeps the idle clock fresh.
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/configmaps/stardelt-spark-runtimes") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-spark-runtimes","namespace":"data"},"data":{"spark-4.0-py3.12":"{\"image\":\"ghcr.io/example/spark@sha256:runtime\",\"sparkVersion\":\"4.0.1\",\"serviceAccount\":\"spark-runtime\",\"sparkConf\":{}}"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/pods/spc-trial-server-abc") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"spc-trial-server-abc","namespace":"data","labels":{"spark-app-selector":"app-1"}}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/pods") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"PodList","metadata":{},"items":[{"metadata":{"name":"spc-trial-server-abc-exec-1","namespace":"data","labels":{"spark-role":"executor"}}}]}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkconnects/spc-trial") {
+                return (
+                    200,
+                    r#"{"apiVersion":"sparkoperator.k8s.io/v1alpha1","kind":"SparkConnect","metadata":{"name":"spc-trial","namespace":"data"},"status":{"state":"Running","server":{"serviceName":"spc-trial-server","podName":"spc-trial-server-abc"}}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/sparkclusters/trial") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"SparkCluster","metadata":{"name":"trial","namespace":"data"},"spec":{"owner":{"group":"mobility-analytics"},"runtime":"spark-4.0-py3.12","state":"Running"},"status":{"phase":"Running"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
+            )
+        });
+        let mut c = cluster(SparkClusterState::Running);
+        c.status = Some(crate::crd::SparkClusterStatus {
+            phase: "Running".into(),
+            last_activity_at: Some(old.clone()),
+            ..Default::default()
+        });
+        let action = reconcile_spark_cluster(Arc::new(c), ctx(client))
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(60)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(!log.contains("\"state\":\"Stopped\""), "{log}");
+        assert!(!log.contains("/events"), "{log}");
+        assert!(log.contains("\"lastActivityAt\":\"20"), "{log}");
+    }
+
+    fn now() -> k8s_openapi::jiff::Timestamp {
+        NOW.parse().unwrap()
+    }
+
+    #[test]
+    fn an_active_cluster_without_history_records_now() {
+        let decision = idle_decision(None, true, 60, now());
+        assert_eq!(decision.last_activity_at, Some(now().to_string()));
+        assert!(!decision.stop);
+    }
+
+    #[test]
+    fn an_active_cluster_keeps_a_fresh_heartbeat() {
+        let decision = idle_decision(Some("2026-11-09T11:58:00Z"), true, 60, now());
+        assert_eq!(
+            decision.last_activity_at,
+            Some("2026-11-09T11:58:00Z".to_string())
+        );
+        assert!(!decision.stop);
+    }
+
+    #[test]
+    fn an_active_cluster_refreshes_a_stale_heartbeat() {
+        let decision = idle_decision(Some("2026-11-09T11:54:00Z"), true, 60, now());
+        assert_eq!(decision.last_activity_at, Some(now().to_string()));
+        assert!(!decision.stop);
+    }
+
+    #[test]
+    fn the_first_idle_poll_starts_the_clock() {
+        let decision = idle_decision(None, false, 60, now());
+        assert_eq!(decision.last_activity_at, Some(now().to_string()));
+        assert!(!decision.stop);
+    }
+
+    #[test]
+    fn idle_below_the_threshold_does_not_stop() {
+        let decision = idle_decision(Some("2026-11-09T11:01:00Z"), false, 60, now());
+        assert_eq!(
+            decision.last_activity_at,
+            Some("2026-11-09T11:01:00Z".to_string())
+        );
+        assert!(!decision.stop);
+    }
+
+    #[test]
+    fn idle_at_the_threshold_stops() {
+        let decision = idle_decision(Some("2026-11-09T11:00:00Z"), false, 60, now());
+        assert!(decision.stop);
+    }
+
+    #[test]
+    fn zero_minutes_never_stops() {
+        let decision = idle_decision(Some("2026-11-09T02:00:00Z"), false, 0, now());
+        assert!(!decision.stop);
+    }
+
+    #[test]
+    fn a_malformed_stored_timestamp_is_treated_as_no_history() {
+        let decision = idle_decision(Some("not a timestamp"), false, 60, now());
+        assert_eq!(decision.last_activity_at, Some(now().to_string()));
+        assert!(!decision.stop);
     }
 }
