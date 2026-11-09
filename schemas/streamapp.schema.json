@@ -188,6 +188,7 @@
           "type": "array"
         },
         "lastCheckpointAt": {
+          "description": "The time of the newest checkpoint commit (RFC 3339). Absent until the operator reports\nit; the checkpoint itself is written to the object store and survives a stop.",
           "nullable": true,
           "type": "string"
         },
