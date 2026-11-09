@@ -2683,7 +2683,7 @@ pub struct SparkEnvVar {
         "message": "pin the image by digest"
     },
     {
-        "rule": "self.env.all(e, self.env.exists_one(f, f.name == e.name))",
+        "rule": "!has(self.env) || self.env.all(e, self.env.exists_one(f, f.name == e.name))",
         "message": "each env var name may appear once in env"
     }
 ]))]
@@ -4901,7 +4901,21 @@ mod tests {
         );
         assert!(has_cel_rule(
             &spark_spec_schema(),
-            "self.env.all(e, self.env.exists_one(f, f.name == e.name))",
+            "!has(self.env) || self.env.all(e, self.env.exists_one(f, f.name == e.name))",
+            "each env var name may appear once in env"
+        ));
+    }
+
+    #[test]
+    fn a_spark_spec_without_env_is_admitted() {
+        let c = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12"
+        }));
+        assert!(c.spec.validate("analytics").is_ok());
+        assert!(c.spec.env.is_empty());
+        assert!(has_cel_rule(
+            &spark_spec_schema(),
+            "!has(self.env) || self.env.all(e, self.env.exists_one(f, f.name == e.name))",
             "each env var name may appear once in env"
         ));
     }
