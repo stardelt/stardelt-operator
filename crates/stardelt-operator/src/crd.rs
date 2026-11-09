@@ -1956,6 +1956,8 @@ pub struct StreamAppStatus {
     /// `Pending`, `Running`, `Failed` or `Stopped`.
     #[serde(default)]
     pub phase: String,
+    /// The time of the newest checkpoint commit (RFC 3339). Absent until the operator reports
+    /// it; the checkpoint itself is written to the object store and survives a stop.
     #[serde(
         default,
         rename = "lastCheckpointAt",
