@@ -359,6 +359,15 @@ mod tests {
             serde_json::json!("2Gi"),
             "platform#696: a stopped notebook server keeps the person's files"
         );
+        // An empty storage class is a real class name to the chart: it writes
+        // `storageClassName: ""` on claim-<user>, which means "bind only to a
+        // pre-made volume", not "use the cluster default" (platform#786,
+        // operator#445). The key must be absent or name a class.
+        let class = &j["singleuser"]["storage"]["dynamic"]["storageClass"];
+        assert!(
+            class.is_null() || class.as_str().is_some_and(|s| !s.is_empty()),
+            "singleuser.storage.dynamic.storageClass must be absent or a real class, got {class}"
+        );
         assert_eq!(j["singleuser"]["defaultUrl"], serde_json::json!("/lab"));
     }
 
