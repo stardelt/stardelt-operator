@@ -816,6 +816,16 @@ pub struct PipelineTask {
     /// Warehouse that runs a `sql` task; absent means the default warehouse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warehouse: Option<String>,
+    /// The `Connection` whose secret fields this task receives as `CONN_<NAME>_<KEY>`: the name
+    /// upper-cased with `-` written as `_`. The credentials reach the pod through `secretKeyRef`s
+    /// and are never part of the resource, the DAG or a log. A `sql` task runs inside the engine
+    /// and cannot name one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 40),
+        regex(pattern = r"^[a-z]([a-z0-9-]*[a-z0-9])?$")
+    )]
+    pub connection: Option<String>,
     /// Task-specific parameters of the other kinds (model path, gate threshold, …).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schemars(schema_with = "task_config_schema")]
@@ -1014,6 +1024,20 @@ impl PipelineSpec {
             }
             if task.kind == TaskKind::Notebook {
                 validate_notebook_task(task)?;
+            }
+            if let Some(connection) = &task.connection {
+                if !connection_name_ok(connection) {
+                    return Err(format!(
+                        "task `{}` names `{connection}`, which is not a connection name (1 to 40 lower-case letters, digits and dashes, starting with a letter)",
+                        task.name
+                    ));
+                }
+                if task.kind == TaskKind::Sql {
+                    return Err(format!(
+                        "task `{}` is a sql task: a connection is used by a task that runs in a pod (notebook, python or dbt)",
+                        task.name
+                    ));
+                }
             }
         }
         for task in &self.tasks {
@@ -1236,15 +1260,7 @@ impl ConnectionSpec {
     /// The rules the schema's CEL validations also enforce, plus those a schema cannot express
     /// (the resource name, the refresh range), in one place for the controller and the tests.
     pub fn validate(&self, name: &str) -> Result<(), String> {
-        let bytes = name.as_bytes();
-        let name_ok = !name.is_empty()
-            && name.len() <= 40
-            && bytes[0].is_ascii_lowercase()
-            && bytes[bytes.len() - 1] != b'-'
-            && bytes
-                .iter()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
-        if !name_ok {
+        if !connection_name_ok(name) {
             return Err(format!(
                 "connection name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
             ));
@@ -1665,6 +1681,19 @@ pub(crate) fn group_name_ok(group: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// The name rule of a `Connection` (1-40 lower-case letters, digits and dashes, starting with a
+/// letter and not ending in a dash). `ConnectionSpec::validate` and a `PipelineTask.connection`
+/// share it, so a pipeline can never name a connection the API would refuse to create.
+pub(crate) fn connection_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 40
+        && name.as_bytes()[0].is_ascii_lowercase()
+        && !name.ends_with('-')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// A non-human identity for jobs, maintenance and collectors (decisions D20 and D21, internal note
@@ -2952,6 +2981,7 @@ mod tests {
             depends_on: depends_on.iter().map(|d| d.to_string()).collect(),
             sql: (kind == TaskKind::Sql).then(|| "SELECT 1".to_string()),
             warehouse: None,
+            connection: None,
             config: BTreeMap::new(),
         }
     }
@@ -3179,6 +3209,41 @@ mod tests {
                 .unwrap_err()
                 .contains("at most 32 keys")
         );
+    }
+
+    #[test]
+    fn a_task_can_name_a_connection() {
+        let mut notebook = notebook_task("report.ipynb", "v1");
+        notebook.connection = Some("crm-db".into());
+        assert_eq!(spec_of(vec![notebook]).validate(), Ok(()));
+
+        let mut sql = task("load", TaskKind::Sql, &[]);
+        sql.connection = Some("crm-db".into());
+        assert!(
+            spec_of(vec![sql])
+                .validate()
+                .unwrap_err()
+                .contains("is a sql task")
+        );
+    }
+
+    #[test]
+    fn a_connection_name_must_be_a_connection_name() {
+        let too_long = "a".repeat(41);
+        for bad in ["", "-crm", "crm-", "crm_db", "Crm-db", too_long.as_str()] {
+            let mut t = notebook_task("report.ipynb", "v1");
+            t.connection = Some(bad.into());
+            assert!(
+                spec_of(vec![t])
+                    .validate()
+                    .unwrap_err()
+                    .contains("is not a connection name"),
+                "{bad:?}"
+            );
+        }
+        let mut good = notebook_task("report.ipynb", "v1");
+        good.connection = Some("crm-db".into());
+        assert_eq!(spec_of(vec![good]).validate(), Ok(()));
     }
 
     #[test]
