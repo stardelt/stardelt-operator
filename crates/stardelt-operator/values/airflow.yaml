@@ -404,9 +404,10 @@ createUserJob:
         secretKeyRef:
           name: airflow-admin
           key: password
-    # The service user Nova signs in with (NOVA_AIRFLOW_USER / NOVA_AIRFLOW_PASSWORD). The
-    # platform's own file creates only the administrator and leaves this user to a hand-made step
-    # (stardelt-platform#476); an operator-managed install creates it here, read-only (Viewer).
+    # The service user Nova signs in with (NOVA_AIRFLOW_USER / NOVA_AIRFLOW_PASSWORD). The same
+    # Job creates the `nova-api` user and moves it from `Viewer` to `stardelt-nova-operator`
+    # (stardelt-platform#476, #680), and `reset-password` makes the Secret's password the user's
+    # password.
     - name: AIRFLOW_NOVA_API_USERNAME
       valueFrom:
         secretKeyRef:
@@ -436,7 +437,12 @@ createUserJob:
         --firstname Nova \
         --lastname API \
         --password "$AIRFLOW_NOVA_API_PASSWORD"
+      airflow users reset-password \
+        --username "$AIRFLOW_NOVA_API_USERNAME" \
+        --password "$AIRFLOW_NOVA_API_PASSWORD"
       python - <<'PY'
+      import os
+
       from airflow.providers.fab.auth_manager.cli_commands.utils import get_application_builder
 
       # stardelt-member (the registration role): Viewer without the two permissions that make
@@ -448,4 +454,16 @@ createUserJob:
           for permission in sm.find_role("Viewer").permissions:
               if (permission.action.name, permission.resource.name) not in GLOBAL:
                   sm.add_permission_to_role(role, permission)
+
+          # stardelt-nova-operator: Viewer plus run, pause and stop. Only nova-api holds it;
+          # Nova checks the caller's group before every call (nova#196, platform#680).
+          WRITE = {("can_edit", "DAGs"), ("can_create", "DAG Runs"), ("can_edit", "DAG Runs")}
+          op = sm.find_role("stardelt-nova-operator") or sm.add_role("stardelt-nova-operator")
+          for permission in sm.find_role("Viewer").permissions:
+              sm.add_permission_to_role(op, permission)
+          for action, resource in WRITE:
+              sm.add_permission_to_role(op, sm.create_permission(action, resource))
+          nova = sm.find_user(username=os.environ["AIRFLOW_NOVA_API_USERNAME"])
+          nova.roles = [op]
+          sm.update_user(nova)
       PY
