@@ -433,6 +433,38 @@ mod tests {
     }
 
     #[test]
+    fn notebook_task_image_matches_the_single_user_image() {
+        let airflow: Value = serde_yaml::from_str(include_str!("../values/airflow.yaml"))
+            .expect("values/airflow.yaml is valid YAML");
+        // PIPELINE_NOTEBOOK_IMAGE lives in the `extraEnv: |` block scalar, which is a
+        // Helm-templated string (the `{{- if }}` lines make it invalid YAML), so read it
+        // as text: the first `value:` line after the name marker.
+        let extra_env = airflow["extraEnv"]
+            .as_str()
+            .expect("values/airflow.yaml has an extraEnv block scalar");
+        let task = extra_env
+            .split("- name: PIPELINE_NOTEBOOK_IMAGE")
+            .nth(1)
+            .expect("PIPELINE_NOTEBOOK_IMAGE in extraEnv")
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.strip_prefix("value:"))
+            .expect("PIPELINE_NOTEBOOK_IMAGE has a value")
+            .trim();
+        let hub: Value = serde_yaml::from_str(include_str!("../values/jupyterhub.yaml"))
+            .expect("values/jupyterhub.yaml is valid YAML");
+        let hub_tag = hub["singleuser"]["image"]["tag"]
+            .as_str()
+            .expect("singleuser.image.tag is a string");
+        assert_eq!(
+            task.split('@').nth(1),
+            hub_tag.split('@').nth(1),
+            "PIPELINE_NOTEBOOK_IMAGE in values/airflow.yaml must equal \
+             singleuser.image.tag in values/jupyterhub.yaml"
+        );
+    }
+
+    #[test]
     fn jupyterhub_golden_values_round_trip_through_yaml() {
         let values = golden_values("jupyterhub");
         let document = serde_yaml::to_string(&values).expect("golden values serialize as YAML");
