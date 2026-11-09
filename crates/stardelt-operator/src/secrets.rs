@@ -248,6 +248,24 @@ pub fn credential_secret_name(provider: &Value) -> Result<String, String> {
     Err("secrets.external.provider must reference a Secret by name (secretRef/tokenSecretRef/authSecretRef)".to_string())
 }
 
+/// A provider block that authenticates without any stored credential: Vault's Kubernetes
+/// auth exchanges the workload's own service-account token, so there is no Secret to name.
+/// `auth.kubernetes` needs both `role` and `serviceAccountRef.name` — the two fields
+/// External Secrets requires; anything less is not a usable Kubernetes-auth store.
+pub fn uses_kubernetes_auth(provider: &Value) -> bool {
+    provider
+        .get("vault")
+        .and_then(|v| v.get("auth"))
+        .and_then(|a| a.get("kubernetes"))
+        .is_some_and(|k| {
+            k.get("role").and_then(Value::as_str).is_some()
+                && k.get("serviceAccountRef")
+                    .and_then(|s| s.get("name"))
+                    .and_then(Value::as_str)
+                    .is_some()
+        })
+}
+
 /// The `ClusterSecretStore` for this instance: `Ok(None)` for `none`/`platform`, `Err` when
 /// `external` mode is incomplete, `Ok(Some(_))` with the provider block passed through unchanged.
 pub fn external_store(spec: &PlatformInstanceSpec) -> Result<Option<Value>, String> {
@@ -259,7 +277,19 @@ pub fn external_store(spec: &PlatformInstanceSpec) -> Result<Option<Value>, Stri
             })?;
             let provider = &external.provider;
             let (provider_name, _provider_value) = provider_block(provider)?;
-            let _ = credential_secret_name(provider)?;
+            if uses_kubernetes_auth(provider) {
+                // Kubernetes auth carries no credential, but an inline token next to it is still a
+                // credential in the CR and stays refused.
+                if let Value::Object(root) = provider
+                    && let Some(Value::Object(vault)) = root.get("vault")
+                    && vault.contains_key("token")
+                    && !vault.contains_key("tokenSecretRef")
+                {
+                    return Err("secrets.external.provider must reference a Secret by name (secretRef/tokenSecretRef/authSecretRef), never inline credentials".to_string());
+                }
+            } else {
+                let _ = credential_secret_name(provider)?;
+            }
             Ok(Some(serde_json::json!({
                 "apiVersion": "external-secrets.io/v1",
                 "kind": "ClusterSecretStore",
@@ -382,6 +412,51 @@ mod tests {
             store["spec"]["provider"],
             spec.secrets.external.as_ref().unwrap().provider
         );
+    }
+
+    #[test]
+    fn kubernetes_auth_needs_no_credential_secret() {
+        use crate::crd::{ComponentValues, IdentitySpec, IngressSettings, Pillars, Profile};
+        let kubernetes_auth = serde_json::json!({"vault": {
+            "server": "https://vault.example.com", "path": "secret", "version": "v2",
+            "auth": {"kubernetes": {"mountPath": "kubernetes", "role": "stardelt",
+                                     "serviceAccountRef": {"name": "stardelt-secret-store", "namespace": "stardelt"}}}
+        }});
+        assert!(uses_kubernetes_auth(&kubernetes_auth));
+        // The old rule still refuses the block: this test pins that the exception is deliberate.
+        assert!(credential_secret_name(&kubernetes_auth).is_err());
+        let spec = PlatformInstanceSpec {
+            profile: Profile::Demo,
+            pillars: Pillars::default(),
+            dry_run: true,
+            cluster_operation: Default::default(),
+            component_values: ComponentValues::default(),
+            namespace: "stardelt".into(),
+            base_domain: None,
+            identity: IdentitySpec::default(),
+            secrets: crate::crd::SecretsSpec {
+                mode: SecretsMode::External,
+                external: Some(ExternalSecretsSpec {
+                    provider: kubernetes_auth.clone(),
+                }),
+                groups: Vec::new(),
+            },
+            ingress: IngressSettings::default(),
+        };
+        let store = external_store(&spec).unwrap().unwrap();
+        assert_eq!(store["spec"]["provider"], kubernetes_auth);
+        // A block with neither a Secret reference nor complete Kubernetes auth is still refused,
+        // and so is an inline token next to Kubernetes auth.
+        for refused in [
+            serde_json::json!({"vault": {"server": "https://vault.example.com"}}),
+            serde_json::json!({"vault": {"server": "https://vault.example.com", "token": "s3cret",
+                "auth": {"kubernetes": {"role": "stardelt",
+                    "serviceAccountRef": {"name": "stardelt-secret-store"}}}}}),
+        ] {
+            let mut refused_spec = spec.clone();
+            refused_spec.secrets.external = Some(ExternalSecretsSpec { provider: refused });
+            assert!(external_store(&refused_spec).is_err());
+        }
     }
 
     #[test]
