@@ -19,6 +19,7 @@ rules:
       - "connections"
       - "serviceprincipals"
       - "sparkclusters"
+      - "catalogs"
     verbs: ["get", "list", "watch"]
   - apiGroups: ["stardelt.io"]
     resources:
@@ -29,6 +30,7 @@ rules:
       - "connections/status"
       - "serviceprincipals/status"
       - "sparkclusters/status"
+      - "catalogs/status"
     verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["events"]

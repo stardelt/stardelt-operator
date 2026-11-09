@@ -29,7 +29,7 @@ use serde_json::json;
 use crate::connection::reconcile_connection;
 use crate::crd::Profile;
 use crate::crd::{
-    ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, IdentityMode,
+    Catalog, ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, IdentityMode,
     Lakehouse, LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal,
     SparkCluster, StorageImpl, StreamApp, ValuesSource,
 };
@@ -110,8 +110,18 @@ pub async fn run() -> anyhow::Result<()> {
         ctx.clone(),
     );
 
+    let catalogs = Controller::new(
+        Api::<Catalog>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .run(
+        crate::maintenance::reconcile_catalog,
+        crate::maintenance::error_policy,
+        ctx.clone(),
+    );
+
     tracing::info!(
-        "stardelt-operator watching PlatformInstance, Lakehouse, Connection, ServicePrincipal, StreamApp and SparkCluster"
+        "stardelt-operator watching PlatformInstance, Lakehouse, Connection, ServicePrincipal, StreamApp, SparkCluster and Catalog"
     );
     futures::pin_mut!(
         lakehouses,
@@ -119,7 +129,8 @@ pub async fn run() -> anyhow::Result<()> {
         connections,
         principals,
         streams,
-        spark_clusters
+        spark_clusters,
+        catalogs
     );
     loop {
         tokio::select! {
@@ -129,6 +140,7 @@ pub async fn run() -> anyhow::Result<()> {
             _ = principals.next() => {}
             _ = streams.next() => {}
             _ = spark_clusters.next() => {}
+            _ = catalogs.next() => {}
         }
     }
 }
