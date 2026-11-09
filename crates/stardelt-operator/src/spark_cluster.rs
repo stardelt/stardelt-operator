@@ -135,10 +135,6 @@ pub fn spark_connect(
         "spark.kubernetes.namespace".to_string(),
         namespace.to_string(),
     );
-    spark_conf.insert(
-        "spark.kubernetes.authenticate.driver.serviceAccountName".to_string(),
-        runtime.service_account.clone(),
-    );
 
     let image = spec.image.clone().unwrap_or_else(|| runtime.image.clone());
 
@@ -659,10 +655,6 @@ mod tests {
             "spark.kubernetes.namespace".to_string(),
             "elsewhere".to_string(),
         );
-        s.spark_conf.insert(
-            "spark.kubernetes.authenticate.driver.serviceAccountName".to_string(),
-            "mine".to_string(),
-        );
         s.spark_conf
             .insert("spark.sql.shuffle.partitions".to_string(), "16".to_string());
         let object = spark_connect("trial", "data", &s, &runtime(), &owner()).expect("build");
@@ -676,6 +668,12 @@ mod tests {
             object
                 .data
                 .pointer("/spec/sparkConf/spark.kubernetes.authenticate.driver.serviceAccountName"),
+            None
+        );
+        assert_eq!(
+            object
+                .data
+                .pointer("/spec/server/template/spec/serviceAccountName"),
             Some(&json!("spark-runtime"))
         );
         assert_eq!(
