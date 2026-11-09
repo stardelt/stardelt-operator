@@ -101,8 +101,6 @@ singleuser:
   storage:
     type: dynamic
     capacity: 2Gi
-    dynamic:
-      storageClass: ""
     extraVolumes:
       - name: trino-ca
         secret:
