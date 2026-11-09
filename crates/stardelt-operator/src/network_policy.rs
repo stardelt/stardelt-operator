@@ -48,6 +48,97 @@ fn peer(labels: &[(&str, &str)]) -> NetworkPolicyPeer {
     }
 }
 
+/// The same peer, with keys and values the caller builds (a group label key carries the
+/// group's own name).
+fn peer_owned(labels: Vec<(&str, String)>) -> NetworkPolicyPeer {
+    NetworkPolicyPeer {
+        pod_selector: Some(LabelSelector {
+            match_labels: Some(BTreeMap::from_iter(
+                labels.into_iter().map(|(k, v)| (k.to_string(), v)),
+            )),
+            match_expressions: None,
+        }),
+        namespace_selector: None,
+        ip_block: None::<IPBlock>,
+    }
+}
+
+/// A Kubernetes label key segment or label value: 1 to 63 bytes, ASCII alphanumeric at both
+/// ends, `[A-Za-z0-9_.-]` in between.
+fn label_segment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let alnum = |b: &u8| b.is_ascii_alphanumeric();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && alnum(&bytes[0])
+        && alnum(&bytes[bytes.len() - 1])
+        && bytes
+            .iter()
+            .all(|b| alnum(b) || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Port the Spark Connect server serves gRPC on.
+pub const SPARK_CONNECT_PORT: i32 = 15002;
+
+/// Ingress to one `SparkConnect` server (internal#161 slice 4d): the server authenticates
+/// nobody, so the network admits only the owner's pods, Nova and Airflow. The caller sets
+/// the owner reference; the policy is created before the server exists.
+pub fn spark_connect_ingress(
+    name: &str,
+    namespace: &str,
+    owner: &crate::crd::SparkClusterOwner,
+) -> Result<NetworkPolicy, String> {
+    let connect = format!("spc-{name}");
+    if !label_segment(&connect) {
+        return Err(format!(
+            "`{connect}` is not a valid label value (1 to 63 characters, letters, digits, `-`, `_` and `.`, starting and ending with a letter or digit)"
+        ));
+    }
+    let owner_peer = match (&owner.group, &owner.user) {
+        (Some(group), _) => {
+            let segment = format!("group.{group}");
+            if !label_segment(&segment) {
+                return Err(format!(
+                    "group `{group}` is not a valid label segment (1 to 63 characters, letters, digits, `-`, `_` and `.`, starting and ending with a letter or digit)"
+                ));
+            }
+            let key = format!("stardelt.io/{segment}");
+            peer_owned(vec![(&key, "true".to_string())])
+        }
+        (None, Some(user)) => {
+            if !label_segment(user) {
+                return Err(format!(
+                    "user `{user}` is not a valid label value (1 to 63 characters, letters, digits, `-`, `_` and `.`, starting and ending with a letter or digit)"
+                ));
+            }
+            peer_owned(vec![("stardelt.io/user", user.clone())])
+        }
+        (None, None) => return Err("the cluster names no owner".to_string()),
+    };
+    Ok(NetworkPolicy {
+        metadata: meta(&format!("{connect}-ingress"), namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(CONNECT_POD_LABEL.to_string(), connect)])),
+                match_expressions: None,
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![
+                    owner_peer,
+                    peer(&[("app.kubernetes.io/name", "nova")]),
+                    peer(&[("release", "airflow"), ("component", "worker")]),
+                ]),
+                ports: Some(vec![port(SPARK_CONNECT_PORT)]),
+            }]),
+            egress: None,
+        }),
+    })
+}
+
+/// The Spark Operator labels a `SparkConnect`'s server pod with the connect's name.
+pub const CONNECT_POD_LABEL: &str = "sparkoperator.k8s.io/connect-name";
+
 fn port(number: i32) -> NetworkPolicyPort {
     NetworkPolicyPort {
         port: Some(IntOrString::Int(number)),
@@ -264,5 +355,105 @@ mod tests {
         for p in ports {
             assert_eq!(p.protocol.as_ref().unwrap(), "TCP");
         }
+    }
+
+    fn owner_labels(peer: &NetworkPolicyPeer) -> BTreeMap<String, String> {
+        peer.pod_selector
+            .as_ref()
+            .expect("pod selector")
+            .match_labels
+            .clone()
+            .expect("labels")
+    }
+
+    #[test]
+    fn a_group_cluster_admits_the_owner_group_nova_and_airflow() {
+        let owner = crate::crd::SparkClusterOwner {
+            group: Some("mobility-analytics".into()),
+            user: None,
+        };
+        let policy = spark_connect_ingress("trial", "data", &owner).expect("policy");
+        assert_eq!(policy.metadata.name.as_deref(), Some("spc-trial-ingress"));
+        assert_eq!(policy.metadata.namespace.as_deref(), Some("data"));
+        assert!(policy.metadata.owner_references.is_none());
+        let spec = policy.spec.as_ref().expect("spec");
+        assert_eq!(
+            spec.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([(
+                "sparkoperator.k8s.io/connect-name".to_string(),
+                "spc-trial".to_string()
+            )])
+        );
+        assert_eq!(
+            spec.policy_types.as_ref().unwrap(),
+            &vec!["Ingress".to_string()]
+        );
+        let ingress = spec.ingress.as_ref().unwrap();
+        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress[0].ports.as_ref().unwrap(), &vec![port(15002)]);
+        let from = ingress[0].from.as_ref().unwrap();
+        assert_eq!(from.len(), 3, "{from:?}");
+        assert_eq!(
+            owner_labels(&from[0]),
+            BTreeMap::from([(
+                "stardelt.io/group.mobility-analytics".to_string(),
+                "true".to_string()
+            )])
+        );
+        assert_eq!(
+            owner_labels(&from[1]),
+            BTreeMap::from([("app.kubernetes.io/name".to_string(), "nova".to_string())])
+        );
+        assert_eq!(
+            owner_labels(&from[2]),
+            BTreeMap::from([
+                ("release".to_string(), "airflow".to_string()),
+                ("component".to_string(), "worker".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_person_cluster_admits_that_person() {
+        let owner = crate::crd::SparkClusterOwner {
+            group: None,
+            user: Some("ana".into()),
+        };
+        let policy = spark_connect_ingress("trial", "data", &owner).expect("policy");
+        let spec = policy.spec.as_ref().expect("spec");
+        let from = spec.ingress.as_ref().unwrap()[0]
+            .from
+            .as_ref()
+            .expect("peer");
+        assert_eq!(
+            owner_labels(&from[0]),
+            BTreeMap::from([("stardelt.io/user".to_string(), "ana".to_string())])
+        );
+        let keys = from
+            .iter()
+            .flat_map(|p| owner_labels(p).into_keys())
+            .collect::<Vec<_>>();
+        assert!(!keys.iter().any(|key| key.contains("group.")), "{keys:?}");
+    }
+
+    #[test]
+    fn an_owner_that_cannot_be_a_label_is_refused() {
+        let spaced = crate::crd::SparkClusterOwner {
+            group: Some("Analytics Team".into()),
+            user: None,
+        };
+        let err = spark_connect_ingress("trial", "data", &spaced).unwrap_err();
+        assert!(err.contains("Analytics Team"), "{err}");
+
+        let long = crate::crd::SparkClusterOwner {
+            group: Some("a".repeat(60)),
+            user: None,
+        };
+        assert!(spark_connect_ingress("trial", "data", &long).is_err());
     }
 }
