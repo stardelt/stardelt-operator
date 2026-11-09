@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
 use kube::api::{Api, DynamicObject, ObjectMeta, Patch, PatchParams, TypeMeta};
@@ -303,6 +304,27 @@ pub async fn reconcile_spark_cluster(
         }
         crate::crd::SparkClusterState::Running => {}
     }
+
+    // The server authenticates nobody: the policy that admits only the owner's pods, Nova
+    // and Airflow goes in before the SparkConnect exists (internal#161 slice 4d).
+    let policy = match crate::network_policy::spark_connect_ingress(&name, &namespace, &spec.owner)
+    {
+        Ok(mut policy) => {
+            policy.metadata.owner_references = Some(vec![owner_reference(&cluster)]);
+            policy
+        }
+        Err(message) => {
+            patch_status(
+                &clusters,
+                &name,
+                status_value("Failed", None, None, Some(&message), generation),
+            )
+            .await?;
+            tracing::info!(cluster = %name, %namespace, %message, "spark cluster cannot start");
+            return Ok(Action::await_change());
+        }
+    };
+    objects::apply::<NetworkPolicy>(&ctx.client, &namespace, &policy, false).await?;
 
     let runtime = match Api::<ConfigMap>::namespaced(ctx.client.clone(), &namespace)
         .get(RUNTIME_CATALOGUE)
@@ -712,6 +734,12 @@ mod tests {
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"not found","reason":"NotFound","code":404}"#.into(),
                 );
             }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
                 return (
                     200,
@@ -740,6 +768,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_applies_the_ingress_policy() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.contains("/configmaps/stardelt-spark-runtimes") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-spark-runtimes","namespace":"data"},"data":{"spark-4.0-py3.12":"{\"image\":\"ghcr.io/example/spark@sha256:runtime\",\"sparkVersion\":\"4.0.1\",\"serviceAccount\":\"spark-runtime\",\"sparkConf\":{}}"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.contains("/sparkconnects/spc-trial") {
+                return (
+                    404,
+                    r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"not found","reason":"NotFound","code":404}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"SparkCluster","metadata":{"name":"trial","namespace":"data"},"spec":{"owner":{"group":"mobility-analytics"},"runtime":"spark-4.0-py3.12","state":"Running"},"status":{"phase":"Starting"}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"apiVersion":"sparkoperator.k8s.io/v1alpha1","kind":"SparkConnect","metadata":{"name":"spc-trial","namespace":"data"}}"#.into(),
+            )
+        });
+        reconcile_spark_cluster(Arc::new(cluster(SparkClusterState::Running)), ctx(client))
+            .await
+            .expect("reconcile");
+        let log = requests.lock().expect("requests").join("\n");
+        let applied = log
+            .lines()
+            .find(|line| {
+                line.starts_with("PATCH") && line.contains("/networkpolicies/spc-trial-ingress")
+            })
+            .unwrap_or_else(|| panic!("no ingress policy applied: {log}"));
+        assert!(
+            applied.contains("fieldManager=stardelt-operator"),
+            "{applied}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_live_running_server_reports_running_with_an_endpoint() {
         let (client, requests) = mock_client(|method, path, _body| {
             if method == "GET" && path.contains("/configmaps/stardelt-spark-runtimes") {
@@ -752,6 +828,12 @@ mod tests {
                 return (
                     200,
                     r#"{"apiVersion":"sparkoperator.k8s.io/v1alpha1","kind":"SparkConnect","metadata":{"name":"spc-trial","namespace":"data"},"status":{"state":"Running","server":{"serviceName":"spc-trial-server"}}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
                 );
             }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
@@ -788,6 +870,12 @@ mod tests {
                     r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
                 );
             }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
                 return (
                     200,
@@ -822,6 +910,12 @@ mod tests {
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"not found","reason":"NotFound","code":404}"#.into(),
                 );
             }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
                 return (
                     200,
@@ -851,6 +945,12 @@ mod tests {
                 return (
                     200,
                     r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-spark-runtimes","namespace":"data"},"data":{"spark-4.0-py3.12":"{}"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
                 );
             }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
@@ -891,6 +991,12 @@ mod tests {
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","message":"not found","reason":"NotFound","code":404}"#.into(),
                 );
             }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
                 return (
                     200,
@@ -922,6 +1028,12 @@ mod tests {
                 return (
                     200,
                     r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-spark-runtimes","namespace":"data"},"data":{"spark-4.0-py3.12":"{\"image\":\"ghcr.io/example/spark@sha256:runtime\",\"sparkVersion\":\"4.0.1\",\"serviceAccount\":\"spark-runtime\",\"sparkConf\":{}}"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
                 );
             }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
@@ -959,6 +1071,12 @@ mod tests {
     #[tokio::test]
     async fn an_invalid_cluster_reports_failed_before_touching_the_catalogue() {
         let (client, requests) = mock_client(|method, path, _body| {
+            if method == "PATCH" && path.contains("/networkpolicies/") {
+                return (
+                    200,
+                    r#"{"apiVersion":"networking.k8s.io/v1","kind":"NetworkPolicy","metadata":{"name":"spc-trial-ingress","namespace":"data"}}"#.into(),
+                );
+            }
             if method == "PATCH" && path.contains("/sparkclusters/trial/status") {
                 return (
                     200,
