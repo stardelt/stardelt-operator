@@ -864,18 +864,42 @@ mod tests {
         assert_eq!(values["fernetKeySecretName"], "airflow-fernet-key");
     }
 
-    /// platform#496: Nova's Airflow identity is read-only; Run/Pause live in Airflow's UI, where
-    /// the person's own group role carries the permission.
+    /// platform#680: Nova's Airflow service user `nova-api` holds `stardelt-nova-operator` —
+    /// Viewer plus run, pause and stop — because Nova's Run/Pause/Resume call Airflow as it.
     #[test]
-    fn the_golden_airflow_create_user_job_keeps_nova_api_read_only() {
-        let text = include_str!("../values/airflow.yaml");
+    fn the_golden_airflow_create_user_job_gives_nova_api_the_operator_role() {
+        let values = golden_values("airflow");
+        let script = values["createUserJob"]["args"][2]
+            .as_str()
+            .expect("the script");
         assert!(
-            text.contains("--role Viewer"),
-            "the nova-api user must be created with --role Viewer"
+            script.contains("sm.add_role(\"stardelt-nova-operator\")"),
+            "the nova-api service user needs the stardelt-nova-operator role"
         );
         assert!(
-            !text.contains("nova-service"),
-            "the golden values must not create a write role for Nova"
+            script.contains("sm.create_permission(action, resource)"),
+            "the operator role is Viewer plus the write permissions"
+        );
+        assert!(
+            script.contains("sm.update_user(nova)"),
+            "the created user must be moved onto the operator role"
+        );
+        assert!(
+            script.contains("airflow users reset-password"),
+            "re-running the Job must set the Secret's password on the existing user"
+        );
+        assert!(
+            script.find("import os") < script.find("os.environ["),
+            "os is imported before the environment is read"
+        );
+        assert_eq!(
+            script.matches("--role Viewer").count(),
+            1,
+            "nova-api is created as Viewer and then moved; no second write role"
+        );
+        assert!(
+            !script.contains("nova-service"),
+            "the golden values must not create a second write role for Nova"
         );
     }
 
@@ -1018,7 +1042,7 @@ mod tests {
     }
 
     #[test]
-    fn the_golden_user_job_creates_the_administrator_and_the_read_only_service_user_of_nova() {
+    fn the_golden_user_job_creates_the_administrator_and_the_service_user_of_nova() {
         let values = golden_values("airflow");
         let job = &values["createUserJob"];
         let env: Vec<(&str, &str, &str)> = job["env"]
@@ -1045,6 +1069,7 @@ mod tests {
         );
         let script = job["args"][2].as_str().expect("the script");
         assert_eq!(script.matches("airflow users create").count(), 2);
+        assert!(script.contains("airflow users reset-password"));
         assert!(script.contains("--role Admin") && script.contains("--role Viewer"));
         assert!(script.contains("--username \"$AIRFLOW_NOVA_API_USERNAME\""));
         assert!(script.starts_with("set -e"));
