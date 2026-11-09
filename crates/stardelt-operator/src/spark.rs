@@ -391,6 +391,16 @@ mod tests {
     }
 
     #[test]
+    fn executors_run_the_same_image_as_the_driver() {
+        let g = golden();
+        assert!(
+            g.defaults
+                .contains(&format!("spark.kubernetes.container.image {}", g.image)),
+            "the spark-defaults block must name the same digest as `image:` in values/spark.yaml"
+        );
+    }
+
+    #[test]
     fn the_driver_reads_the_s3_secret_and_its_own_ip() {
         let dep = deployment("stardelt");
         let container = container_of(&dep);
