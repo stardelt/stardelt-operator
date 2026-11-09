@@ -3468,6 +3468,119 @@ mod tests {
         );
     }
 
+    /// What every `helm get manifest` answers in the first-stop test: one Deployment and one
+    /// StatefulSet, the two workloads the plan's releases render.
+    const FIRST_STOP_MANIFEST: &str = r#"---
+# Source: lakekeeper/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lakekeeper
+  namespace: stardelt
+---
+# Source: seaweedfs/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: seaweedfs-master
+  namespace: stardelt
+"#;
+
+    #[tokio::test]
+    async fn a_first_stop_discovers_the_workloads_and_records_them() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        helm.reply("get", FIRST_STOP_MANIFEST);
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse = stopped_lakehouse(
+            None,
+            json!({ "dryRun": false, "clusterOperation": { "stopped": true } }),
+        );
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile a first stop");
+
+        // The record: written before anything was scaled, one entry per discovered workload
+        // with the live replica count (the mock answers 1).
+        let records = patches_to(&requests, "lakehouses/main");
+        let recorded = records
+            .iter()
+            .find_map(|body| {
+                body["metadata"]["annotations"]
+                    .get("stardelt.io/previous-replicas")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("no previous-replicas annotation: {records:?}"));
+        let recorded: serde_json::Value =
+            serde_json::from_str(&recorded).expect("the annotation is JSON");
+        assert_eq!(
+            recorded,
+            json!({ "Deployment/lakekeeper": 1, "StatefulSet/seaweedfs-master": 1 })
+        );
+
+        // The scale-down: the set of names patched to zero, independent of component order
+        // and of the count (the stub answers the same manifest to every release's `get`).
+        let scaled: std::collections::BTreeSet<String> = requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|request| {
+                request.method == "PATCH"
+                    && (request.path.contains("/deployments/")
+                        || request.path.contains("/statefulsets/"))
+            })
+            .filter(|request| {
+                let body: serde_json::Value =
+                    serde_json::from_str(&request.body).expect("patch body is JSON");
+                body["spec"]["replicas"] == json!(0)
+            })
+            .map(|request| {
+                request
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            scaled,
+            std::collections::BTreeSet::from([
+                "lakekeeper".to_string(),
+                "seaweedfs-master".to_string()
+            ])
+        );
+
+        for cluster in ["lakekeeper-pg", "openfga-pg"] {
+            let patches = patches_to(&requests, &format!("/clusters/{cluster}"));
+            assert!(
+                patches.iter().any(|body| {
+                    body["metadata"]["annotations"]["cnpg.io/hibernation"] == json!("true")
+                }),
+                "{cluster} is hibernated: {patches:?}"
+            );
+        }
+
+        assert_eq!(
+            patched_status(&requests, "lakehouses")["phase"],
+            json!("Stopped")
+        );
+        assert!(
+            !helm
+                .calls
+                .lock()
+                .expect("calls poisoned")
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("upgrade")),
+            "a first stop must not apply a release"
+        );
+    }
+
     #[tokio::test]
     async fn an_unstoppped_lakehouse_restores_the_counts_and_removes_the_annotation() {
         let (client, requests) = status_mock_client(json!([]));
