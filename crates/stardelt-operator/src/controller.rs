@@ -6,6 +6,7 @@
 //! - `Connection` → an External Secrets sync (see [`crate::connection`])
 //! - `ServicePrincipal` → validation and its credentials Secret check (see [`crate::principal`])
 //! - `StreamApp` → a SparkApplication job (see [`crate::stream_app`])
+//! - `SparkCluster` → the Spark Operator's `SparkConnect` server (see [`crate::spark_cluster`])
 //!
 //! Applies go through Helm. Both resources default to `dryRun: true`, so a new
 //! resource plans first and changes nothing until explicitly flipped.
@@ -30,7 +31,7 @@ use crate::crd::Profile;
 use crate::crd::{
     ComponentStatus, ComponentValues, Condition, Connection, DeletionPolicy, IdentityMode,
     Lakehouse, LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal,
-    StorageImpl, StreamApp, ValuesSource,
+    SparkCluster, StorageImpl, StreamApp, ValuesSource,
 };
 use crate::helm::{
     CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned, manifest_args,
@@ -99,10 +100,27 @@ pub async fn run() -> anyhow::Result<()> {
         ctx.clone(),
     );
 
-    tracing::info!(
-        "stardelt-operator watching PlatformInstance, Lakehouse, Connection, ServicePrincipal and StreamApp"
+    let spark_clusters = Controller::new(
+        Api::<SparkCluster>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .run(
+        crate::spark_cluster::reconcile_spark_cluster,
+        crate::spark_cluster::error_policy,
+        ctx.clone(),
     );
-    futures::pin_mut!(lakehouses, platforms, connections, principals, streams);
+
+    tracing::info!(
+        "stardelt-operator watching PlatformInstance, Lakehouse, Connection, ServicePrincipal, StreamApp and SparkCluster"
+    );
+    futures::pin_mut!(
+        lakehouses,
+        platforms,
+        connections,
+        principals,
+        streams,
+        spark_clusters
+    );
     loop {
         tokio::select! {
             _ = lakehouses.next() => {}
@@ -110,6 +128,7 @@ pub async fn run() -> anyhow::Result<()> {
             _ = connections.next() => {}
             _ = principals.next() => {}
             _ = streams.next() => {}
+            _ = spark_clusters.next() => {}
         }
     }
 }

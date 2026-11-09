@@ -134,6 +134,15 @@ pub fn spark_application_resource() -> ApiResource {
     )
 }
 
+/// A Kubeflow Spark Operator Spark Connect server
+/// (`sparkconnects.sparkoperator.k8s.io/v1alpha1`).
+pub fn spark_connect_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("sparkoperator.k8s.io", "v1alpha1", "SparkConnect"),
+        "sparkconnects",
+    )
+}
+
 /// The CloudNative-PG ScheduledBackup resource (`scheduledbackups.postgresql.cnpg.io/v1`).
 pub fn cnpg_scheduled_backup_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(
