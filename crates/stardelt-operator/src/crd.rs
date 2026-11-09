@@ -603,13 +603,16 @@ pub struct SparkCompute {
     pub enabled: bool,
 }
 
-/// The operator's switches for one resource (design: operator#64). `stopped`
-/// is not part of this struct yet; it lands with its own ticket.
+/// The operator's switches for one resource (design: operator#64).
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
 pub struct ClusterOperation {
     /// Stop reconciling: the operator writes `Paused` and applies nothing.
     #[serde(default, rename = "reconciliationPaused")]
     pub reconciliation_paused: bool,
+    /// Stop the workloads: scale every rendered Deployment and StatefulSet to zero, hibernate the
+    /// namespace's CNPG databases, and report `Stopped`. Data, PVCs and Secrets stay.
+    #[serde(default)]
+    pub stopped: bool,
 }
 
 /// A managed lakehouse: catalog + storage (+ query) on object storage.

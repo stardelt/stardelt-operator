@@ -151,14 +151,19 @@ impl HelmRelease {
 
     /// `helm get manifest` — the rendered objects of the deployed release.
     pub fn manifest_args(&self) -> Vec<String> {
-        vec![
-            "get".into(),
-            "manifest".into(),
-            self.name.clone(),
-            "--namespace".into(),
-            self.namespace.clone(),
-        ]
+        manifest_args(&self.name, &self.namespace)
     }
+}
+
+/// `helm get manifest <release> -n <namespace>` — the rendered objects of the deployed release.
+pub fn manifest_args(release: &str, namespace: &str) -> Vec<String> {
+    vec![
+        "get".into(),
+        "manifest".into(),
+        release.to_string(),
+        "--namespace".into(),
+        namespace.to_string(),
+    ]
 }
 
 /// True when `helm status -o json` output reports the release as `deployed`.
