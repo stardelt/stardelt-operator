@@ -32,11 +32,18 @@ spec:
               clusterOperation:
                 default:
                   reconciliationPaused: false
+                  stopped: false
                 description: 'Freeze this resource: no cluster changes, status phase `Paused` (operator#64).'
                 properties:
                   reconciliationPaused:
                     default: false
                     description: 'Stop reconciling: the operator writes `Paused` and applies nothing.'
+                    type: boolean
+                  stopped:
+                    default: false
+                    description: |-
+                      Stop the workloads: scale every rendered Deployment and StatefulSet to zero, hibernate the
+                      namespace's CNPG databases, and report `Stopped`. Data, PVCs and Secrets stay.
                     type: boolean
                 type: object
               dryRun:

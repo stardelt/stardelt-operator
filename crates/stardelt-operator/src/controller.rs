@@ -32,7 +32,10 @@ use crate::crd::{
     Lakehouse, LakehouseStatus, PlatformInstance, PlatformInstanceStatus, ServicePrincipal,
     StorageImpl, StreamApp, ValuesSource,
 };
-use crate::helm::{CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned};
+use crate::helm::{
+    CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned, manifest_args,
+    rendered_workloads,
+};
 use crate::objects::cnpg_cluster_resource;
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::prerequisites::CATALOG_CLUSTER;
@@ -48,6 +51,7 @@ use crate::provision::{
     ensure_secrets_mode, ensure_spark, ensure_superset_group_roles, ensure_superset_rbac,
     ensure_superset_secrets, ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
+use crate::stop;
 use crate::values::{deep_merge, effective_values, identity_values, parse_values_document};
 
 pub struct Context {
@@ -860,6 +864,241 @@ async fn delete_lakehouse(lh: &Lakehouse, ctx: &Context) -> Result<Action, kube:
     Ok(Action::await_change())
 }
 
+/// Stop a `Lakehouse` (operator#64): scale every workload the releases rendered to zero,
+/// hibernate the namespace's CNPG databases and report `Stopped`. The replica counts are
+/// recorded in [`stop::PREVIOUS_REPLICAS`] the first time, so an unstop restores them.
+///
+/// Exactly three things happen: the annotation (once), the scale-down, and the status. No
+/// plan is applied and no Helm release is upgraded, so the pods stay down.
+async fn stop_lakehouse(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Result<Action, kube::Error> {
+    let name = lh.name_any();
+    let annotation = lh
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(stop::PREVIOUS_REPLICAS));
+    let workloads = match annotation {
+        // Already stopped once: only enforce zero (idempotent, repairs a hand-scaled workload).
+        Some(annotation) => invalid_input(stop::recorded(annotation), &name)?,
+        None => {
+            let workloads = discover_workloads(ctx, lh, namespace).await?;
+            if workloads.is_empty() {
+                tracing::info!(
+                    lakehouse = %name,
+                    %namespace,
+                    "stopped; no workload was ever applied, so nothing was scaled"
+                );
+                return write_stopped_status(ctx, lh).await;
+            }
+            let mut annotations = serde_json::Map::new();
+            annotations.insert(
+                stop::PREVIOUS_REPLICAS.to_string(),
+                json!(stop::annotation_value(&workloads)),
+            );
+            lakehouse_api(ctx, lh)
+                .patch(
+                    &name,
+                    &PatchParams::default(),
+                    &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
+                )
+                .await?;
+            workloads
+        }
+    };
+    for (kind, workload, _) in &workloads {
+        scale_workload(ctx, namespace, kind, workload, 0).await?;
+    }
+    set_hibernation(ctx, namespace, true).await?;
+    write_stopped_status(ctx, lh).await
+}
+
+/// Undo a stop (operator#64): restore the recorded replica counts, drop the hibernation
+/// annotation and the record. The caller falls through to the normal reconcile, which
+/// re-applies the releases and reports the real phase.
+async fn restore_lakehouse(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Result<(), kube::Error> {
+    let name = lh.name_any();
+    let annotation = lh
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(stop::PREVIOUS_REPLICAS))
+        .cloned()
+        .unwrap_or_default();
+    let workloads = invalid_input(stop::recorded(&annotation), &name)?;
+    for (kind, workload, replicas) in &workloads {
+        scale_workload(ctx, namespace, kind, workload, *replicas).await?;
+    }
+    set_hibernation(ctx, namespace, false).await?;
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(stop::PREVIOUS_REPLICAS.to_string(), serde_json::Value::Null);
+    lakehouse_api(ctx, lh)
+        .patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Turn a malformed annotation into the reconcile's error, naming the key to fix.
+fn invalid_input<T>(result: anyhow::Result<T>, lakehouse: &str) -> Result<T, kube::Error> {
+    result.map_err(|error| {
+        kube::Error::Service(anyhow::anyhow!("Lakehouse '{lakehouse}': {error}").into())
+    })
+}
+
+/// The Deployments and StatefulSets the installed releases rendered, with the replica count
+/// each one runs right now (absent `spec.replicas` means 1). A release `helm get manifest`
+/// cannot read is not installed: skipped. A workload that does not exist is skipped too.
+async fn discover_workloads(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Result<Vec<(String, String, i32)>, kube::Error> {
+    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), namespace);
+    let statefulsets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), namespace);
+    let mut workloads = Vec::new();
+    for component in plan_lakehouse(&lh.spec) {
+        if component.chart.is_none() {
+            // No adapter, so this operator never installed it.
+            continue;
+        }
+        let manifest = match ctx
+            .helm
+            .run(manifest_args(component.name, namespace), None)
+            .await
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::debug!(
+                    release = component.name,
+                    %namespace,
+                    %error,
+                    "no release manifest; the release is not installed"
+                );
+                continue;
+            }
+        };
+        let rendered = rendered_workloads(&manifest).map_err(|error| {
+            kube::Error::Service(
+                anyhow::anyhow!(
+                    "helm manifest of '{}' is not parseable: {error}",
+                    component.name
+                )
+                .into(),
+            )
+        })?;
+        for workload in rendered {
+            let replicas = if workload.kind == "Deployment" {
+                deployments
+                    .get_opt(&workload.name)
+                    .await?
+                    .map(|deployment| deployment.spec.replicas.unwrap_or(1))
+            } else {
+                statefulsets
+                    .get_opt(&workload.name)
+                    .await?
+                    .map(|statefulset| statefulset.spec.replicas.unwrap_or(1))
+            };
+            if let Some(replicas) = replicas {
+                workloads.push((workload.kind, workload.name, replicas));
+            }
+        }
+    }
+    Ok(workloads)
+}
+
+/// Set `spec.replicas` on one Deployment or StatefulSet by kind.
+async fn scale_workload(
+    ctx: &Context,
+    namespace: &str,
+    kind: &str,
+    name: &str,
+    replicas: i32,
+) -> Result<(), kube::Error> {
+    let patch = json!({ "spec": { "replicas": replicas } });
+    if kind == "Deployment" {
+        let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), namespace);
+        deployments
+            .patch(name, &PatchParams::default(), &Patch::Merge(patch))
+            .await?;
+    } else {
+        let statefulsets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), namespace);
+        statefulsets
+            .patch(name, &PatchParams::default(), &Patch::Merge(patch))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Set (or, with `false`, remove) CloudNative-PG's hibernation annotation on the two Clusters
+/// the Lakehouse owns. A Cluster that does not exist yet is skipped.
+async fn set_hibernation(
+    ctx: &Context,
+    namespace: &str,
+    hibernate: bool,
+) -> Result<(), kube::Error> {
+    let clusters: Api<kube::api::DynamicObject> =
+        Api::namespaced_with(ctx.client.clone(), namespace, &cnpg_cluster_resource());
+    let value = if hibernate {
+        json!("true")
+    } else {
+        serde_json::Value::Null
+    };
+    for cluster in [CATALOG_CLUSTER, "openfga-pg"] {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(stop::HIBERNATION.to_string(), value.clone());
+        let patch = json!({ "metadata": { "annotations": annotations } });
+        match clusters
+            .patch(cluster, &PatchParams::default(), &Patch::Merge(patch))
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                tracing::debug!(%namespace, cluster, "no CNPG Cluster to hibernate");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Write the stopped status: phase `Stopped`, Ready `False` with reason `Stopped`, the last
+/// component list kept (like the pause branch).
+async fn write_stopped_status(ctx: &Context, lh: &Lakehouse) -> Result<Action, kube::Error> {
+    let previous = lh
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.type_ == "Ready"));
+    let components = lh
+        .status
+        .as_ref()
+        .map(|status| status.components.clone())
+        .unwrap_or_default();
+    let status = LakehouseStatus {
+        phase: "Stopped".into(),
+        conditions: vec![ready_condition(
+            "Stopped",
+            lh.metadata.generation,
+            previous,
+            &now_rfc3339(),
+        )],
+        observed_generation: lh.metadata.generation,
+        components,
+    };
+    patch_lakehouse_status(ctx, lh, status).await?;
+    Ok(Action::await_change())
+}
+
 async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Action, kube::Error> {
     let name = lh.name_any();
     let namespace = lh.namespace().unwrap_or_else(|| "default".into());
@@ -948,6 +1187,21 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     // never applied anything and stays without the finalizer: deleting it must
     // not uninstall the releases of the resource that owns the namespace.
     ensure_lakehouse_finalizer(&ctx, &lh).await?;
+
+    // `stopped` (operator#64) scales the workloads to zero instead of re-applying: the golden
+    // values carry `replicas: 1`, so applying would start the pods again and flap them.
+    if lh.spec.cluster_operation.stopped {
+        return stop_lakehouse(&ctx, &lh, &namespace).await;
+    }
+    if lh
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(stop::PREVIOUS_REPLICAS))
+    {
+        restore_lakehouse(&ctx, &lh, &namespace).await?;
+        // fall through: the normal reconcile re-applies and reports the real phase
+    }
 
     let plan = plan_lakehouse(&lh.spec);
     // The identity contract decides whether Trino authenticates; its key material decides
@@ -1804,6 +2058,33 @@ mod tests {
                         "metadata": { "name": "main", "namespace": "stardelt" },
                         "spec": {}
                     })
+                } else if path.contains("/deployments/") || path.contains("/statefulsets/") {
+                    let kind = if path.contains("/deployments/") {
+                        "Deployment"
+                    } else {
+                        "StatefulSet"
+                    };
+                    let name = path.rsplit('/').next().unwrap_or_default();
+                    json!({
+                        "apiVersion": "apps/v1",
+                        "kind": kind,
+                        "metadata": { "name": name, "namespace": "stardelt" },
+                        "spec": {
+                            "replicas": 1,
+                            "selector": { "matchLabels": { "app": name } },
+                            "template": {
+                                "metadata": { "labels": { "app": name } },
+                                "spec": { "containers": [{ "name": "main", "image": "busybox" }] }
+                            }
+                        }
+                    })
+                } else if path.contains("/clusters/") {
+                    let name = path.rsplit('/').next().unwrap_or_default();
+                    json!({
+                        "apiVersion": "postgresql.cnpg.io/v1",
+                        "kind": "Cluster",
+                        "metadata": { "name": name, "namespace": "stardelt" }
+                    })
                 } else if method == "PATCH" {
                     json!({
                         "apiVersion": "stardelt.io/v1alpha1",
@@ -1858,6 +2139,20 @@ mod tests {
             .expect("requests poisoned")
             .iter()
             .filter(|r| r.method == "PATCH")
+            .map(|r| serde_json::from_str(&r.body).expect("patch body is JSON"))
+            .collect()
+    }
+
+    /// Every PATCH body whose path contains `marker`, oldest first.
+    fn patches_to(
+        requests: &Arc<Mutex<Vec<RecordedRequest>>>,
+        marker: &str,
+    ) -> Vec<serde_json::Value> {
+        requests
+            .lock()
+            .expect("requests poisoned")
+            .iter()
+            .filter(|r| r.method == "PATCH" && r.path.contains(marker))
             .map(|r| serde_json::from_str(&r.body).expect("patch body is JSON"))
             .collect()
     }
@@ -2834,6 +3129,182 @@ mod tests {
         assert!(
             helm.calls.lock().expect("calls poisoned").is_empty(),
             "a paused PlatformInstance must not run helm"
+        );
+    }
+
+    /// A `Lakehouse` that is stopped, carrying `annotations` and the given spec.
+    fn stopped_lakehouse(
+        annotations: Option<serde_json::Value>,
+        spec: serde_json::Value,
+    ) -> Lakehouse {
+        let mut metadata = json!({
+            "name": "main",
+            "namespace": "stardelt",
+            "generation": 4,
+            "finalizers": [LAKEHOUSE_FINALIZER]
+        });
+        if let Some(annotations) = annotations {
+            metadata["annotations"] = annotations;
+        }
+        serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Lakehouse",
+            "metadata": metadata,
+            "spec": spec,
+            "status": {
+                "phase": "Ready",
+                "observedGeneration": 3,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "Ready",
+                    "lastTransitionTime": "old"
+                }],
+                "components": [{ "name": "lakekeeper", "ready": true }]
+            }
+        }))
+        .expect("deserialize Lakehouse")
+    }
+
+    #[tokio::test]
+    async fn a_stopped_lakehouse_with_nothing_applied_writes_stopped() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse = stopped_lakehouse(
+            None,
+            json!({ "dryRun": false, "clusterOperation": { "stopped": true } }),
+        );
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile a stopped Lakehouse");
+
+        let status = patched_status(&requests, "lakehouses");
+        assert_eq!(status["phase"], json!("Stopped"));
+        assert_eq!(status["observedGeneration"], json!(4));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Stopped"));
+        assert_eq!(
+            status["components"][0]["name"],
+            json!("lakekeeper"),
+            "a stopped Lakehouse keeps the last component list"
+        );
+        let calls = helm.calls.lock().expect("calls poisoned");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("upgrade")),
+            "a stopped Lakehouse must not apply a release"
+        );
+        assert!(
+            patches_to(&requests, "/deployments").is_empty(),
+            "nothing was applied, so there is nothing to scale: {:?}",
+            patch_bodies(&requests)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_lakehouse_scales_every_recorded_workload() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse = stopped_lakehouse(
+            Some(json!({
+                "stardelt.io/previous-replicas": r#"{"Deployment/lakekeeper":1,"StatefulSet/seaweedfs-master":1}"#
+            })),
+            json!({ "dryRun": false, "clusterOperation": { "stopped": true } }),
+        );
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile a stopped Lakehouse");
+
+        let deployments = patches_to(&requests, "/deployments/lakekeeper");
+        assert_eq!(deployments.len(), 1, "one patch per recorded Deployment");
+        assert_eq!(deployments[0]["spec"]["replicas"], json!(0));
+        let statefulsets = patches_to(&requests, "/statefulsets/seaweedfs-master");
+        assert_eq!(statefulsets.len(), 1, "one patch per recorded StatefulSet");
+        assert_eq!(statefulsets[0]["spec"]["replicas"], json!(0));
+        let scaled: Vec<serde_json::Value> = patch_bodies(&requests)
+            .into_iter()
+            .filter(|body| body["spec"]["replicas"] == json!(0))
+            .collect();
+        assert_eq!(scaled.len(), 2, "exactly the two recorded workloads");
+        for cluster in ["lakekeeper-pg", "openfga-pg"] {
+            let patches = patches_to(&requests, &format!("/clusters/{cluster}"));
+            assert_eq!(patches.len(), 1, "{cluster} is hibernated");
+            assert_eq!(
+                patches[0]["metadata"]["annotations"]["cnpg.io/hibernation"],
+                json!("true")
+            );
+        }
+        assert_eq!(
+            patched_status(&requests, "lakehouses")["phase"],
+            json!("Stopped")
+        );
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a stopped Lakehouse that already recorded its workloads reads no manifests"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstoppped_lakehouse_restores_the_counts_and_removes_the_annotation() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let lakehouse = stopped_lakehouse(
+            Some(json!({
+                "stardelt.io/previous-replicas": r#"{"Deployment/lakekeeper":1,"StatefulSet/seaweedfs-master":1}"#
+            })),
+            json!({ "clusterOperation": { "stopped": false } }),
+        );
+
+        reconcile_lakehouse(Arc::new(lakehouse), ctx)
+            .await
+            .expect("reconcile an unstoppped Lakehouse");
+
+        let deployments = patches_to(&requests, "/deployments/lakekeeper");
+        assert_eq!(deployments.len(), 1, "the Deployment is restored once");
+        assert_eq!(deployments[0]["spec"]["replicas"], json!(1));
+        let statefulsets = patches_to(&requests, "/statefulsets/seaweedfs-master");
+        assert_eq!(statefulsets.len(), 1, "the StatefulSet is restored once");
+        assert_eq!(statefulsets[0]["spec"]["replicas"], json!(1));
+        for cluster in ["lakekeeper-pg", "openfga-pg"] {
+            let patches = patches_to(&requests, &format!("/clusters/{cluster}"));
+            let waking: Vec<&serde_json::Value> = patches
+                .iter()
+                .filter(|body| {
+                    body["metadata"]["annotations"]
+                        .get("cnpg.io/hibernation")
+                        .is_some()
+                })
+                .collect();
+            assert_eq!(waking.len(), 1, "{cluster} is woken up exactly once");
+            assert_eq!(
+                waking[0]["metadata"]["annotations"]["cnpg.io/hibernation"],
+                serde_json::Value::Null
+            );
+        }
+        let recorded_patches = patches_to(&requests, "lakehouses/main");
+        assert!(
+            recorded_patches.iter().any(|body| {
+                body["metadata"]["annotations"]["stardelt.io/previous-replicas"]
+                    == serde_json::Value::Null
+            }),
+            "the record is removed: {recorded_patches:?}"
         );
     }
 }

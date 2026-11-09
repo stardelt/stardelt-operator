@@ -27,6 +27,7 @@ pub mod principal_keycloak;
 pub mod provision;
 pub mod secrets;
 pub mod spark;
+pub mod stop;
 pub mod stream_app;
 pub mod superset;
 pub mod values;
