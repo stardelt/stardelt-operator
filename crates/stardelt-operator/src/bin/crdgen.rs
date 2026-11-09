@@ -9,7 +9,7 @@ use kube::CustomResourceExt;
 
 use stardelt_operator::crd::{
     Catalog, Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance, ServicePrincipal,
-    SqlWarehouse, StreamApp, Volume,
+    SparkCluster, SqlWarehouse, StreamApp, Volume,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -96,6 +96,15 @@ fn main() -> anyhow::Result<()> {
         "sqlwarehouse.schema.json",
         "SqlWarehouse",
         &warehouse_crd,
+    )?;
+
+    let spark_crd = SparkCluster::crd();
+    write(dir, "stardelt.io_sparkclusters.yaml", &spark_crd)?;
+    write_schema(
+        schema_dir,
+        "sparkcluster.schema.json",
+        "SparkCluster",
+        &spark_crd,
     )?;
 
     println!(

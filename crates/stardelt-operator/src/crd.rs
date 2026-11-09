@@ -2572,6 +2572,361 @@ pub struct SqlWarehouseStatus {
     pub observed_generation: Option<i64>,
 }
 
+/// A Spark cluster's size class: three shapes an administrator picks instead of every number.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SparkClusterSize {
+    #[default]
+    Small,
+    Medium,
+    Large,
+}
+
+/// The desired state of a `SparkCluster`. Start and Stop write it; the controller follows it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "PascalCase")]
+pub enum SparkClusterState {
+    #[default]
+    Stopped,
+    Running,
+}
+
+/// Who owns a `SparkCluster`: a group, or as an exception one person.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct SparkClusterOwner {
+    /// The Keycloak group whose members start, stop and use the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 64),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    )]
+    pub group: Option<String>,
+    /// One person's user name. The exception: prefer `group`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
+    )]
+    pub user: Option<String>,
+}
+
+/// The pod shape of a driver or an executor. Absent fields follow the size class.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct SparkResources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 16))]
+    pub cores: Option<i32>,
+    /// For example `4Gi`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(regex(pattern = r"^[1-9][0-9]*(Mi|Gi)$"))]
+    pub memory: Option<String>,
+}
+
+/// Where an environment variable's value comes from when it is not written in the spec.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+pub struct ConnectionKeyRef {
+    /// Name of a `Connection` in the same namespace.
+    #[serde(rename = "name")]
+    #[schemars(length(min = 1, max = 40), regex(pattern = r"^[a-z0-9][a-z0-9-]*$"))]
+    pub name: String,
+    /// The key inside that connection's synced Secret.
+    #[serde(rename = "key")]
+    #[schemars(length(min = 1, max = 63), regex(pattern = r"^[A-Za-z][A-Za-z0-9_]*$"))]
+    pub key: String,
+}
+
+/// One environment variable of the driver and executors: a literal value or a reference to a
+/// `Connection` key, never both.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "has(self.value) != has(self.connectionRef)",
+        "message": "set exactly one of value and connectionRef"
+    }
+]))]
+pub struct SparkEnvVar {
+    #[serde(rename = "name")]
+    #[schemars(length(min = 1, max = 64), regex(pattern = r"^[A-Z_][A-Z0-9_]*$"))]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 1024))]
+    pub value: Option<String>,
+    #[serde(
+        default,
+        rename = "connectionRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub connection_ref: Option<ConnectionKeyRef>,
+}
+
+/// Admin-defined Spark compute for the platform, a team or one person: size, runtime, image,
+/// environment, Spark settings and an idle stop. Started by hand, stopped when idle. This resource
+/// carries the *desired* state (`Start`/`Stop` write `state`); the controller drives a
+/// `SparkApplication` from it.
+#[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[kube(
+    group = "stardelt.io",
+    version = "v1alpha1",
+    kind = "SparkCluster",
+    namespaced,
+    status = "SparkClusterStatus",
+    shortname = "spc",
+    doc = "Spark compute for the platform, a team or one person: size, runtime, settings; started by hand, stopped when idle."
+)]
+#[schemars(extend("x-kubernetes-validations" = [
+    {
+        "rule": "has(self.owner.group) != has(self.owner.user)",
+        "message": "set exactly one of owner.group and owner.user"
+    },
+    {
+        "rule": "!has(self.image) || self.image.contains('@sha256:')",
+        "message": "pin the image by digest"
+    },
+    {
+        "rule": "self.env.all(e, self.env.exists_one(f, f.name == e.name))",
+        "message": "each env var name may appear once in env"
+    }
+]))]
+pub struct SparkClusterSpec {
+    #[serde(
+        default,
+        rename = "displayName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(max = 100))]
+    pub display_name: Option<String>,
+    pub owner: SparkClusterOwner,
+    #[serde(default)]
+    pub size: SparkClusterSize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<SparkResources>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<SparkResources>,
+    #[serde(
+        default,
+        rename = "maxExecutors",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(range(min = 0, max = 50))]
+    pub max_executors: Option<i32>,
+    /// The Spark and Python runtime, for example `spark-4.0-py3.12`.
+    #[schemars(regex(pattern = r"^spark-[0-9]+\.[0-9]+-py3\.[0-9]+$"))]
+    pub runtime: String,
+    /// A custom image, pinned by digest so a tag cannot move under the cluster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 512))]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 50))]
+    pub env: Vec<SparkEnvVar>,
+    /// Spark settings applied to the driver and the executors.
+    #[serde(
+        default,
+        rename = "sparkConf",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    #[schemars(extend("maxProperties" = 100))]
+    pub spark_conf: BTreeMap<String, String>,
+    /// Minutes without a job before the cluster stops by itself. `0` (never) is reserved for the
+    /// shared cluster.
+    #[serde(default = "default_idle_stop_minutes", rename = "idleStopMinutes")]
+    #[schemars(range(min = 0, max = 1440))]
+    pub idle_stop_minutes: i32,
+    #[serde(default)]
+    pub state: SparkClusterState,
+}
+
+fn default_idle_stop_minutes() -> i32 {
+    60
+}
+
+impl SparkClusterSpec {
+    /// The rules the schema enforces, repeated for the controller and the tests, plus the name
+    /// (1 to 40 lower-case letters, digits and dashes, starting with a letter) and the
+    /// `sparkConf` denylist: the settings the platform owns and a user must not override.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        let name_ok = !name.is_empty()
+            && name.len() <= 40
+            && bytes[0].is_ascii_lowercase()
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+        if !name_ok {
+            return Err(format!(
+                "spark cluster name `{name}` must be 1 to 40 lower-case letters, digits and dashes, starting with a letter"
+            ));
+        }
+        if self.owner.group.is_some() == self.owner.user.is_some() {
+            return Err("set exactly one of owner.group and owner.user".to_string());
+        }
+        if let Some(display_name) = &self.display_name
+            && display_name.len() > 100
+        {
+            return Err("displayName must be at most 100 characters".to_string());
+        }
+        for (what, resources) in [
+            ("driver", self.driver.as_ref()),
+            ("executor", self.executor.as_ref()),
+        ] {
+            let Some(resources) = resources else {
+                continue;
+            };
+            if let Some(cores) = resources.cores
+                && !(1..=16).contains(&cores)
+            {
+                return Err(format!("{what}.cores must be between 1 and 16"));
+            }
+            if let Some(memory) = &resources.memory
+                && !memory_matches(memory)
+            {
+                return Err(format!("{what}.memory must look like `4Gi` or `512Mi`"));
+            }
+        }
+        if let Some(max) = self.max_executors
+            && !(0..=50).contains(&max)
+        {
+            return Err("maxExecutors must be between 0 and 50".to_string());
+        }
+        if !runtime_matches(&self.runtime) {
+            return Err(format!(
+                "runtime `{}` must look like `spark-4.0-py3.12`",
+                self.runtime
+            ));
+        }
+        if let Some(image) = &self.image {
+            if image.len() > 512 {
+                return Err("image must be at most 512 characters".to_string());
+            }
+            if !image.contains("@sha256:") {
+                return Err("pin the image by digest".to_string());
+            }
+        }
+        if self.env.len() > 50 {
+            return Err("env must have at most 50 entries".to_string());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for var in &self.env {
+            if !env_name_matches(&var.name) {
+                return Err(format!(
+                    "env name `{}` must be upper-case letters, digits and underscores, starting with a letter or underscore",
+                    var.name
+                ));
+            }
+            if !seen.insert(var.name.as_str()) {
+                return Err(format!(
+                    "each env var name may appear once in env: `{}` appears twice",
+                    var.name
+                ));
+            }
+            if var.value.is_some() == var.connection_ref.is_some() {
+                return Err(format!(
+                    "env `{}` must set exactly one of value and connectionRef",
+                    var.name
+                ));
+            }
+            if let Some(value) = &var.value
+                && value.len() > 1024
+            {
+                return Err(format!(
+                    "env `{}` value must be at most 1024 characters",
+                    var.name
+                ));
+            }
+        }
+        if self.spark_conf.len() > 100 {
+            return Err("sparkConf must have at most 100 entries".to_string());
+        }
+        for key in self.spark_conf.keys() {
+            if managed_spark_conf_key(key) {
+                return Err(format!("sparkConf key {key} is managed by the platform"));
+            }
+        }
+        if !(0..=1440).contains(&self.idle_stop_minutes) {
+            return Err("idleStopMinutes must be between 0 and 1440".to_string());
+        }
+        if self.idle_stop_minutes == 0 && name != "shared" {
+            return Err("only the shared cluster may run without an idle stop".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn memory_matches(memory: &str) -> bool {
+    let Some(number) = memory
+        .strip_suffix("Gi")
+        .or_else(|| memory.strip_suffix("Mi"))
+    else {
+        return false;
+    };
+    !number.is_empty() && !number.starts_with('0') && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn runtime_matches(runtime: &str) -> bool {
+    let Some(rest) = runtime.strip_prefix("spark-") else {
+        return false;
+    };
+    let Some((spark, python)) = rest.split_once("-py3.") else {
+        return false;
+    };
+    let spark_ok = spark
+        .split_once('.')
+        .is_some_and(|(major, minor)| digits(major) && digits(minor));
+    spark_ok && digits(python)
+}
+
+fn digits(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn env_name_matches(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && matches!(name.as_bytes()[0], b'A'..=b'Z' | b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Settings the platform owns: the Kubernetes identity of the pods, the catalog credentials and
+/// the object-store keys a `Connection` supplies. A user value here would break the isolation the
+/// platform guarantees, so it is refused instead of ignored.
+fn managed_spark_conf_key(key: &str) -> bool {
+    key.starts_with("spark.kubernetes.authenticate.")
+        || key == "spark.kubernetes.namespace"
+        || key.contains("serviceAccount")
+        || (key.starts_with("spark.hadoop.fs.s3a.") && key.contains("key"))
+        || (key.starts_with("spark.sql.catalog.")
+            && (key.contains("credential") || key.contains("token")))
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct SparkClusterStatus {
+    /// `Stopped`, `Starting`, `Running`, `Stopping` or `Failed`.
+    #[serde(default)]
+    pub phase: String,
+    /// The Spark Connect endpoint while the cluster runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, rename = "startedAt", skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(
+        default,
+        rename = "lastActivityAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_activity_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(
+        default,
+        rename = "observedGeneration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub observed_generation: Option<i64>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
 pub struct ComponentStatus {
     pub name: String,
@@ -4379,6 +4734,221 @@ mod tests {
             }));
             assert!(w.spec.validate("big").is_err(), "{running}/{queued}");
         }
+    }
+
+    fn spark_spec_schema() -> serde_json::Value {
+        let yaml = serde_yaml::to_string(&SparkCluster::crd()).unwrap();
+        let crd: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"].clone()
+    }
+
+    fn cel_rules(schema: &serde_json::Value) -> Vec<(String, String)> {
+        schema["x-kubernetes-validations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|r| {
+                (
+                    r["rule"].as_str().unwrap_or_default().to_string(),
+                    r["message"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn has_cel_rule(schema: &serde_json::Value, rule: &str, message: &str) -> bool {
+        cel_rules(schema)
+            .iter()
+            .any(|(r, m)| r.as_str() == rule && m.as_str() == message)
+    }
+
+    fn spark_cluster(spec: serde_json::Value) -> SparkCluster {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "SparkCluster",
+            "metadata": { "name": "shared", "namespace": "stardelt" },
+            "spec": spec
+        }))
+        .expect("deserialize SparkCluster")
+    }
+
+    fn minimal_spark_spec() -> serde_json::Value {
+        serde_json::json!({ "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12" })
+    }
+
+    #[test]
+    fn a_spark_cluster_defaults_to_small_stopped_and_a_one_hour_idle_stop() {
+        let c = spark_cluster(minimal_spark_spec());
+        assert_eq!(c.spec.size, SparkClusterSize::Small);
+        assert_eq!(c.spec.state, SparkClusterState::Stopped);
+        assert_eq!(c.spec.idle_stop_minutes, 60);
+        assert!(c.spec.env.is_empty() && c.spec.spark_conf.is_empty());
+        assert!(c.spec.validate("analytics").is_ok());
+        assert_eq!(SparkCluster::crd().spec.names.plural, "sparkclusters");
+    }
+
+    #[test]
+    fn a_spark_cluster_owner_is_exactly_one_group_or_user() {
+        for owner in [
+            serde_json::json!({ "group": "analytics", "user": "ada" }),
+            serde_json::json!({}),
+        ] {
+            let c = spark_cluster(serde_json::json!({
+                "owner": owner, "runtime": "spark-4.0-py3.12"
+            }));
+            assert!(
+                c.spec
+                    .validate("analytics")
+                    .unwrap_err()
+                    .contains("owner.group and owner.user"),
+                "{owner}"
+            );
+        }
+        assert!(has_cel_rule(
+            &spark_spec_schema(),
+            "has(self.owner.group) != has(self.owner.user)",
+            "set exactly one of owner.group and owner.user"
+        ));
+        let one_person = spark_cluster(serde_json::json!({
+            "owner": { "user": "ada" }, "runtime": "spark-4.0-py3.12"
+        }));
+        assert!(one_person.spec.validate("ada-spark").is_ok());
+    }
+
+    #[test]
+    fn a_spark_image_must_be_pinned_by_digest() {
+        let unpinned = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "image": "ghcr.io/stardelt/spark:4.0"
+        }));
+        assert!(
+            unpinned
+                .spec
+                .validate("analytics")
+                .unwrap_err()
+                .contains("pin the image by digest")
+        );
+        assert!(
+            has_cel_rule(
+                &spark_spec_schema(),
+                "!has(self.image) || self.image.contains('@sha256:')",
+                "pin the image by digest"
+            ),
+            "the CRD schema must refuse an image without a digest"
+        );
+        let pinned = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "image": "ghcr.io/stardelt/spark@sha256:0123456789abcdef"
+        }));
+        assert!(pinned.spec.validate("analytics").is_ok());
+    }
+
+    #[test]
+    fn spark_conf_keys_the_platform_manages_are_refused() {
+        for key in [
+            "spark.kubernetes.authenticate.driver.serviceAccountName",
+            "spark.kubernetes.namespace",
+            "spark.driver.serviceAccount",
+            "spark.hadoop.fs.s3a.access.key",
+            "spark.hadoop.fs.s3a.secret.key",
+            "spark.sql.catalog.lakekeeper.credential",
+            "spark.sql.catalog.lakekeeper.token",
+        ] {
+            let c = spark_cluster(serde_json::json!({
+                "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+                "sparkConf": { (key): "x" }
+            }));
+            assert_eq!(
+                c.spec.validate("analytics").unwrap_err(),
+                format!("sparkConf key {key} is managed by the platform"),
+                "{key}"
+            );
+        }
+        let allowed = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "sparkConf": { "spark.sql.shuffle.partitions": "200" }
+        }));
+        assert!(allowed.spec.validate("analytics").is_ok());
+    }
+
+    #[test]
+    fn only_the_shared_cluster_may_run_without_an_idle_stop() {
+        let c = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "idleStopMinutes": 0
+        }));
+        assert_eq!(
+            c.spec.validate("mobility").unwrap_err(),
+            "only the shared cluster may run without an idle stop"
+        );
+        assert!(c.spec.validate("shared").is_ok());
+    }
+
+    #[test]
+    fn a_duplicate_spark_env_name_is_refused() {
+        let c = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "env": [
+                { "name": "ETL_HOME", "value": "/opt/etl" },
+                { "name": "ETL_HOME", "value": "/var/etl" }
+            ]
+        }));
+        assert!(
+            c.spec
+                .validate("analytics")
+                .unwrap_err()
+                .contains("ETL_HOME")
+        );
+        assert!(has_cel_rule(
+            &spark_spec_schema(),
+            "self.env.all(e, self.env.exists_one(f, f.name == e.name))",
+            "each env var name may appear once in env"
+        ));
+    }
+
+    #[test]
+    fn a_spark_env_var_is_a_value_or_a_connection_key() {
+        let both = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "env": [ { "name": "PG_PASSWORD", "value": "x",
+                       "connectionRef": { "name": "pg", "key": "password" } } ]
+        }));
+        assert!(
+            both.spec
+                .validate("analytics")
+                .unwrap_err()
+                .contains("exactly one of value and connectionRef")
+        );
+        let env_items = &spark_spec_schema()["properties"]["env"]["items"];
+        assert!(has_cel_rule(
+            env_items,
+            "has(self.value) != has(self.connectionRef)",
+            "set exactly one of value and connectionRef"
+        ));
+        let referenced = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "env": [ { "name": "PG_PASSWORD",
+                       "connectionRef": { "name": "pg", "key": "password" } } ]
+        }));
+        assert!(referenced.spec.validate("analytics").is_ok());
+        let var = &referenced.spec.env[0];
+        assert_eq!(var.connection_ref.as_ref().unwrap().name, "pg");
+    }
+
+    #[test]
+    fn spark_cluster_round_trips_camel_case() {
+        let c = spark_cluster(serde_json::json!({
+            "owner": { "group": "analytics" }, "runtime": "spark-4.0-py3.12",
+            "displayName": "Analytics Spark", "maxExecutors": 4,
+            "idleStopMinutes": 30, "state": "Running"
+        }));
+        let json = serde_json::to_value(&c.spec).expect("serialises");
+        for key in ["displayName", "maxExecutors", "idleStopMinutes"] {
+            assert!(json.get(key).is_some(), "{key} must be camelCase");
+        }
+        assert_eq!(c.spec.state, SparkClusterState::Running);
+        assert_eq!(c.spec.max_executors, Some(4));
+        assert_eq!(c.spec.idle_stop_minutes, 30);
     }
 
     #[test]

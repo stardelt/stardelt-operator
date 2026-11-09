@@ -1,0 +1,243 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Spark compute for the platform, a team or one person: size, runtime, settings; started by hand, stopped when idle.",
+  "properties": {
+    "spec": {
+      "description": "Admin-defined Spark compute for the platform, a team or one person: size, runtime, image,\nenvironment, Spark settings and an idle stop. Started by hand, stopped when idle. This resource\ncarries the *desired* state (`Start`/`Stop` write `state`); the controller drives a\n`SparkApplication` from it.",
+      "properties": {
+        "displayName": {
+          "maxLength": 100,
+          "nullable": true,
+          "type": "string"
+        },
+        "driver": {
+          "description": "The pod shape of a driver or an executor. Absent fields follow the size class.",
+          "nullable": true,
+          "properties": {
+            "cores": {
+              "format": "int32",
+              "maximum": 16.0,
+              "minimum": 1.0,
+              "nullable": true,
+              "type": "integer"
+            },
+            "memory": {
+              "description": "For example `4Gi`.",
+              "nullable": true,
+              "pattern": "^[1-9][0-9]*(Mi|Gi)$",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "env": {
+          "items": {
+            "description": "One environment variable of the driver and executors: a literal value or a reference to a\n`Connection` key, never both.",
+            "properties": {
+              "connectionRef": {
+                "description": "Where an environment variable's value comes from when it is not written in the spec.",
+                "nullable": true,
+                "properties": {
+                  "key": {
+                    "description": "The key inside that connection's synced Secret.",
+                    "maxLength": 63,
+                    "minLength": 1,
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]*$",
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "Name of a `Connection` in the same namespace.",
+                    "maxLength": 40,
+                    "minLength": 1,
+                    "pattern": "^[a-z0-9][a-z0-9-]*$",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "key",
+                  "name"
+                ],
+                "type": "object"
+              },
+              "name": {
+                "maxLength": 64,
+                "minLength": 1,
+                "pattern": "^[A-Z_][A-Z0-9_]*$",
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 1024,
+                "nullable": true,
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object",
+            "x-kubernetes-validations": [
+              {
+                "message": "set exactly one of value and connectionRef",
+                "rule": "has(self.value) != has(self.connectionRef)"
+              }
+            ]
+          },
+          "maxItems": 50,
+          "type": "array"
+        },
+        "executor": {
+          "description": "The pod shape of a driver or an executor. Absent fields follow the size class.",
+          "nullable": true,
+          "properties": {
+            "cores": {
+              "format": "int32",
+              "maximum": 16.0,
+              "minimum": 1.0,
+              "nullable": true,
+              "type": "integer"
+            },
+            "memory": {
+              "description": "For example `4Gi`.",
+              "nullable": true,
+              "pattern": "^[1-9][0-9]*(Mi|Gi)$",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "idleStopMinutes": {
+          "default": 60,
+          "description": "Minutes without a job before the cluster stops by itself. `0` (never) is reserved for the\nshared cluster.",
+          "format": "int32",
+          "maximum": 1440.0,
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "image": {
+          "description": "A custom image, pinned by digest so a tag cannot move under the cluster.",
+          "maxLength": 512,
+          "nullable": true,
+          "type": "string"
+        },
+        "maxExecutors": {
+          "format": "int32",
+          "maximum": 50.0,
+          "minimum": 0.0,
+          "nullable": true,
+          "type": "integer"
+        },
+        "owner": {
+          "description": "Who owns a `SparkCluster`: a group, or as an exception one person.",
+          "properties": {
+            "group": {
+              "description": "The Keycloak group whose members start, stop and use the cluster.",
+              "maxLength": 64,
+              "minLength": 1,
+              "nullable": true,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+              "type": "string"
+            },
+            "user": {
+              "description": "One person's user name. The exception: prefer `group`.",
+              "maxLength": 128,
+              "minLength": 1,
+              "nullable": true,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._@-]*$",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "runtime": {
+          "description": "The Spark and Python runtime, for example `spark-4.0-py3.12`.",
+          "pattern": "^spark-[0-9]+\\.[0-9]+-py3\\.[0-9]+$",
+          "type": "string"
+        },
+        "size": {
+          "default": "small",
+          "description": "A Spark cluster's size class: three shapes an administrator picks instead of every number.",
+          "enum": [
+            "small",
+            "medium",
+            "large"
+          ],
+          "type": "string"
+        },
+        "sparkConf": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Spark settings applied to the driver and the executors.",
+          "maxProperties": 100,
+          "type": "object"
+        },
+        "state": {
+          "default": "Stopped",
+          "description": "The desired state of a `SparkCluster`. Start and Stop write it; the controller follows it.",
+          "enum": [
+            "Stopped",
+            "Running"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "owner",
+        "runtime"
+      ],
+      "type": "object",
+      "x-kubernetes-validations": [
+        {
+          "message": "set exactly one of owner.group and owner.user",
+          "rule": "has(self.owner.group) != has(self.owner.user)"
+        },
+        {
+          "message": "pin the image by digest",
+          "rule": "!has(self.image) || self.image.contains('@sha256:')"
+        },
+        {
+          "message": "each env var name may appear once in env",
+          "rule": "self.env.all(e, self.env.exists_one(f, f.name == e.name))"
+        }
+      ]
+    },
+    "status": {
+      "nullable": true,
+      "properties": {
+        "endpoint": {
+          "description": "The Spark Connect endpoint while the cluster runs.",
+          "nullable": true,
+          "type": "string"
+        },
+        "lastActivityAt": {
+          "nullable": true,
+          "type": "string"
+        },
+        "message": {
+          "nullable": true,
+          "type": "string"
+        },
+        "observedGeneration": {
+          "format": "int64",
+          "nullable": true,
+          "type": "integer"
+        },
+        "phase": {
+          "default": "",
+          "description": "`Stopped`, `Starting`, `Running`, `Stopping` or `Failed`.",
+          "type": "string"
+        },
+        "startedAt": {
+          "nullable": true,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "spec"
+  ],
+  "title": "SparkCluster",
+  "type": "object"
+}
