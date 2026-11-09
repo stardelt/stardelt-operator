@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::{
     Api, ResourceExt,
     api::{DynamicObject, Patch, PatchParams},
@@ -205,6 +205,17 @@ pub fn sync_state(external_secret: &Value) -> SyncState {
     }
 }
 
+/// Whether a Secret holds every key a `Connection` names. `secrets.mode: none` syncs nothing and the
+/// service page says the Secret is written by hand; this is what makes such a connection Ready
+/// instead of `ExternalSecretsNotInstalled`.
+pub fn secret_ready(secret: &Secret, keys: &[String]) -> bool {
+    let Some(data) = secret.data.as_ref() else {
+        return false;
+    };
+    keys.iter()
+        .all(|key| data.get(key).is_some_and(|value| !value.0.is_empty()))
+}
+
 /// The `Ready` condition, keeping the previous transition time while the status is unchanged.
 pub(crate) fn ready_condition(
     ready: bool,
@@ -288,15 +299,38 @@ pub async fn reconcile_connection(
                     let reason = if state.ready { "Synced" } else { "Syncing" };
                     (state.ready, reason, state.message, state.last_sync)
                 }
-                Err(kube::Error::Api(response)) if response.code == 404 => (
-                    false,
-                    "ExternalSecretsNotInstalled",
-                    Some(
-                        "External Secrets Operator is not installed (make external-secrets)"
-                            .to_string(),
-                    ),
-                    None,
-                ),
+                Err(kube::Error::Api(response)) if response.code == 404 => {
+                    let keys = conn
+                        .spec
+                        .secret
+                        .as_ref()
+                        .map(|secret| secret.keys.clone())
+                        .unwrap_or_default();
+                    let existing: Option<Secret> =
+                        Api::<Secret>::namespaced(ctx.client.clone(), &namespace)
+                            .get_opt(&connection_secret_name(&name))
+                            .await?;
+                    match existing {
+                        Some(secret) if secret_ready(&secret, &keys) => (
+                            true,
+                            "SecretFound",
+                            Some(
+                                "the Secret is written by hand; External Secrets does not manage it"
+                                    .to_string(),
+                            ),
+                            None,
+                        ),
+                        _ => (
+                            false,
+                            "ExternalSecretsNotInstalled",
+                            Some(
+                                "External Secrets Operator is not installed (make external-secrets), and no Secret conn-<name> holds the keys"
+                                    .to_string(),
+                            ),
+                            None,
+                        ),
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -309,7 +343,8 @@ pub async fn reconcile_connection(
         .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
     let status = ConnectionStatus {
         ready,
-        secret_name: (ready && reason == "Synced").then(|| connection_secret_name(&name)),
+        secret_name: (ready && matches!(reason, "Synced" | "SecretFound"))
+            .then(|| connection_secret_name(&name)),
         last_sync,
         conditions: vec![ready_condition(
             ready,
@@ -343,6 +378,32 @@ pub async fn reconcile_connection(
 mod tests {
     use super::*;
     use crate::crd::SecretsMode;
+
+    fn secret(data: serde_json::Value) -> Secret {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "conn-crm-db", "namespace": "stardelt" },
+            "data": data
+        }))
+        .expect("deserialize Secret")
+    }
+
+    #[test]
+    fn a_hand_written_secret_is_ready_when_it_holds_every_key() {
+        let keys = vec!["user".to_string(), "password".to_string()];
+        assert!(secret_ready(
+            &secret(serde_json::json!({ "user": "dXNlcg==", "password": "cHc=" })),
+            &keys
+        ));
+        assert!(!secret_ready(
+            &secret(serde_json::json!({ "user": "dXNlcg==" })),
+            &keys
+        ));
+        assert!(!secret_ready(
+            &secret(serde_json::json!({ "user": "dXNlcg==", "password": "" })),
+            &keys
+        ));
+        assert!(!secret_ready(&secret(serde_json::json!({})), &keys));
+    }
 
     fn spec(value: serde_json::Value) -> ConnectionSpec {
         let mut base = json!({
