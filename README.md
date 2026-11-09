@@ -90,8 +90,14 @@ spec:
 ```
 
 In `secrets.mode: platform` the operator installs OpenBao (`openbao/openbao` 0.30.4, standalone,
-`pebbledb` on one 10 GiB volume) and generates Secret `openbao-seal-key` once; the store is
-**not initialised** by this step, so it reports `Running 0/1` until the bootstrap ticket lands.
+`pebbledb` on one 10 GiB volume) and generates Secret `openbao-seal-key` once. The store is
+**initialised once** by the operator: `ensure_openbao_init` calls `/v1/sys/init` and keeps the
+recovery key and the initial root token in Secret `openbao-init`; an initialised store is never
+re-initialised, and an `openbao-init` missing a key is reported instead. With
+`spec.secrets.groups`, `ensure_group_stores` enables Kubernetes auth and writes one policy,
+auth role, ServiceAccount and `SecretStore` per group (`eso-<group>`, `openbao-<group>`), which
+is what `Connection` objects sync through. The root token in `openbao-init` is a sandbox
+credential; a production install uses `secrets.mode: external`.
 In `secrets.mode: external` the operator publishes `ClusterSecretStore` `enterprise` from
 `spec.secrets.external.provider` verbatim; exactly one provider key; credentials must be referenced
 by Secret name (`secretRef`/`tokenSecretRef`/`authSecretRef`), never inline; the store is the
