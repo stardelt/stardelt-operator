@@ -24,7 +24,7 @@ images:
     # would silently redeploy a different DAG image.
     repository: ghcr.io/stardelt/airflow
     tag: demo
-    digest: sha256:aaad6c9b47df008c45f7f5a27608764f80494736e23c8862a5ae681ceec507cc
+    digest: sha256:22f11ab5c03346567b7e9ec7b89b3abc3b95af962ca9a1ef31123a14292219cd
     pullPolicy: IfNotPresent
 
 # No secrets in this file: scripts/app-secrets.sh generates them per cluster
@@ -252,7 +252,7 @@ env:
   - name: AIRFLOW__KUBERNETES_EXECUTOR__WORKER_CONTAINER_REPOSITORY
     value: ghcr.io/stardelt/airflow
   - name: AIRFLOW__KUBERNETES_EXECUTOR__WORKER_CONTAINER_TAG
-    value: "demo@sha256:aaad6c9b47df008c45f7f5a27608764f80494736e23c8862a5ae681ceec507cc"
+    value: "demo@sha256:22f11ab5c03346567b7e9ec7b89b3abc3b95af962ca9a1ef31123a14292219cd"
 
 # Secret-backed envs use extraEnv (templated string accepting valueFrom).
 extraEnv: |
