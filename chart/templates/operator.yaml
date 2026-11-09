@@ -18,6 +18,7 @@ rules:
       - "pipelines"
       - "connections"
       - "serviceprincipals"
+      - "sparkclusters"
     verbs: ["get", "list", "watch"]
   - apiGroups: ["stardelt.io"]
     resources:
@@ -27,6 +28,7 @@ rules:
       - "pipelines/status"
       - "connections/status"
       - "serviceprincipals/status"
+      - "sparkclusters/status"
     verbs: ["get", "patch", "update"]
   - apiGroups: [""]
     resources: ["events"]
