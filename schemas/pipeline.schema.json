@@ -110,7 +110,7 @@
                 "type": "array"
               },
               "kind": {
-                "description": "What a pipeline task does — the task contract behind `Pipeline`\n(master spec §5, plugs 6, 7 and 12). `sql` is the first kind the platform\nruns (scheduled jobs phase J0); the others are accepted so manifests can be\nwritten ahead of their runtimes.",
+                "description": "What a pipeline task does — the task contract behind `Pipeline`\n(master spec §5, plugs 6, 7 and 12). `sql` and `notebook` run today\n(scheduled jobs phases J0 and J1); `python`, `dbt` and `quality` are\naccepted so manifests can be written ahead of their runtimes.",
                 "enum": [
                   "sql",
                   "notebook",

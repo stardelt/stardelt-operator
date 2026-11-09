@@ -739,9 +739,9 @@ pub struct IngestionSourceStatus {
 }
 
 /// What a pipeline task does — the task contract behind `Pipeline`
-/// (master spec §5, plugs 6, 7 and 12). `sql` is the first kind the platform
-/// runs (scheduled jobs phase J0); the others are accepted so manifests can be
-/// written ahead of their runtimes.
+/// (master spec §5, plugs 6, 7 and 12). `sql` and `notebook` run today
+/// (scheduled jobs phases J0 and J1); `python`, `dbt` and `quality` are
+/// accepted so manifests can be written ahead of their runtimes.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskKind {
@@ -750,11 +750,11 @@ pub enum TaskKind {
     /// Published Jupyter notebook, run with papermill as the run-as principal.
     /// The source is pinned by the object version in `config.objectVersion`.
     Notebook,
-    /// Python transform.
+    /// Python transform. Accepted; no runtime yet.
     Python,
-    /// dbt-core model run.
+    /// dbt-core model run. Accepted; no runtime yet.
     Dbt,
-    /// Data-quality gate (Soda + dbt tests).
+    /// Data-quality gate (Soda + dbt tests). Accepted; no runtime yet.
     Quality,
 }
 
