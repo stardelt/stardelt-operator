@@ -2943,7 +2943,7 @@ pub struct ComponentStatus {
     pub applied_hash: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq)]
 pub struct Condition {
     #[serde(rename = "type")]
     pub type_: String,

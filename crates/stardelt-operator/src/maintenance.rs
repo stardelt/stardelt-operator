@@ -4,18 +4,23 @@
 //! writes `MaintenanceReady` is slice b2.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, Container, EnvVar, EnvVarSource, LocalObjectReference, PodSpec, PodTemplateSpec,
-    ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource, SecurityContext,
-    Volume, VolumeMount,
+    Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, LocalObjectReference, PodSpec,
+    PodTemplateSpec, ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource,
+    SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::ObjectMeta;
+use kube::ResourceExt;
+use kube::api::{Api, ObjectMeta};
+use kube::runtime::controller::Action;
 
-use crate::crd::{MaintenanceSpec, principal_client_id};
+use crate::controller::Context;
+use crate::crd::{Catalog, Condition, MaintenanceSpec, ServicePrincipal, principal_client_id};
 use crate::identity::PLATFORM_REALM;
 use crate::objects::FIELD_MANAGER;
 
@@ -225,10 +230,286 @@ pub fn cron_job(
     }
 }
 
+/// The conditions after replacing the one of `next`'s type and keeping every other one, so a
+/// controller patch never wipes `CatalogReady`/`GrantsReady`/`Drift` (the access-sync job
+/// writes the whole array with a merge-patch).
+pub fn merge_condition(existing: &[Condition], next: Condition) -> Vec<Condition> {
+    let mut conditions: Vec<Condition> = existing
+        .iter()
+        .filter(|c| c.type_ != next.type_)
+        .cloned()
+        .collect();
+    conditions.push(next);
+    conditions
+}
+
+fn catalog_owner(catalog: &Catalog) -> OwnerReference {
+    OwnerReference {
+        api_version: "stardelt.io/v1alpha1".into(),
+        kind: "Catalog".into(),
+        name: catalog.name_any(),
+        uid: catalog.uid().unwrap_or_default(),
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    }
+}
+
+/// `token_url` for this platform: the external issuer's endpoint when the contract carries
+/// `provider`, the in-cluster Keycloak otherwise.
+fn token_endpoint(identity: Option<&ConfigMap>) -> String {
+    let data = identity.and_then(|c| c.data.as_ref());
+    let external = data.is_some_and(|d| d.contains_key("provider"));
+    let issuer = data.and_then(|d| d.get("issuerUrl")).map(String::as_str);
+    token_url(if external { issuer } else { None })
+}
+
+/// One `Catalog` -> one `maint-<catalog>` CronJob. On a missing `pipeline-<owner>` principal the
+/// condition says so and nothing is applied (the principal controller creates it).
+pub async fn reconcile_catalog(
+    catalog: Arc<Catalog>,
+    ctx: Arc<Context>,
+) -> Result<Action, kube::Error> {
+    let namespace = catalog.namespace().unwrap_or_default();
+    let name = catalog.name_any();
+    let owner = catalog.spec.owner.clone();
+    let principal = format!("pipeline-{owner}");
+
+    let identity: Option<ConfigMap> = Api::namespaced(ctx.client.clone(), &namespace)
+        .get_opt("stardelt-identity")
+        .await?;
+
+    let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), &namespace);
+    let condition = match principals.get_opt(&principal).await? {
+        None => Condition {
+            type_: "MaintenanceReady".into(),
+            status: "False".into(),
+            reason: Some("NoRunner".into()),
+            message: Some(format!(
+                "create ServicePrincipal {principal} to run maintenance"
+            )),
+            last_transition_time: Some(k8s_openapi::jiff::Timestamp::now().to_string()),
+            observed_generation: catalog.metadata.generation,
+        },
+        Some(_) => {
+            let job = cron_job(
+                &namespace,
+                &name,
+                &owner,
+                &catalog.spec.maintenance,
+                &token_endpoint(identity.as_ref()),
+                &catalog_owner(&catalog),
+            );
+            crate::objects::apply(&ctx.client, &namespace, &job, false).await?;
+            Condition {
+                type_: "MaintenanceReady".into(),
+                status: "True".into(),
+                reason: Some("Scheduled".into()),
+                message: Some(format!(
+                    "{} on {}",
+                    job_name(&name),
+                    catalog.spec.maintenance.schedule
+                )),
+                last_transition_time: Some(k8s_openapi::jiff::Timestamp::now().to_string()),
+                observed_generation: catalog.metadata.generation,
+            }
+        }
+    };
+
+    let existing = catalog
+        .status
+        .as_ref()
+        .map(|s| s.conditions.clone())
+        .unwrap_or_default();
+    let conditions = merge_condition(&existing, condition);
+    let observed = catalog.metadata.generation;
+    let api: Api<Catalog> = Api::namespaced(ctx.client.clone(), &namespace);
+    api.patch_status(
+        &name,
+        &kube::api::PatchParams::default(),
+        &kube::api::Patch::Merge(serde_json::json!({
+            "status": { "conditions": conditions, "observedGeneration": observed }
+        })),
+    )
+    .await?;
+    tracing::info!(catalog = %name, %namespace, "reconciled maintenance job");
+    Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+pub fn error_policy<K>(_object: Arc<K>, error: &kube::Error, _ctx: Arc<Context>) -> Action {
+    tracing::warn!(error = %error, "maintenance reconcile failed");
+    Action::requeue(Duration::from_secs(30))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crd::MaintenanceSpec;
+    use kube::Client;
+    use std::sync::Mutex;
+
+    fn catalog() -> Catalog {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Catalog",
+            "metadata": {
+                "name": "mobility",
+                "namespace": "data",
+                "uid": "uid-1",
+                "generation": 3
+            },
+            "spec": { "lakehouseRef": { "name": "main" }, "owner": "analytics" },
+            "status": {
+                "conditions": [
+                    { "type": "CatalogReady", "status": "True" }
+                ]
+            }
+        }))
+        .expect("deserialize Catalog")
+    }
+
+    fn mock_client<F>(handler: F) -> (Client, Arc<Mutex<Vec<String>>>)
+    where
+        F: Fn(&str, &str, &str) -> (u16, String) + Send + Sync + 'static,
+    {
+        use http_body_util::BodyExt;
+        let requests: Arc<Mutex<Vec<String>>> = Arc::default();
+        let recorder = requests.clone();
+        let handler = Arc::new(handler);
+        let service = tower::service_fn(move |request: http::Request<kube::client::Body>| {
+            let recorder = recorder.clone();
+            let handler = handler.clone();
+            let method = request.method().to_string();
+            let path = request.uri().path().to_string();
+            let query = request.uri().query().unwrap_or_default().to_string();
+            async move {
+                let body_bytes = request
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|b| b.to_bytes().to_vec())
+                    .unwrap_or_default();
+                let body = String::from_utf8_lossy(&body_bytes).to_string();
+                recorder
+                    .lock()
+                    .expect("requests poisoned")
+                    .push(format!("{method} {path}?{query} {body}"));
+                let (status, document) = handler(&method, &path, &body);
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(document.into_bytes()))
+                        .expect("valid mock response"),
+                )
+            }
+        });
+        (Client::new(service, "stardelt"), requests)
+    }
+
+    fn ctx(client: Client) -> Arc<Context> {
+        Arc::new(Context {
+            client,
+            helm: Arc::new(crate::helm::testing::RecordingRunner::default()),
+        })
+    }
+
+    /// A `Catalog` with its pipeline principal applies `maint-<catalog>` and writes
+    /// `MaintenanceReady` without dropping the access-sync condition.
+    #[tokio::test]
+    async fn a_catalog_with_a_pipeline_principal_applies_the_job_and_one_condition() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.ends_with("/configmaps/stardelt-identity") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-identity","namespace":"data"},"data":{"issuerUrl":"https://id.example.com/realms/stardelt"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/serviceprincipals/pipeline-analytics") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/cronjobs/maint-mobility") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"CronJob","metadata":{"name":"maint-mobility","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.ends_with("/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Catalog","metadata":{"name":"mobility","namespace":"data"},"spec":{"lakehouseRef":{"name":"main"},"owner":"analytics"},"status":{"conditions":[{"type":"CatalogReady","status":"True"},{"type":"MaintenanceReady","status":"True"}]}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
+            )
+        });
+        let action = reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        assert_eq!(action, Action::requeue(Duration::from_secs(300)));
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(
+            log.contains("PATCH /apis/batch/v1/namespaces/data/cronjobs/maint-mobility"),
+            "{log}"
+        );
+        let status = log
+            .lines()
+            .find(|line| line.contains("/status"))
+            .unwrap_or_else(|| panic!("no status patch\n{log}"));
+        assert!(
+            status.starts_with(
+                "PATCH /apis/stardelt.io/v1alpha1/namespaces/data/catalogs/mobility/status"
+            ),
+            "{status}"
+        );
+        assert!(status.contains("\"MaintenanceReady\""), "{status}");
+        assert!(status.contains("\"CatalogReady\""), "{status}");
+        assert!(status.contains("\"observedGeneration\":3"), "{status}");
+    }
+
+    /// Without `pipeline-<owner>` the condition says so and no CronJob is applied.
+    #[tokio::test]
+    async fn a_missing_pipeline_principal_writes_no_runner_and_applies_nothing() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.ends_with("/configmaps/stardelt-identity") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-identity","namespace":"data"},"data":{"issuerUrl":"https://id.example.com/realms/stardelt"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/serviceprincipals/pipeline-analytics") {
+                return (
+                    404,
+                    r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.ends_with("/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Catalog","metadata":{"name":"mobility","namespace":"data"},"spec":{"lakehouseRef":{"name":"main"},"owner":"analytics"},"status":{"conditions":[]}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
+            )
+        });
+        reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(!log.contains("/cronjobs/"), "{log}");
+        let status = log
+            .lines()
+            .find(|line| line.contains("/status"))
+            .unwrap_or_else(|| panic!("no status patch\n{log}"));
+        assert!(status.contains("\"NoRunner\""), "{status}");
+        assert!(status.contains("\"MaintenanceReady\""), "{status}");
+    }
 
     fn owner() -> OwnerReference {
         OwnerReference {
@@ -322,6 +603,76 @@ mod tests {
     fn an_external_issuer_supplies_its_own_token_endpoint() {
         assert_eq!(
             token_url(Some("https://login.example.com/tenant/")),
+            "https://login.example.com/tenant/protocol/openid-connect/token"
+        );
+    }
+
+    #[test]
+    fn a_condition_patch_keeps_the_access_sync_conditions() {
+        let existing = vec![
+            Condition {
+                type_: "CatalogReady".into(),
+                status: "True".into(),
+                reason: None,
+                message: None,
+                last_transition_time: None,
+                observed_generation: None,
+            },
+            Condition {
+                type_: "GrantsReady".into(),
+                status: "True".into(),
+                reason: None,
+                message: None,
+                last_transition_time: None,
+                observed_generation: None,
+            },
+        ];
+        let next = Condition {
+            type_: "MaintenanceReady".into(),
+            status: "True".into(),
+            reason: Some("Scheduled".into()),
+            message: None,
+            last_transition_time: None,
+            observed_generation: Some(3),
+        };
+        let merged = merge_condition(&existing, next.clone());
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|c| c.type_ == "MaintenanceReady")
+                .count(),
+            1
+        );
+        assert!(merged.iter().any(|c| c.type_ == "CatalogReady"));
+        assert!(merged.iter().any(|c| c.type_ == "GrantsReady"));
+        assert_eq!(merged.last(), Some(&next));
+    }
+
+    #[test]
+    fn an_external_contract_uses_its_issuer_and_platform_mode_the_keycloak_service() {
+        let platform = ConfigMap {
+            data: Some(BTreeMap::from([(
+                "issuerUrl".to_string(),
+                "https://id.example.com/realms/stardelt".to_string(),
+            )])),
+            ..ConfigMap::default()
+        };
+        assert_eq!(
+            token_endpoint(Some(&platform)),
+            "http://keycloak:8080/realms/stardelt/protocol/openid-connect/token"
+        );
+        let external = ConfigMap {
+            data: Some(BTreeMap::from([
+                (
+                    "issuerUrl".to_string(),
+                    "https://login.example.com/tenant".to_string(),
+                ),
+                ("provider".to_string(), "entra".to_string()),
+            ])),
+            ..ConfigMap::default()
+        };
+        assert_eq!(
+            token_endpoint(Some(&external)),
             "https://login.example.com/tenant/protocol/openid-connect/token"
         );
     }
