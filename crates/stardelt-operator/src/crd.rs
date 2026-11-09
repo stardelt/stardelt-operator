@@ -794,6 +794,10 @@ fn task_config_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::
     {
         "rule": r"self.kind != 'notebook' || !has(self.config) || !('params' in self.config) || self.config['params'].size() <= 4096",
         "message": "notebook params must be a JSON object string of at most 4096 characters"
+    },
+    {
+        "rule": r"self.kind != 'sql' || !has(self.connection)",
+        "message": "a sql task cannot name a connection: it runs inside the engine"
     }
 ]))]
 pub struct PipelineTask {
@@ -3418,6 +3422,7 @@ mod tests {
         assert!(crd.contains("a sql task needs a sql statement"));
         assert!(crd.contains("a notebook task needs config.notebook"));
         assert!(crd.contains("notebook tasks accept only notebook, objectVersion and params"));
+        assert!(crd.contains("a sql task cannot name a connection"));
     }
 
     #[test]
