@@ -1399,6 +1399,23 @@ mod tests {
     }
 
     #[test]
+    fn notebooks_are_framable_by_nova() {
+        let values = effective_values("jupyterhub", Profile::Full, None, None);
+        let snippet = values["hub"]["extraConfig"]["10-oidc"]
+            .as_str()
+            .expect("10-oidc");
+        assert!(snippet.contains("frame-ancestors 'self' {_nova}"));
+        assert!(snippet.contains("STARDELT_NOVA_ORIGIN"));
+        assert!(snippet.contains("\"SameSite\": \"None\""));
+        for env in [&values["hub"], &values["singleuser"]] {
+            assert_eq!(
+                env["extraEnv"]["STARDELT_NOVA_URL"]["valueFrom"]["configMapKeyRef"],
+                serde_json::json!({ "name": "stardelt-identity", "key": "publicUrl", "optional": true })
+            );
+        }
+    }
+
+    #[test]
     fn openbao_values_mount_the_seal_key_secret() {
         let values = golden_values("openbao");
         assert_eq!(

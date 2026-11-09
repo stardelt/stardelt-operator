@@ -38,6 +38,14 @@ hub:
           name: stardelt-identity
           key: trinoUrl
           optional: true
+    # Nova's public origin, the one allowed to frame the hub and the servers.
+    # From the identity contract, never from this file.
+    STARDELT_NOVA_URL:
+      valueFrom:
+        configMapKeyRef:
+          name: stardelt-identity
+          key: publicUrl
+          optional: true
   resources:
     limits:
       cpu: 500m
@@ -72,6 +80,12 @@ singleuser:
   extraEnv:
     SPARK_REMOTE: sc://spark-connect.__NAMESPACE__.svc.cluster.local:15002
     STARDELT_SECRET_STORE_URL: http://openbao.__NAMESPACE__.svc.cluster.local:8200
+    STARDELT_NOVA_URL:
+      valueFrom:
+        configMapKeyRef:
+          name: stardelt-identity
+          key: publicUrl
+          optional: true
   image:
     # The digest is a copy of the platform's pin and must be bumped in both repositories; the
     # test `notebook_task_image_matches_the_single_user_image` fails when values/airflow.yaml
