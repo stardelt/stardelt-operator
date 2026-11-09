@@ -197,7 +197,7 @@
         },
         {
           "message": "each env var name may appear once in env",
-          "rule": "self.env.all(e, self.env.exists_one(f, f.name == e.name))"
+          "rule": "!has(self.env) || self.env.all(e, self.env.exists_one(f, f.name == e.name))"
         }
       ]
     },
