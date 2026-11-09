@@ -960,8 +960,8 @@ mod tests {
             .as_str()
             .expect("a digest");
         assert_eq!(
-            digest, "sha256:aaad6c9b47df008c45f7f5a27608764f80494736e23c8862a5ae681ceec507cc",
-            "the golden Airflow image must carry the loader's access_control (platform#493) and the PEGELONLINE demo DAGs (demos#46)"
+            digest, "sha256:22f11ab5c03346567b7e9ec7b89b3abc3b95af962ca9a1ef31123a14292219cd",
+            "the golden Airflow image must carry the loader's access_control (platform#493) and the PEGELONLINE demo DAGs (demos#46); and a notebook task's CONN_ variables (demos#64)"
         );
         let worker = values["env"]
             .as_array()
