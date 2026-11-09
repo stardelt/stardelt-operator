@@ -107,6 +107,17 @@ spec:
                       description: Task-specific parameters of the other kinds (model path, gate threshold, …).
                       maxProperties: 32
                       type: object
+                    connection:
+                      description: |-
+                        The `Connection` whose secret fields this task receives as `CONN_<NAME>_<KEY>`: the name
+                        upper-cased with `-` written as `_`. The credentials reach the pod through `secretKeyRef`s
+                        and are never part of the resource, the DAG or a log. A `sql` task runs inside the engine
+                        and cannot name one.
+                      maxLength: 40
+                      minLength: 1
+                      nullable: true
+                      pattern: ^[a-z]([a-z0-9-]*[a-z0-9])?$
+                      type: string
                     dependsOn:
                       description: Names of the tasks that must succeed first.
                       items:

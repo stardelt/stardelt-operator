@@ -275,6 +275,7 @@ mod tests {
             depends_on: vec![],
             sql: (kind == TaskKind::Sql).then(|| "SELECT 1".to_string()),
             warehouse: None,
+            connection: None,
             config: BTreeMap::new(),
         }
     }

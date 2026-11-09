@@ -37,13 +37,19 @@ fn meta(name: &str, namespace: &str) -> ObjectMeta {
     }
 }
 
-/// Read access to the pipelines and the service principals of the namespace, nothing else.
+/// Read access to the pipelines, the service principals and the connections of the namespace,
+/// nothing else. The loader also resolves a task's `connection` against the namespace's
+/// `Connection` resources; the Secret is never read here.
 pub fn pipeline_reader_role(namespace: &str) -> Role {
     Role {
         metadata: meta(PIPELINE_READER_ROLE, namespace),
         rules: Some(vec![PolicyRule {
             api_groups: Some(vec!["stardelt.io".into()]),
-            resources: Some(vec!["pipelines".into(), "serviceprincipals".into()]),
+            resources: Some(vec![
+                "pipelines".into(),
+                "serviceprincipals".into(),
+                "connections".into(),
+            ]),
             verbs: vec!["get".into(), "list".into(), "watch".into()],
             ..PolicyRule::default()
         }]),
@@ -428,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn the_role_reads_pipelines_and_service_principals_and_nothing_else() {
+    fn the_role_reads_pipelines_service_principals_and_connections_and_nothing_else() {
         let role = pipeline_reader_role("stardelt");
         assert_eq!(
             role.metadata.name.as_deref(),
@@ -446,7 +452,8 @@ mod tests {
             rules[0].resources,
             Some(vec![
                 "pipelines".to_string(),
-                "serviceprincipals".to_string()
+                "serviceprincipals".to_string(),
+                "connections".to_string()
             ])
         );
         assert_eq!(rules[0].verbs, ["get", "list", "watch"]);
