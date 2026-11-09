@@ -174,7 +174,8 @@ pub fn roles(namespace: &str) -> Vec<Role> {
         // `SqlWarehouse` resources are read for the group, permission and compute views
         // (a catalog is also patched by the administrators' view). `StreamApp` resources are read
         // for the Streams page (D42) — list and phase only; the start/stop routes are a later
-        // ticket.
+        // ticket. `SparkCluster` resources are listed and patched for the Compute page
+        // (internal#161 slice 5a); create and delete are the administrator's form.
         role(
             PIPELINES_ROLE,
             namespace,
@@ -186,6 +187,15 @@ pub fn roles(namespace: &str) -> Vec<Role> {
                 ),
                 rule(&["serviceprincipals"], &["get", "list"], "stardelt.io"),
                 rule(&["streamapps"], &["get", "list", "patch"], "stardelt.io"),
+                // The Compute page and Start/Stop (internal#161 slice 5a): list the
+                // `SparkCluster` resources and patch `spec.state`; create and delete are the
+                // administrator's cluster form (slice 5). Stardelt-nova#632 and
+                // stardelt-platform#823 add the same five pairs to the platform paths.
+                rule(
+                    &["sparkclusters"],
+                    &["get", "list", "patch", "create", "delete"],
+                    "stardelt.io",
+                ),
                 rule(&["catalogs"], &["get", "list", "patch"], "stardelt.io"),
                 rule(&["sqlwarehouses"], &["get", "list"], "stardelt.io"),
             ],
@@ -439,10 +449,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Every (apiGroup, resource, verb) that Nova may use. 25 entries: the list that
+    /// Every (apiGroup, resource, verb) that Nova may use. 30 entries: the list that
     /// `scripts/check-nova-rbac-parity.sh` in stardelt-platform compares between the manifest
     /// and the chart.
-    const GRANTED: [(&str, &str, &str); 25] = [
+    const GRANTED: [(&str, &str, &str); 30] = [
         ("apps", "deployments", "get"),
         ("apps", "deployments", "list"),
         ("apps", "statefulsets", "get"),
@@ -463,6 +473,11 @@ mod tests {
         ("stardelt.io", "streamapps", "get"),
         ("stardelt.io", "streamapps", "list"),
         ("stardelt.io", "streamapps", "patch"),
+        ("stardelt.io", "sparkclusters", "create"),
+        ("stardelt.io", "sparkclusters", "delete"),
+        ("stardelt.io", "sparkclusters", "get"),
+        ("stardelt.io", "sparkclusters", "list"),
+        ("stardelt.io", "sparkclusters", "patch"),
         ("stardelt.io", "catalogs", "get"),
         ("stardelt.io", "catalogs", "list"),
         ("stardelt.io", "catalogs", "patch"),
