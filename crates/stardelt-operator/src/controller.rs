@@ -38,7 +38,7 @@ use crate::helm::{
 };
 use crate::objects::cnpg_cluster_resource;
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
-use crate::prerequisites::CATALOG_CLUSTER;
+use crate::prerequisites::{CATALOG_CLUSTER, NOVA_CLUSTER};
 use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
@@ -864,6 +864,11 @@ async fn delete_lakehouse(lh: &Lakehouse, ctx: &Context) -> Result<Action, kube:
     Ok(Action::await_change())
 }
 
+/// The CNPG operator's own Deployment. A stop never scales it (operator#64): it is the
+/// controller that processes `cnpg.io/hibernation` on the databases, and it is not in the
+/// data path, so leaving it at one keeps the databases managed.
+const CNPG_OPERATOR_DEPLOYMENT: &str = "cnpg-cloudnative-pg";
+
 /// Stop a `Lakehouse` (operator#64): scale every workload the releases rendered to zero,
 /// hibernate the namespace's CNPG databases and report `Stopped`. The replica counts are
 /// recorded in [`stop::PREVIOUS_REPLICAS`] the first time, so an unstop restores them.
@@ -881,38 +886,40 @@ async fn stop_lakehouse(
         .annotations
         .as_ref()
         .and_then(|annotations| annotations.get(stop::PREVIOUS_REPLICAS));
-    let workloads = match annotation {
-        // Already stopped once: only enforce zero (idempotent, repairs a hand-scaled workload).
-        Some(annotation) => invalid_input(stop::recorded(annotation), &name)?,
-        None => {
-            let workloads = discover_workloads(ctx, lh, namespace).await?;
-            if workloads.is_empty() {
-                tracing::info!(
-                    lakehouse = %name,
-                    %namespace,
-                    "stopped; no workload was ever applied, so nothing was scaled"
-                );
-                return write_stopped_status(ctx, lh).await;
-            }
-            let mut annotations = serde_json::Map::new();
-            annotations.insert(
-                stop::PREVIOUS_REPLICAS.to_string(),
-                json!(stop::annotation_value(&workloads)),
-            );
-            lakehouse_api(ctx, lh)
-                .patch(
-                    &name,
-                    &PatchParams::default(),
-                    &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
-                )
-                .await?;
-            workloads
-        }
-    };
+    let (workloads, fresh) = stop_workloads(
+        ctx,
+        &plan_lakehouse(&lh.spec),
+        namespace,
+        annotation.map(String::as_str),
+        &resource_name("Lakehouse", &name),
+    )
+    .await?;
+    if fresh && workloads.is_empty() {
+        tracing::info!(
+            lakehouse = %name,
+            %namespace,
+            "stopped; no workload was ever applied, so nothing was scaled"
+        );
+        return write_stopped_status(ctx, lh).await;
+    }
+    if fresh {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            stop::PREVIOUS_REPLICAS.to_string(),
+            json!(stop::annotation_value(&workloads)),
+        );
+        lakehouse_api(ctx, lh)
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
+            )
+            .await?;
+    }
     for (kind, workload, _) in &workloads {
         scale_workload(ctx, namespace, kind, workload, 0).await?;
     }
-    set_hibernation(ctx, namespace, true).await?;
+    set_hibernation(ctx, namespace, &[CATALOG_CLUSTER, "openfga-pg"], true).await?;
     write_stopped_status(ctx, lh).await
 }
 
@@ -932,11 +939,14 @@ async fn restore_lakehouse(
         .and_then(|annotations| annotations.get(stop::PREVIOUS_REPLICAS))
         .cloned()
         .unwrap_or_default();
-    let workloads = invalid_input(stop::recorded(&annotation), &name)?;
-    for (kind, workload, replicas) in &workloads {
-        scale_workload(ctx, namespace, kind, workload, *replicas).await?;
-    }
-    set_hibernation(ctx, namespace, false).await?;
+    restore_workloads(
+        ctx,
+        namespace,
+        &[CATALOG_CLUSTER, "openfga-pg"],
+        &annotation,
+        &resource_name("Lakehouse", &name),
+    )
+    .await?;
     let mut annotations = serde_json::Map::new();
     annotations.insert(stop::PREVIOUS_REPLICAS.to_string(), serde_json::Value::Null);
     lakehouse_api(ctx, lh)
@@ -949,11 +959,60 @@ async fn restore_lakehouse(
     Ok(())
 }
 
-/// Turn a malformed annotation into the reconcile's error, naming the key to fix.
-fn invalid_input<T>(result: anyhow::Result<T>, lakehouse: &str) -> Result<T, kube::Error> {
-    result.map_err(|error| {
-        kube::Error::Service(anyhow::anyhow!("Lakehouse '{lakehouse}': {error}").into())
-    })
+/// Name a resource the way an error message should: `Lakehouse 'main'`.
+fn resource_name(kind: &str, name: &str) -> String {
+    format!("{kind} '{name}'")
+}
+
+/// The workloads a stop touches, and whether the caller still has to record their replica
+/// counts: the annotation when the resource was stopped before (idempotent), otherwise a
+/// fresh discovery of what the plan's installed releases rendered. `plan` must already omit
+/// the releases a stop never touches (the CNPG operator, for a `PlatformInstance`).
+async fn stop_workloads(
+    ctx: &Context,
+    plan: &[ComponentPlan],
+    namespace: &str,
+    record: Option<&str>,
+    resource: &str,
+) -> Result<(Vec<(String, String, i32)>, bool), kube::Error> {
+    match record {
+        Some(record) => Ok((recorded_workloads(record, resource)?, false)),
+        None => Ok((discover_workloads(ctx, plan, namespace).await?, true)),
+    }
+}
+
+/// Undo a stop: restore the recorded replica counts and lift the hibernation annotation.
+/// The caller removes the record itself, since the annotation lives on its own API type.
+async fn restore_workloads(
+    ctx: &Context,
+    namespace: &str,
+    clusters: &[&str],
+    record: &str,
+    resource: &str,
+) -> Result<(), kube::Error> {
+    for (kind, workload, replicas) in recorded_workloads(record, resource)? {
+        scale_workload(ctx, namespace, &kind, &workload, replicas).await?;
+    }
+    set_hibernation(ctx, namespace, clusters, false).await
+}
+
+/// The replica counts recorded in the annotation, minus the CNPG operator's Deployment: a
+/// stop never scales it, even when an older record happens to name it.
+fn recorded_workloads(
+    annotation: &str,
+    resource: &str,
+) -> Result<Vec<(String, String, i32)>, kube::Error> {
+    let workloads = invalid_input(stop::recorded(annotation), resource)?;
+    Ok(workloads
+        .into_iter()
+        .filter(|(kind, name, _)| !(kind == "Deployment" && name == CNPG_OPERATOR_DEPLOYMENT))
+        .collect())
+}
+
+/// Turn a malformed annotation into the reconcile's error, naming the resource and the key
+/// to fix.
+fn invalid_input<T>(result: anyhow::Result<T>, resource: &str) -> Result<T, kube::Error> {
+    result.map_err(|error| kube::Error::Service(anyhow::anyhow!("{resource}: {error}").into()))
 }
 
 /// The Deployments and StatefulSets the installed releases rendered, with the replica count
@@ -961,13 +1020,13 @@ fn invalid_input<T>(result: anyhow::Result<T>, lakehouse: &str) -> Result<T, kub
 /// cannot read is not installed: skipped. A workload that does not exist is skipped too.
 async fn discover_workloads(
     ctx: &Context,
-    lh: &Lakehouse,
+    plan: &[ComponentPlan],
     namespace: &str,
 ) -> Result<Vec<(String, String, i32)>, kube::Error> {
     let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), namespace);
     let statefulsets: Api<StatefulSet> = Api::namespaced(ctx.client.clone(), namespace);
     let mut workloads = Vec::new();
-    for component in plan_lakehouse(&lh.spec) {
+    for component in plan {
         if component.chart.is_none() {
             // No adapter, so this operator never installed it.
             continue;
@@ -1040,25 +1099,26 @@ async fn scale_workload(
     Ok(())
 }
 
-/// Set (or, with `false`, remove) CloudNative-PG's hibernation annotation on the two Clusters
-/// the Lakehouse owns. A Cluster that does not exist yet is skipped.
+/// Set (or, with `false`, remove) CloudNative-PG's hibernation annotation on `clusters`.
+/// A Cluster that does not exist yet is skipped.
 async fn set_hibernation(
     ctx: &Context,
     namespace: &str,
+    clusters: &[&str],
     hibernate: bool,
 ) -> Result<(), kube::Error> {
-    let clusters: Api<kube::api::DynamicObject> =
+    let clusters_api: Api<kube::api::DynamicObject> =
         Api::namespaced_with(ctx.client.clone(), namespace, &cnpg_cluster_resource());
     let value = if hibernate {
         json!("true")
     } else {
         serde_json::Value::Null
     };
-    for cluster in [CATALOG_CLUSTER, "openfga-pg"] {
+    for cluster in clusters {
         let mut annotations = serde_json::Map::new();
         annotations.insert(stop::HIBERNATION.to_string(), value.clone());
         let patch = json!({ "metadata": { "annotations": annotations } });
-        match clusters
+        match clusters_api
             .patch(cluster, &PatchParams::default(), &Patch::Merge(patch))
             .await
         {
@@ -1368,6 +1428,139 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
+/// Stop a `PlatformInstance` (operator#64): scale every workload the platform releases rendered
+/// to zero, hibernate the identity and Nova databases and report `Stopped`. The replica counts
+/// are recorded in [`stop::PREVIOUS_REPLICAS`] the first time, so an unstop restores them.
+///
+/// The CNPG operator's own release is never stopped: it processes `cnpg.io/hibernation` on
+/// `keycloak-pg`/`nova-pg` and is not in the data path, so it stays at one. CronJobs are not
+/// suspended either (backups, the access sync and the group-role sync keep running).
+async fn stop_platform(
+    ctx: &Context,
+    instance: &PlatformInstance,
+    namespace: &str,
+) -> Result<Action, kube::Error> {
+    let name = instance.name_any();
+    let resource = resource_name("PlatformInstance", &name);
+    let plan: Vec<ComponentPlan> = plan_platform(&instance.spec)
+        .into_iter()
+        .filter(|component| component.name != "cnpg")
+        .collect();
+    let annotation = instance
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(stop::PREVIOUS_REPLICAS));
+    let (workloads, fresh) = stop_workloads(
+        ctx,
+        &plan,
+        namespace,
+        annotation.map(String::as_str),
+        &resource,
+    )
+    .await?;
+    if fresh && workloads.is_empty() {
+        tracing::info!(
+            instance = %name,
+            %namespace,
+            "stopped; no workload was ever applied, so nothing was scaled"
+        );
+        return write_stopped_platform_status(ctx, instance).await;
+    }
+    if fresh {
+        let mut annotations = serde_json::Map::new();
+        annotations.insert(
+            stop::PREVIOUS_REPLICAS.to_string(),
+            json!(stop::annotation_value(&workloads)),
+        );
+        Api::<PlatformInstance>::all(ctx.client.clone())
+            .patch(
+                &name,
+                &PatchParams::default(),
+                &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
+            )
+            .await?;
+    }
+    for (kind, workload, _) in &workloads {
+        scale_workload(ctx, namespace, kind, workload, 0).await?;
+    }
+    set_hibernation(ctx, namespace, &["keycloak-pg", NOVA_CLUSTER], true).await?;
+    write_stopped_platform_status(ctx, instance).await
+}
+
+/// Undo a stop: restore the recorded replica counts, lift the hibernation annotation and drop
+/// the record. The caller falls through to the normal reconcile, which re-applies the releases
+/// and reports the real phase.
+async fn restore_platform(
+    ctx: &Context,
+    instance: &PlatformInstance,
+    namespace: &str,
+) -> Result<(), kube::Error> {
+    let name = instance.name_any();
+    let annotation = instance
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|annotations| annotations.get(stop::PREVIOUS_REPLICAS))
+        .cloned()
+        .unwrap_or_default();
+    restore_workloads(
+        ctx,
+        namespace,
+        &["keycloak-pg", NOVA_CLUSTER],
+        &annotation,
+        &resource_name("PlatformInstance", &name),
+    )
+    .await?;
+    let mut annotations = serde_json::Map::new();
+    annotations.insert(stop::PREVIOUS_REPLICAS.to_string(), serde_json::Value::Null);
+    Api::<PlatformInstance>::all(ctx.client.clone())
+        .patch(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "metadata": { "annotations": annotations } })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Write the stopped status of a `PlatformInstance`: phase `Stopped`, Ready `False` with reason
+/// `Stopped`, the last component list kept (like the pause branch).
+async fn write_stopped_platform_status(
+    ctx: &Context,
+    instance: &PlatformInstance,
+) -> Result<Action, kube::Error> {
+    let name = instance.name_any();
+    let previous = instance
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.type_ == "Ready"));
+    let components = instance
+        .status
+        .as_ref()
+        .map(|status| status.components.clone())
+        .unwrap_or_default();
+    let status = PlatformInstanceStatus {
+        phase: "Stopped".into(),
+        conditions: vec![ready_condition(
+            "Stopped",
+            instance.metadata.generation,
+            previous,
+            &now_rfc3339(),
+        )],
+        observed_generation: instance.metadata.generation,
+        components,
+    };
+    Api::<PlatformInstance>::all(ctx.client.clone())
+        .patch_status(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "status": status })),
+        )
+        .await?;
+    Ok(Action::await_change())
+}
+
 async fn reconcile_platform(
     instance: Arc<PlatformInstance>,
     ctx: Arc<Context>,
@@ -1405,6 +1598,24 @@ async fn reconcile_platform(
         tracing::info!(instance = %name, "reconciliation paused; nothing was applied");
         return Ok(Action::await_change());
     }
+
+    // `stopped` (operator#64) scales the platform install's workloads to zero instead of
+    // re-applying it: the golden values carry `replicas: 1`, so applying would start the pods
+    // again and flap them. The CNPG operator's release is never part of it (see stop_platform).
+    let namespace = instance.spec.namespace.clone();
+    if instance.spec.cluster_operation.stopped {
+        return stop_platform(&ctx, &instance, &namespace).await;
+    }
+    if instance
+        .metadata
+        .annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(stop::PREVIOUS_REPLICAS))
+    {
+        restore_platform(&ctx, &instance, &namespace).await?;
+        // fall through: the normal reconcile re-applies and reports the real phase
+    }
+
     let plan = plan_platform(&instance.spec);
     let overrides = OverridesContext {
         // PlatformInstance is cluster-scoped: valuesFrom refs must name their
@@ -3299,6 +3510,207 @@ mod tests {
             );
         }
         let recorded_patches = patches_to(&requests, "lakehouses/main");
+        assert!(
+            recorded_patches.iter().any(|body| {
+                body["metadata"]["annotations"]["stardelt.io/previous-replicas"]
+                    == serde_json::Value::Null
+            }),
+            "the record is removed: {recorded_patches:?}"
+        );
+    }
+
+    /// A cluster-scoped `PlatformInstance` with `annotations` and the given spec.
+    fn stopped_platform_instance(
+        annotations: Option<serde_json::Value>,
+        spec: serde_json::Value,
+    ) -> PlatformInstance {
+        let mut metadata = json!({ "name": "cluster", "generation": 4 });
+        if let Some(annotations) = annotations {
+            metadata["annotations"] = annotations;
+        }
+        serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": metadata,
+            "spec": spec,
+            "status": {
+                "phase": "Ready",
+                "observedGeneration": 3,
+                "conditions": [{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "Ready",
+                    "lastTransitionTime": "old"
+                }],
+                "components": [{ "name": "trino", "ready": true }]
+            }
+        }))
+        .expect("deserialize PlatformInstance")
+    }
+
+    /// The recorded CNPG operator Deployment is dropped before anything is scaled: it is what
+    /// processes `cnpg.io/hibernation`, so a stop never touches it (operator#64).
+    #[test]
+    fn the_cnpg_operators_deployment_is_never_restored() {
+        let workloads = recorded_workloads(
+            r#"{"Deployment/cnpg-cloudnative-pg":1,"Deployment/keycloak":1}"#,
+            "PlatformInstance 'cluster'",
+        )
+        .expect("a valid record");
+        assert_eq!(
+            workloads,
+            vec![("Deployment".to_string(), "keycloak".to_string(), 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_platforminstance_writes_stopped_and_calls_no_upgrade() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance = stopped_platform_instance(
+            None,
+            json!({
+                "dryRun": false,
+                "pillars": { "pipelines": true, "dashboards": true },
+                "clusterOperation": { "stopped": true }
+            }),
+        );
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("reconcile a stopped PlatformInstance");
+
+        let status = patched_status(&requests, "platforminstances");
+        assert_eq!(status["phase"], json!("Stopped"));
+        assert_eq!(status["observedGeneration"], json!(4));
+        let ready = &status["conditions"][0];
+        assert_eq!(ready["type"], json!("Ready"));
+        assert_eq!(ready["status"], json!("False"));
+        assert_eq!(ready["reason"], json!("Stopped"));
+        assert_eq!(
+            status["components"][0]["name"],
+            json!("trino"),
+            "a stopped PlatformInstance keeps the last component list"
+        );
+        let calls = helm.calls.lock().expect("calls poisoned").clone();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.args.first().map(String::as_str) == Some("upgrade")),
+            "a stopped PlatformInstance must not apply a release"
+        );
+        assert!(
+            !calls.iter().any(
+                |call| call.args.get(1).map(String::as_str) == Some("manifest")
+                    && call.args.get(2).map(String::as_str) == Some("cnpg")
+            ),
+            "the CNPG operator's release is never read: {calls:?}"
+        );
+        assert!(
+            patches_to(&requests, "/deployments").is_empty(),
+            "nothing was applied, so there is nothing to scale: {:?}",
+            patch_bodies(&requests)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_platforminstance_scales_the_platform_releases() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance = stopped_platform_instance(
+            Some(json!({
+                "stardelt.io/previous-replicas": r#"{"Deployment/keycloak":1,"Deployment/airflow-scheduler":1}"#
+            })),
+            json!({ "dryRun": false, "clusterOperation": { "stopped": true } }),
+        );
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("reconcile a stopped PlatformInstance");
+
+        let keycloak = patches_to(&requests, "/deployments/keycloak");
+        assert_eq!(keycloak.len(), 1, "one patch per recorded Deployment");
+        assert_eq!(keycloak[0]["spec"]["replicas"], json!(0));
+        let airflow = patches_to(&requests, "/deployments/airflow-scheduler");
+        assert_eq!(airflow.len(), 1, "one patch per recorded Deployment");
+        assert_eq!(airflow[0]["spec"]["replicas"], json!(0));
+        let scaled: Vec<serde_json::Value> = patch_bodies(&requests)
+            .into_iter()
+            .filter(|body| body["spec"]["replicas"] == json!(0))
+            .collect();
+        assert_eq!(scaled.len(), 2, "exactly the two recorded workloads");
+        for cluster in ["keycloak-pg", "nova-pg"] {
+            let patches = patches_to(&requests, &format!("/clusters/{cluster}"));
+            assert_eq!(patches.len(), 1, "{cluster} is hibernated");
+            assert_eq!(
+                patches[0]["metadata"]["annotations"]["cnpg.io/hibernation"],
+                json!("true")
+            );
+        }
+        assert!(
+            patches_to(&requests, "/deployments/cnpg-cloudnative-pg").is_empty(),
+            "the CNPG operator's Deployment is never scaled"
+        );
+        assert_eq!(
+            patched_status(&requests, "platforminstances")["phase"],
+            json!("Stopped")
+        );
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a stopped PlatformInstance that already recorded its workloads reads no manifests"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unstoppped_platforminstance_restores_the_counts() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = helm_stub();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance = stopped_platform_instance(
+            Some(json!({
+                "stardelt.io/previous-replicas": r#"{"Deployment/keycloak":1,"Deployment/airflow-scheduler":1}"#
+            })),
+            json!({ "clusterOperation": { "stopped": false } }),
+        );
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("reconcile an unstoppped PlatformInstance");
+
+        let keycloak = patches_to(&requests, "/deployments/keycloak");
+        assert_eq!(keycloak.len(), 1, "the Deployment is restored once");
+        assert_eq!(keycloak[0]["spec"]["replicas"], json!(1));
+        let airflow = patches_to(&requests, "/deployments/airflow-scheduler");
+        assert_eq!(airflow.len(), 1, "the Deployment is restored once");
+        assert_eq!(airflow[0]["spec"]["replicas"], json!(1));
+        for cluster in ["keycloak-pg", "nova-pg"] {
+            let patches = patches_to(&requests, &format!("/clusters/{cluster}"));
+            let waking: Vec<&serde_json::Value> = patches
+                .iter()
+                .filter(|body| {
+                    body["metadata"]["annotations"]
+                        .get("cnpg.io/hibernation")
+                        .is_some()
+                })
+                .collect();
+            assert_eq!(waking.len(), 1, "{cluster} is woken up exactly once");
+            assert_eq!(
+                waking[0]["metadata"]["annotations"]["cnpg.io/hibernation"],
+                serde_json::Value::Null
+            );
+        }
+        let recorded_patches = patches_to(&requests, "platforminstances/cluster");
         assert!(
             recorded_patches.iter().any(|body| {
                 body["metadata"]["annotations"]["stardelt.io/previous-replicas"]
