@@ -136,7 +136,10 @@ spec:
                     type: object
                   schedule:
                     default: 0 2 * * *
-                    description: Five-field cron; the default is 02:00 every day.
+                    description: |-
+                      Five-field cron; the default is 02:00 every day. A `Catalog` that keeps this
+                      default is staggered by name at reconcile time (operator#490); any other value is
+                      applied verbatim.
                     pattern: ^(\S+\s+){4}\S+$
                     type: string
                 type: object

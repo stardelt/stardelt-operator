@@ -55,6 +55,31 @@ pub fn token_url(issuer_url: Option<&str>) -> String {
     }
 }
 
+/// The minute a catalog's maintenance starts when it keeps the default schedule
+/// (operator#490): nine catalogs on one node used to start in the same second.
+///
+/// FNV-1a over the name in `1..=49`, so minute 0 stays free for an explicit schedule and
+/// the value is stable across releases (unlike `DefaultHasher`, which is not guaranteed
+/// to keep its algorithm).
+pub fn stagger_minute(catalog: &str) -> u32 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in catalog.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    1 + (hash % 49) as u32
+}
+
+/// The schedule the CronJob actually carries: the catalog's own when it set one, the
+/// name-staggered default otherwise.
+pub fn effective_schedule(catalog: &str, spec: &MaintenanceSpec) -> String {
+    if spec.schedule == MaintenanceSpec::DEFAULT_SCHEDULE {
+        format!("{} 2 * * *", stagger_minute(catalog))
+    } else {
+        spec.schedule.clone()
+    }
+}
+
 fn labels(catalog: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -199,7 +224,7 @@ pub fn cron_job(
             ..ObjectMeta::default()
         },
         spec: CronJobSpec {
-            schedule: spec.schedule.clone(),
+            schedule: effective_schedule(catalog, spec),
             concurrency_policy: Some("Forbid".to_string()),
             successful_jobs_history_limit: Some(1),
             failed_jobs_history_limit: Some(1),
@@ -306,7 +331,7 @@ pub async fn reconcile_catalog(
                 message: Some(format!(
                     "{} on {}",
                     job_name(&name),
-                    catalog.spec.maintenance.schedule
+                    effective_schedule(&name, &catalog.spec.maintenance)
                 )),
                 last_transition_time: Some(k8s_openapi::jiff::Timestamp::now().to_string()),
                 observed_generation: catalog.metadata.generation,
@@ -521,6 +546,49 @@ mod tests {
     }
 
     #[test]
+    fn the_default_schedule_is_staggered_by_catalog_name() {
+        // The nine catalogs on the dev cluster (operator#490): with the default schedule they
+        // all fired at 02:00:00Z. They must now start in different minutes, and the values must
+        // not drift between releases (a changed hash re-schedules everyone).
+        let spec = MaintenanceSpec::default();
+        let expected = [
+            ("mobility", "44 2 * * *"),
+            ("mobilitylab", "28 2 * * *"),
+            ("mobilityref", "17 2 * * *"),
+            ("qaenergy", "3 2 * * *"),
+            ("qaenergylab", "6 2 * * *"),
+            ("qaenergyref", "28 2 * * *"),
+            ("retail", "44 2 * * *"),
+            ("retaillab", "15 2 * * *"),
+            ("retailref", "40 2 * * *"),
+        ];
+        for (catalog, schedule) in expected {
+            assert_eq!(effective_schedule(catalog, &spec), schedule, "{catalog}");
+        }
+        let minutes: std::collections::BTreeSet<String> = expected
+            .iter()
+            .map(|(catalog, _)| effective_schedule(catalog, &spec))
+            .collect();
+        assert!(
+            minutes.len() >= 7,
+            "the nine catalogs must spread over the hour, got {minutes:?}"
+        );
+        assert!(
+            !minutes.contains("0 2 * * *"),
+            "no catalog may keep the unstaggered default"
+        );
+    }
+
+    #[test]
+    fn an_explicit_schedule_is_kept_verbatim() {
+        let spec = MaintenanceSpec {
+            schedule: "15 4 * * 1".to_string(),
+            ..MaintenanceSpec::default()
+        };
+        assert_eq!(effective_schedule("mobility", &spec), "15 4 * * 1");
+    }
+
+    #[test]
     fn the_job_runs_daily_as_the_teams_pipeline_principal() {
         let job = cron_job(
             "stardelt",
@@ -532,7 +600,7 @@ mod tests {
         );
         assert_eq!(job.metadata.name.as_deref(), Some("maint-mobility"));
         let spec = job.spec;
-        assert_eq!(spec.schedule, "0 2 * * *");
+        assert_eq!(spec.schedule, "44 2 * * *");
         assert_eq!(spec.concurrency_policy.as_deref(), Some("Forbid"));
 
         let pod = spec.job_template.spec.unwrap().template.spec.unwrap();
