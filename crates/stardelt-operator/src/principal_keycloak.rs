@@ -135,8 +135,8 @@ pub fn credentials_secret(name: &str, namespace: &str, secret: &str) -> Secret {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientOutcome {
-    Created { client_id: String },
-    Converged { client_id: String },
+    Created { client_id: String, subject: String },
+    Converged { client_id: String, subject: String },
     OwnerGroupMissing { group: String },
     Unavailable { message: String },
 }
@@ -619,6 +619,7 @@ async fn ensure_principal_client_inner(
         .get("id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "the service-account user has no id".to_string())?;
+    let subject = uid.to_string();
 
     let user_groups_json = proxy_auth(
         ctx,
@@ -671,9 +672,9 @@ async fn ensure_principal_client_inner(
     }
 
     if created {
-        Ok(ClientOutcome::Created { client_id })
+        Ok(ClientOutcome::Created { client_id, subject })
     } else {
-        Ok(ClientOutcome::Converged { client_id })
+        Ok(ClientOutcome::Converged { client_id, subject })
     }
 }
 

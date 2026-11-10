@@ -124,6 +124,11 @@
         "secretName": {
           "nullable": true,
           "type": "string"
+        },
+        "subject": {
+          "description": "The identity provider's user id of this principal (the `sub` of its tokens), written in\nplatform mode after the client converges. The query log records it as the engine user;\nNova maps it back to `spec.ownerGroup` so a team sees its principals' queries\n(stardelt-nova#116). External mode leaves it unset: the provider's administrator owns\nthe account and the operator never talks to that provider.",
+          "nullable": true,
+          "type": "string"
         }
       },
       "type": "object"
