@@ -887,7 +887,7 @@ pub struct PipelineTask {
     /// The tables a `sql` task writes, as `catalog.schema.table`. Only these get an audit
     /// branch when `spec.publish: wap`; a read leaves them alone (nova#628 decision 3).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 16))]
+    #[schemars(length(max = 16), inner(length(min = 1, max = 512)))]
     pub writes: Vec<String>,
     /// A `quality` task's assertions; empty on every other kind.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
