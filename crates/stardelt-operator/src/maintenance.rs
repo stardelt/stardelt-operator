@@ -299,6 +299,19 @@ fn finished_at(job: &Job) -> Option<String> {
         .map(|time| time.0.to_string())
 }
 
+/// The `status.maintenance` body of a merge patch. Every key is written, and a count the log did
+/// not report is written as `null`: JSON merge patch keeps a key it is not sent, so an omitted
+/// count would leave the previous run's number next to the new result (operator#516). The typed
+/// [`MaintenanceStatus`] still leaves a `None` field out on the wire; only this patch is explicit.
+pub fn maintenance_patch(maintenance: &MaintenanceStatus) -> serde_json::Value {
+    serde_json::json!({
+        "lastRun": maintenance.last_run,
+        "lastResult": maintenance.last_result,
+        "tablesDone": maintenance.tables_done,
+        "tablesFailed": maintenance.tables_failed,
+    })
+}
+
 /// The newest finished Job of this catalog's CronJob and its summary, if it has one. A Job is
 /// finished when it completed or failed (operator#507); a failed Job has no `completionTime`.
 async fn last_maintenance(
@@ -451,8 +464,7 @@ pub async fn reconcile_catalog(
         "observedGeneration": observed,
     });
     if let Some(maintenance) = maintenance {
-        status["maintenance"] = serde_json::to_value(&maintenance)
-            .expect("MaintenanceStatus is a plain struct and always serializes");
+        status["maintenance"] = maintenance_patch(&maintenance);
     }
     api.patch_status(
         &name,
@@ -651,6 +663,112 @@ mod tests {
             .unwrap_or_else(|| panic!("no status patch\n{log}"));
         assert!(status.contains("\"NoRunner\""), "{status}");
         assert!(status.contains("\"MaintenanceReady\""), "{status}");
+    }
+
+    /// The API of a reconcile that applies `maint-mobility`: the identity ConfigMap, the pipeline
+    /// principal, the CronJob, the catalog's Jobs (`jobs`), their Pods (`pods`) and one pod log.
+    fn maintenance_client(
+        jobs: String,
+        pods: String,
+        log: String,
+    ) -> (Client, Arc<Mutex<Vec<String>>>) {
+        mock_client(move |method, path, _body| {
+            if method == "GET" && path.ends_with("/configmaps/stardelt-identity") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-identity","namespace":"data"},"data":{"issuerUrl":"https://id.example.com/realms/stardelt"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/serviceprincipals/pipeline-analytics") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"}}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.contains("/cronjobs/maint-mobility") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"CronJob","metadata":{"name":"maint-mobility","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/jobs") {
+                return (200, jobs.clone());
+            }
+            if method == "GET" && path.ends_with("/pods") {
+                return (200, pods.clone());
+            }
+            if method == "GET" && path.ends_with("/log") {
+                return (200, log.clone());
+            }
+            if method == "PATCH" && path.ends_with("/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Catalog","metadata":{"name":"mobility","namespace":"data"},"spec":{"lakehouseRef":{"name":"main"},"owner":"analytics"},"status":{"conditions":[]}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
+            )
+        })
+    }
+
+    fn one_failed_job() -> String {
+        r#"{"apiVersion":"batch/v1","kind":"JobList","items":[{"metadata":{"name":"maint-mobility-abc","namespace":"data","labels":{"stardelt.io/catalog":"mobility"}},"status":{"failed":1,"conditions":[{"type":"Failed","status":"True","lastTransitionTime":"2026-11-10T09:28:56Z"}]}}]}"#.to_string()
+    }
+
+    fn one_pod() -> String {
+        r#"{"apiVersion":"v1","kind":"PodList","items":[{"metadata":{"name":"maint-mobility-abc-x1","namespace":"data"}}]}"#.to_string()
+    }
+
+    fn status_patch(requests: &Arc<Mutex<Vec<String>>>) -> String {
+        let log = requests.lock().expect("requests").join("\n");
+        log.lines()
+            .find(|line| line.contains("/status"))
+            .unwrap_or_else(|| panic!("no status patch\n{log}"))
+            .to_string()
+    }
+
+    #[test]
+    fn a_run_without_a_summary_sends_null_counts() {
+        let patch = maintenance_patch(&MaintenanceStatus {
+            last_run: Some("2026-11-10T09:28:56Z".to_string()),
+            last_result: Some("Failed".to_string()),
+            tables_done: None,
+            tables_failed: None,
+        });
+        assert!(patch.get("tablesDone").is_some(), "{patch}");
+        assert!(patch.get("tablesFailed").is_some(), "{patch}");
+        assert_eq!(patch["tablesDone"], serde_json::Value::Null, "{patch}");
+        assert_eq!(patch["tablesFailed"], serde_json::Value::Null, "{patch}");
+        assert_eq!(patch["lastResult"], "Failed", "{patch}");
+    }
+
+    /// A failed Job whose pod printed no summary must clear the previous run's counts: a merge
+    /// patch that omits them keeps the old numbers next to the new `lastResult` (operator#516).
+    #[tokio::test]
+    async fn a_failed_run_without_a_summary_clears_the_previous_counts() {
+        let (client, requests) = maintenance_client(one_failed_job(), one_pod(), String::new());
+        reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        let status = status_patch(&requests);
+        assert!(status.contains("\"lastResult\":\"Failed\""), "{status}");
+        assert!(status.contains("\"tablesDone\":null"), "{status}");
+        assert!(status.contains("\"tablesFailed\":null"), "{status}");
+    }
+
+    /// The same path with a summary line keeps the counts it printed.
+    #[tokio::test]
+    async fn a_run_with_a_summary_keeps_its_counts() {
+        let log = "{\"catalog\":\"mobility\",\"tablesDone\":2,\"tablesFailed\":0}\n".to_string();
+        let (client, requests) = maintenance_client(one_failed_job(), one_pod(), log);
+        reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        let status = status_patch(&requests);
+        assert!(status.contains("\"tablesDone\":2"), "{status}");
+        assert!(status.contains("\"tablesFailed\":0"), "{status}");
     }
 
     fn owner() -> OwnerReference {
