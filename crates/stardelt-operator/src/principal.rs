@@ -19,8 +19,8 @@ use serde_json::json;
 use crate::connection::ready_condition;
 use crate::controller::Context;
 use crate::crd::{
-    IdentityMode, PlatformInstance, ServicePrincipal, ServicePrincipalSpec, ServicePrincipalStatus,
-    principal_client_id,
+    Condition, IdentityMode, PlatformInstance, ServicePrincipal, ServicePrincipalSpec,
+    ServicePrincipalStatus, principal_client_id,
 };
 use crate::principal_keycloak::{ClientOutcome, delete_principal_client, ensure_principal_client};
 
@@ -334,6 +334,31 @@ async fn ensure_principal_finalizer(
     Ok(())
 }
 
+/// The status a reconcile writes. Pure so every field's wiring is testable without an API
+/// server: `patch_principal_status` only computes `now`/`previous` and sends this.
+fn status_for(
+    state: &PrincipalState,
+    generation: Option<i64>,
+    previous: Option<&Condition>,
+    now: &str,
+) -> ServicePrincipalStatus {
+    ServicePrincipalStatus {
+        ready: state.ready,
+        client_id: state.client_id.clone(),
+        secret_name: state.secret_name.clone(),
+        subject: state.subject.clone(),
+        conditions: vec![ready_condition(
+            state.ready,
+            state.reason,
+            state.message.clone(),
+            generation,
+            previous,
+            now,
+        )],
+        observed_generation: generation,
+    }
+}
+
 async fn patch_principal_status(
     sp: &ServicePrincipal,
     ctx: &Context,
@@ -346,21 +371,7 @@ async fn patch_principal_status(
         .status
         .as_ref()
         .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
-    let status = ServicePrincipalStatus {
-        ready: state.ready,
-        client_id: state.client_id.clone(),
-        secret_name: state.secret_name.clone(),
-        subject: state.subject.clone(),
-        conditions: vec![ready_condition(
-            state.ready,
-            state.reason,
-            state.message.clone(),
-            sp.metadata.generation,
-            previous,
-            &now,
-        )],
-        observed_generation: sp.metadata.generation,
-    };
+    let status = status_for(&state, sp.metadata.generation, previous, &now);
     let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), namespace);
     principals
         .patch_status(
@@ -452,6 +463,30 @@ mod tests {
             state.subject, None,
             "a principal that is not ready claims no owner"
         );
+    }
+
+    #[test]
+    fn the_written_status_carries_the_reconciled_identity_fields() {
+        let state = PrincipalState {
+            ready: true,
+            reason: "Provisioned",
+            message: None,
+            client_id: Some("sp-etl".into()),
+            secret_name: Some("sp-etl".into()),
+            subject: Some("e385bcb7-9484-48b9-8d60-8f509fc6cbd9".into()),
+        };
+        let status = status_for(&state, Some(7), None, "2026-11-10T00:00:00Z");
+        assert!(status.ready);
+        assert_eq!(status.client_id.as_deref(), Some("sp-etl"));
+        assert_eq!(status.secret_name.as_deref(), Some("sp-etl"));
+        assert_eq!(
+            status.subject.as_deref(),
+            Some("e385bcb7-9484-48b9-8d60-8f509fc6cbd9")
+        );
+        assert_eq!(status.observed_generation, Some(7));
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].type_, "Ready");
+        assert_eq!(status.conditions[0].status, "True");
     }
 
     #[test]
