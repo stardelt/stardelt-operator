@@ -3583,6 +3583,51 @@ mod tests {
         assert_eq!(domain["value"], "example.com");
     }
 
+    #[tokio::test]
+    async fn nova_reads_the_jupyterhub_service_token_and_the_same_idle_timeout_as_the_culler() {
+        let (client, requests) = keycloak_client(&[], Some(1));
+        ensure_nova(&context(client), &platform("none", false))
+            .await
+            .expect("a status");
+        let requests = requests.lock().expect("requests poisoned");
+        let deployment = requests
+            .iter()
+            .find(|(_, path, _)| path.ends_with("/deployments/nova"))
+            .expect("the Deployment");
+        let body: serde_json::Value = serde_json::from_str(&deployment.2).expect("JSON body");
+        let env = body["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env");
+        let names: Vec<&str> = env.iter().filter_map(|var| var["name"].as_str()).collect();
+        assert!(names.contains(&"NOVA_JUPYTERHUB_API_URL"), "{names:?}");
+        assert!(names.contains(&"NOVA_JUPYTERHUB_API_TOKEN"), "{names:?}");
+        assert!(names.contains(&"NOVA_WORKSPACE_IDLE_SECONDS"), "{names:?}");
+
+        let token = env
+            .iter()
+            .find(|var| var["name"] == "NOVA_JUPYTERHUB_API_TOKEN")
+            .expect("NOVA_JUPYTERHUB_API_TOKEN");
+        let source = &token["valueFrom"]["secretKeyRef"];
+        assert_eq!(source["name"], "hub");
+        assert_eq!(source["key"], "hub.services.nova.apiToken");
+        assert_eq!(source["optional"], true);
+
+        // The countdown equals the culler: the hub's `cull.timeout` is what stops an
+        // idle server, so the two numbers must not drift apart.
+        let golden: serde_json::Value =
+            serde_yaml::from_str(include_str!("../values/jupyterhub.yaml")).expect("golden values");
+        let cull = golden["cull"]["timeout"].as_i64().expect("cull.timeout");
+        let idle = env
+            .iter()
+            .find(|var| var["name"] == "NOVA_WORKSPACE_IDLE_SECONDS")
+            .expect("NOVA_WORKSPACE_IDLE_SECONDS");
+        assert_eq!(
+            idle["value"],
+            cull.to_string().as_str(),
+            "Nova's countdown must equal the culler"
+        );
+    }
+
     /// A platform spec with ingress switched on, the given identity mode and lakehouse pillar.
     fn platform_with_ingress(mode: &str, lakehouse: bool, dry_run: bool) -> PlatformInstanceSpec {
         let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
