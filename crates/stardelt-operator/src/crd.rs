@@ -1800,6 +1800,13 @@ pub struct ServicePrincipalStatus {
         skip_serializing_if = "Option::is_none"
     )]
     pub secret_name: Option<String>,
+    /// The identity provider's user id of this principal (the `sub` of its tokens), written in
+    /// platform mode after the client converges. The query log records it as the engine user;
+    /// Nova maps it back to `spec.ownerGroup` so a team sees its principals' queries
+    /// (stardelt-nova#116). External mode leaves it unset: the provider's administrator owns
+    /// the account and the operator never talks to that provider.
+    #[serde(default, rename = "subject", skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
     #[serde(

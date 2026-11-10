@@ -70,6 +70,7 @@ pub struct PrincipalState {
     pub message: Option<String>,
     pub client_id: Option<String>,
     pub secret_name: Option<String>,
+    pub subject: Option<String>,
 }
 
 fn not_ready(reason: &'static str, message: String) -> PrincipalState {
@@ -79,6 +80,7 @@ fn not_ready(reason: &'static str, message: String) -> PrincipalState {
         message: Some(message),
         client_id: None,
         secret_name: None,
+        subject: None,
     }
 }
 
@@ -125,6 +127,7 @@ pub fn principal_state(
                     message: None,
                     client_id: None,
                     secret_name: Some(secret_name.to_string()),
+                    subject: None,
                 },
             }
         }
@@ -155,10 +158,19 @@ pub fn principal_state(
                     message: None,
                     client_id: Some(secret_name.clone()),
                     secret_name: Some(secret_name),
+                    subject: None,
                 },
             }
         }
     }
+}
+
+/// Attach the identity provider's subject the platform-mode converge reported.
+/// Only a ready principal reports one: the field is what Nova maps to `spec.ownerGroup`,
+/// and a half-set-up principal must not claim an owner.
+pub fn with_subject(mut state: PrincipalState, subject: Option<String>) -> PrincipalState {
+    state.subject = if state.ready { subject } else { None };
+    state
 }
 
 /// Reconcile one `ServicePrincipal`: validate, check the credentials Secret, write the status.
@@ -188,6 +200,7 @@ pub async fn reconcile_principal(
             .as_ref()
             .is_some_and(|pi| pi.spec.identity.mode == IdentityMode::Platform);
 
+    let mut subject: Option<String> = None;
     if platform_mode {
         if let Err(message) = sp.spec.validate(&name) {
             return patch_principal_status(
@@ -225,7 +238,10 @@ pub async fn reconcile_principal(
                 )
                 .await;
             }
-            ClientOutcome::Created { .. } | ClientOutcome::Converged { .. } => {}
+            ClientOutcome::Created { subject: s, .. }
+            | ClientOutcome::Converged { subject: s, .. } => {
+                subject = Some(s);
+            }
         }
     }
 
@@ -247,6 +263,7 @@ pub async fn reconcile_principal(
         ),
         Err(error) => return Err(error),
     };
+    let state = with_subject(state, subject);
 
     if state.ready {
         ensure_principal_finalizer(&sp, &ctx).await?;
@@ -320,6 +337,7 @@ async fn patch_principal_status(
         ready: state.ready,
         client_id: state.client_id.clone(),
         secret_name: state.secret_name.clone(),
+        subject: state.subject.clone(),
         conditions: vec![ready_condition(
             state.ready,
             state.reason,
@@ -401,6 +419,26 @@ mod tests {
         assert_eq!(state.message, None);
         assert_eq!(state.client_id.as_deref(), Some("sp-etl"));
         assert_eq!(state.secret_name.as_deref(), Some("sp-etl"));
+    }
+
+    #[test]
+    fn only_a_ready_principal_reports_a_subject() {
+        let check = secret_check(Some(&healthy("sp-etl")));
+        let ready = principal_state(&spec(json!({})), "etl", &check);
+        let state = with_subject(ready, Some("e385bcb7-9484-48b9-8d60-8f509fc6cbd9".into()));
+        assert!(state.ready, "{state:?}");
+        assert_eq!(
+            state.subject.as_deref(),
+            Some("e385bcb7-9484-48b9-8d60-8f509fc6cbd9")
+        );
+
+        let unset = principal_state(&spec(json!({})), "etl", &secret_check(None));
+        let state = with_subject(unset, Some("e385bcb7-9484-48b9-8d60-8f509fc6cbd9".into()));
+        assert!(!state.ready, "{state:?}");
+        assert_eq!(
+            state.subject, None,
+            "a principal that is not ready claims no owner"
+        );
     }
 
     #[test]
