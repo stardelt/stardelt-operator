@@ -171,10 +171,13 @@
           "properties": {
             "allowedCidrs": {
               "default": [],
-              "description": "Source ranges that may open a connection to the public endpoints\n(`stardelt-platform#427`). Empty = open to everyone. A non-empty list renders\n`nginx.ingress.kubernetes.io/whitelist-source-range` on every Ingress this operator\napplies (ingress-nginx; other controllers ignore it). Entries are CIDRs, at most 64.\nAlways include the cluster's own egress address: pods that call the public names\narrive through it.",
+              "description": "Source ranges that may open a connection to the public endpoints\n(`stardelt-platform#427`). Empty = open to everyone. A non-empty list renders\n`nginx.ingress.kubernetes.io/whitelist-source-range` on every Ingress this operator\napplies (ingress-nginx; other controllers ignore it). Entries are CIDRs, at most 64.\nAlways include the cluster's own egress address: pods that call the public names\narrive through it.\n\nThe bounds are not cosmetic: the API server's CEL cost estimator treats an\nunbounded array under a `matches()` rule as unbounded, and refuses the whole\nCRD (\"estimated rule cost exceeds budget by factor of more than 100x\",\noperator#536). `maxItems`/`maxLength` are what make the rule affordable.",
               "items": {
+                "maxLength": 64,
+                "minLength": 1,
                 "type": "string"
               },
+              "maxItems": 64,
               "type": "array"
             },
             "className": {

@@ -162,8 +162,16 @@ spec:
                       applies (ingress-nginx; other controllers ignore it). Entries are CIDRs, at most 64.
                       Always include the cluster's own egress address: pods that call the public names
                       arrive through it.
+
+                      The bounds are not cosmetic: the API server's CEL cost estimator treats an
+                      unbounded array under a `matches()` rule as unbounded, and refuses the whole
+                      CRD ("estimated rule cost exceeds budget by factor of more than 100x",
+                      operator#536). `maxItems`/`maxLength` are what make the rule affordable.
                     items:
+                      maxLength: 64
+                      minLength: 1
                       type: string
+                    maxItems: 64
                     type: array
                   className:
                     description: 'IngressClass name, for example `nginx` or `traefik`. Absent: the cluster default.'
