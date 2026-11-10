@@ -30,7 +30,7 @@ use crate::objects::FIELD_MANAGER;
 pub const JOB_PREFIX: &str = "maint-";
 /// The CLI image (stardelt/stardelt-python#62), pinned by digest: the digest is what runs and
 /// the `:dev` tag is kept for readability only, as in `values/*.yaml`.
-pub const IMAGE: &str = "ghcr.io/stardelt/stardelt-cli:dev@sha256:6b24c07c4271870be966d8bcfe85b691708d74a9cbf006263dc4bf928e220b63";
+pub const IMAGE: &str = "ghcr.io/stardelt/stardelt-cli:dev@sha256:b1aa1d35b0392061248cf03a5b53ee7621a18c8be1bce227fb2475dd160a8d82";
 
 pub fn job_name(catalog: &str) -> String {
     format!("{JOB_PREFIX}{catalog}")
