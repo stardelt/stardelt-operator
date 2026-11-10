@@ -182,6 +182,12 @@ fn build(
             "true".to_string(),
         );
     }
+    if !settings.allowed_cidrs.is_empty() {
+        annotations.insert(
+            "nginx.ingress.kubernetes.io/whitelist-source-range".to_string(),
+            settings.allowed_cidrs.join(","),
+        );
+    }
     let backend = |service: &str| IngressBackend {
         service: Some(IngressServiceBackend {
             name: service.to_string(),
@@ -336,6 +342,40 @@ mod tests {
         assert_eq!(tls.len(), 1);
         assert_eq!(tls[0].hosts, Some(vec!["data.example.com".to_string()]));
         assert_eq!(tls[0].secret_name.as_deref(), Some("data-example-com-tls"));
+    }
+
+    #[test]
+    fn the_allow_list_is_written_on_every_public_ingress() {
+        let s = spec(serde_json::json!({
+            "identity": { "mode": "platform" },
+            "pillars": { "pipelines": true, "notebooks": true, "dashboards": true },
+            "ingress": { "enabled": true, "allowedCidrs": ["203.0.113.0/24", "10.0.0.0/8"] }
+        }));
+        let expected = "203.0.113.0/24,10.0.0.0/8";
+        for ingress in [
+            nova(&s).expect("nova"),
+            keycloak(&s).expect("keycloak"),
+            airflow(&s).expect("airflow"),
+            jupyterhub(&s).expect("jupyterhub"),
+            superset(&s).expect("superset"),
+            trino(&s).expect("trino"),
+        ] {
+            assert_eq!(
+                ingress.metadata.annotations.as_ref().expect("annotations")["nginx.ingress.kubernetes.io/whitelist-source-range"],
+                expected,
+                "{:?}",
+                ingress.metadata.name
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_allow_list_writes_no_annotation() {
+        let ingress = nova(&spec(serde_json::json!({}))).expect("an Ingress");
+        assert!(
+            ingress.metadata.annotations.is_none(),
+            "empty means open, and open means no annotation"
+        );
     }
 
     #[test]
