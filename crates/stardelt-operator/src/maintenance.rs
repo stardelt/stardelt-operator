@@ -312,25 +312,29 @@ pub fn maintenance_patch(maintenance: &MaintenanceStatus) -> serde_json::Value {
     })
 }
 
-/// The newest finished Job of this catalog's CronJob and its summary, if it has one. A Job is
+/// The newest finished Job of this catalog's CronJob and its summary, if it has one, and whether
+/// any Job of the catalog exists at all. The caller tells "a run is in progress" (a Job, no verdict
+/// yet) from "nothing is left on the cluster" (a deleted Job, so a stale verdict must go). A Job is
 /// finished when it completed or failed (operator#507); a failed Job has no `completionTime`.
 async fn last_maintenance(
     ctx: &Context,
     namespace: &str,
     catalog: &str,
-) -> Result<Option<MaintenanceStatus>, kube::Error> {
+) -> Result<(bool, Option<MaintenanceStatus>), kube::Error> {
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     let selector = format!("stardelt.io/catalog={catalog}");
-    let mut done: Vec<(String, Job)> = jobs
+    let items = jobs
         .list(&ListParams::default().labels(&selector))
         .await?
-        .items
+        .items;
+    let any = !items.is_empty();
+    let mut done: Vec<(String, Job)> = items
         .into_iter()
         .filter_map(|job| finished_at(&job).map(|at| (at, job)))
         .collect();
     done.sort_by(|a, b| a.0.cmp(&b.0));
     let Some((finished, job)) = done.pop() else {
-        return Ok(None);
+        return Ok((any, None));
     };
     let status = job.status.clone().unwrap_or_default();
     let result = if status.succeeded.unwrap_or(0) > 0 {
@@ -344,12 +348,15 @@ async fn last_maintenance(
         job.metadata.name.as_deref().unwrap_or_default(),
     )
     .await;
-    Ok(Some(MaintenanceStatus {
-        last_run: Some(finished),
-        last_result: Some(result.to_string()),
-        tables_done: summary.map(|(done, _)| done),
-        tables_failed: summary.map(|(_, failed)| failed),
-    }))
+    Ok((
+        true,
+        Some(MaintenanceStatus {
+            last_run: Some(finished),
+            last_result: Some(result.to_string()),
+            tables_done: summary.map(|(done, _)| done),
+            tables_failed: summary.map(|(_, failed)| failed),
+        }),
+    ))
 }
 
 /// The pod log of one Job's pod, parsed with [`parse_summary`]. A refusal (the pod was already
@@ -449,7 +456,7 @@ pub async fn reconcile_catalog(
         }
     };
 
-    let maintenance = last_maintenance(&ctx, &namespace, &name).await?;
+    let (job_exists, maintenance) = last_maintenance(&ctx, &namespace, &name).await?;
 
     let existing = catalog
         .status
@@ -465,6 +472,10 @@ pub async fn reconcile_catalog(
     });
     if let Some(maintenance) = maintenance {
         status["maintenance"] = maintenance_patch(&maintenance);
+    } else if !job_exists {
+        // The newest run's Job was deleted (history limit, a TTL, or by hand): the old verdict
+        // describes nothing on the cluster. Merge patch removes a key whose value is null.
+        status["maintenance"] = serde_json::Value::Null;
     }
     api.patch_status(
         &name,
@@ -769,6 +780,38 @@ mod tests {
         let status = status_patch(&requests);
         assert!(status.contains("\"tablesDone\":2"), "{status}");
         assert!(status.contains("\"tablesFailed\":0"), "{status}");
+    }
+
+    /// A verdict whose Job was deleted (history limit, a TTL, by hand) describes nothing on the
+    /// cluster, so the merge patch sends `null` and removes the key (operator#519).
+    #[tokio::test]
+    async fn no_job_at_all_clears_the_maintenance_status() {
+        let (client, requests) = maintenance_client(
+            r#"{"apiVersion":"batch/v1","kind":"JobList","items":[]}"#.to_string(),
+            r#"{"apiVersion":"v1","kind":"PodList","items":[]}"#.to_string(),
+            String::new(),
+        );
+        reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        let status = status_patch(&requests);
+        assert!(status.contains("\"maintenance\":null"), "{status}");
+    }
+
+    /// A run in progress must not wipe the previous verdict: a Job exists, it simply has no
+    /// result yet (operator#519).
+    #[tokio::test]
+    async fn a_running_job_keeps_the_previous_status() {
+        let (client, requests) = maintenance_client(
+            r#"{"apiVersion":"batch/v1","kind":"JobList","items":[{"metadata":{"name":"maint-mobility-now","namespace":"data","labels":{"stardelt.io/catalog":"mobility"}},"status":{"active":1}}]}"#.to_string(),
+            r#"{"apiVersion":"v1","kind":"PodList","items":[]}"#.to_string(),
+            String::new(),
+        );
+        reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        let status = status_patch(&requests);
+        assert!(!status.contains("\"maintenance\""), "{status}");
     }
 
     fn owner() -> OwnerReference {
