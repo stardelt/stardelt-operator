@@ -1599,14 +1599,17 @@ pub async fn ensure_airflow_group_roles(
 /// The two ConfigMaps the warehouse half of the access sync writes (`trino-warehouses`,
 /// `trino-group-file`): created empty when they are absent, and **never** applied over an
 /// existing one — a server-side apply with force would blank the file the sync wrote
-/// (`make trino-warehouse-configmaps` in stardelt-platform has the same rule). `None`
-/// without the platform identity: the job reads the realm.
+/// (`make trino-warehouse-configmaps` in stardelt-platform has the same rule). Runs for **any**
+/// identity provider (`mode != none`): the access-sync CronJob fills the two files in `platform`
+/// mode, while an `external` install gets them empty — the identity overlay refuses to start
+/// Trino with a *missing* file, not with an empty one. `None` when no identity provider is
+/// configured: the identity overlay is not applied then, so nothing reads these files.
 pub async fn ensure_trino_config_maps(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "trino-configmaps";
-    if spec.identity.mode != IdentityMode::Platform {
+    if spec.identity.mode == IdentityMode::None {
         return None;
     }
     let namespace = &spec.namespace;
@@ -1654,15 +1657,16 @@ const TRINO_KEYSTORE: keycloak::IdentitySecret = keycloak::IdentitySecret {
     fernet: &[],
 };
 
-/// The Trino trust anchor for `identity.mode: platform`: the keystore password Secret first
-/// (cert-manager never issues a certificate whose keystore password Secret is missing), then
-/// the two Issuers and the two Certificates of manifests/trino-tls.yaml.
+/// The Trino trust anchor for any identity provider (`mode != none`): the platform's `make trino`
+/// rule creates the same anchor whenever ConfigMap `stardelt-identity` exists. The keystore
+/// password Secret comes first (cert-manager never issues a certificate whose keystore password
+/// Secret is missing), then the two Issuers and the two Certificates of manifests/trino-tls.yaml.
 pub async fn ensure_trino_tls(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "trino-tls";
-    if spec.identity.mode != IdentityMode::Platform {
+    if spec.identity.mode == IdentityMode::None {
         return None;
     }
     let namespace = &spec.namespace;
@@ -1715,16 +1719,17 @@ const TRINO_INTERNAL: keycloak::IdentitySecret = keycloak::IdentitySecret {
     fernet: &[],
 };
 
-/// The Trino service account: Secret `trino-password-db`, keys `password.db`
-/// (`superset:<bcrypt>` — the PASSWORD authenticator's file), `password` (the plaintext, which
-/// Superset's datasource hook reads) and `username=superset`. Created with the value it needs
-/// and never rewritten; a Secret created before this step only gets the missing `password.db`.
+/// The Trino service account for any identity provider (`mode != none`): Secret
+/// `trino-password-db`, keys `password.db` (`superset:<bcrypt>` — the PASSWORD authenticator's
+/// file), `password` (the plaintext, which Superset's datasource hook reads) and
+/// `username=superset`. Created with the value it needs and never rewritten; a Secret created
+/// before this step only gets the missing `password.db`.
 pub async fn ensure_trino_auth_secrets(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "trino-auth-secrets";
-    if spec.identity.mode != IdentityMode::Platform {
+    if spec.identity.mode == IdentityMode::None {
         return None;
     }
     let internal = ensure_generated_secrets(ctx, spec, NAME, &[TRINO_INTERNAL]).await;
@@ -4534,12 +4539,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trino_config_maps_exist_with_an_external_identity_provider() {
+        let (client, _store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("external", false);
+        let status = ensure_trino_config_maps(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+    }
+
+    #[tokio::test]
     async fn access_sync_is_absent_without_the_platform_identity() {
         let (client, _store, _requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
         let spec = platform("external", false);
         assert!(ensure_access_sync(&ctx, &spec).await.is_none());
-        assert!(ensure_trino_config_maps(&ctx, &spec).await.is_none());
     }
 
     #[tokio::test]
@@ -4585,11 +4600,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trino_tls_is_skipped_without_the_platform_identity_provider() {
+    async fn trino_tls_is_skipped_without_an_identity_provider() {
         let (client, _store, _requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
         let spec = platform("none", false);
         assert!(ensure_trino_tls(&ctx, &spec).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn trino_tls_is_created_for_an_external_identity_provider() {
+        let (client, _store, requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("external", false);
+        let status = ensure_trino_tls(&ctx, &spec).await.expect("a status");
+        assert!(status.ready);
+        let cert_paths: Vec<String> = applied_paths(&requests)
+            .into_iter()
+            .filter(|p| p.contains("/apis/cert-manager.io/v1/"))
+            .collect();
+        assert_eq!(cert_paths.len(), 4);
     }
 
     #[tokio::test]
@@ -4673,11 +4702,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trino_auth_secrets_are_skipped_without_the_platform_identity_provider() {
+    async fn trino_auth_secrets_are_skipped_without_an_identity_provider() {
         let (client, _store, _requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
-        let spec = platform("external", false);
+        let spec = platform("none", false);
         assert!(ensure_trino_auth_secrets(&ctx, &spec).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn trino_auth_secrets_are_created_for_an_external_identity_provider() {
+        let (client, store, _requests) = identity_client(BTreeMap::new());
+        let ctx = context(client);
+        let spec = platform("external", false);
+        let status = ensure_trino_auth_secrets(&ctx, &spec)
+            .await
+            .expect("a status");
+        assert!(status.ready);
+        let store = store.lock().expect("store poisoned");
+        assert!(store.get("trino-internal-secret").is_some());
+        assert!(store.get("trino-password-db").is_some());
     }
 
     #[tokio::test]

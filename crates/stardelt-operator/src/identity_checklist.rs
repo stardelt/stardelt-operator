@@ -138,12 +138,25 @@ fn notes(spec: &PlatformInstanceSpec, client: &str, kind: &str, api_audience: &s
                     "grant the application permission Group.Read.All with admin consent".into(),
                 );
             }
+            if client == "trino" {
+                notes.push(
+                    "the operator creates Trino's TLS anchor and its internal Secrets; supply this client's secret in Secret stardelt-oidc-clients under key trino".into(),
+                );
+            }
             notes
         }
-        IdentityProvider::Oidc => vec![format!(
-            "emit the claim {} with group names in the ID token and the access token",
-            spec.identity.effective_group_claim()
-        )],
+        IdentityProvider::Oidc => {
+            let mut notes = vec![format!(
+                "emit the claim {} with group names in the ID token and the access token",
+                spec.identity.effective_group_claim()
+            )];
+            if client == "trino" {
+                notes.push(
+                    "the operator creates Trino's TLS anchor and its internal Secrets; supply this client's secret in Secret stardelt-oidc-clients under key trino".into(),
+                );
+            }
+            notes
+        }
     }
 }
 
