@@ -231,8 +231,8 @@ mod tests {
 
     use super::*;
     use crate::crd::{
-        CatalogSpec, Pillars, PipelineConcurrency, PipelineTask, PlatformInstanceSpec, SecretsMode,
-        SecretsSpec, StorageSpec,
+        CatalogSpec, Pillars, PipelineConcurrency, PipelinePublish, PipelineTask,
+        PlatformInstanceSpec, SecretsMode, SecretsSpec, StorageSpec,
     };
 
     fn spec(catalog: CatalogImpl, storage: StorageImpl) -> LakehouseSpec {
@@ -277,6 +277,8 @@ mod tests {
             warehouse: None,
             connection: None,
             config: BTreeMap::new(),
+            writes: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -291,6 +293,7 @@ mod tests {
             timeout: None,
             concurrency: PipelineConcurrency::default(),
             engine,
+            publish: PipelinePublish::Direct,
         }
     }
 

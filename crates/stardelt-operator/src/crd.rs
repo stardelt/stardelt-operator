@@ -758,6 +758,44 @@ pub enum TaskKind {
     Quality,
 }
 
+/// How a pipeline's writes reach the tables people read (WAP, nova#628).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PipelinePublish {
+    /// Write straight to `main` (the behaviour of every pipeline today).
+    #[default]
+    Direct,
+    /// Write to an `audit_<run>` branch, run the quality checks, then move `main` (nova#628).
+    Wap,
+}
+
+/// One SQL assertion of a `quality` task: the check passes when the query returns no rows.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QualityCheck {
+    /// Unique within the task; the run page names the check by it.
+    #[schemars(
+        length(min = 1, max = 63),
+        regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+    )]
+    pub name: String,
+    /// The assertion; it passes when it returns zero rows. `${table}` is the branch-qualified
+    /// table during the audit (nova#628 decision 2).
+    #[schemars(length(min = 1, max = 20000))]
+    pub sql: String,
+    /// `error` fails the run; `warn` records the rows and lets the run publish.
+    #[serde(default)]
+    pub severity: QualitySeverity,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QualitySeverity {
+    #[default]
+    Error,
+    Warn,
+}
+
 /// Schema for a task's `config` map. The bounds are not cosmetic: Kubernetes'
 /// CEL cost estimator refuses unbounded maps and strings used by the `notebook`
 /// rules at admission. 32 keys covers every kind's parameters, and 4096
@@ -798,6 +836,18 @@ fn task_config_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::
     {
         "rule": r"self.kind != 'sql' || !has(self.connection)",
         "message": "a sql task cannot name a connection: it runs inside the engine"
+    },
+    {
+        "rule": "!has(self.writes) || self.kind == 'sql'",
+        "message": "only a sql task declares writes"
+    },
+    {
+        "rule": "self.kind != 'sql' || !has(self.writes) || self.writes.all(w, w.matches('^[^ .]+[.][^ .]+[.][^ .]+$'))",
+        "message": "writes must be catalog.schema.table"
+    },
+    {
+        "rule": "!has(self.checks) || self.kind == 'quality'",
+        "message": "only a quality task declares checks"
     }
 ]))]
 pub struct PipelineTask {
@@ -834,6 +884,15 @@ pub struct PipelineTask {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[schemars(schema_with = "task_config_schema")]
     pub config: BTreeMap<String, String>,
+    /// The tables a `sql` task writes, as `catalog.schema.table`. Only these get an audit
+    /// branch when `spec.publish: wap`; a read leaves them alone (nova#628 decision 3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 16))]
+    pub writes: Vec<String>,
+    /// A `quality` task's assertions; empty on every other kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 50))]
+    pub checks: Vec<QualityCheck>,
 }
 
 /// Engine that orchestrates (and for `spark`, executes) the pipeline.
@@ -904,6 +963,14 @@ pub enum PipelineConcurrency {
     {
         "rule": "self.tasks.all(t, t.kind != 'sql' || has(t.sql))",
         "message": "a sql task needs a sql statement"
+    },
+    {
+        "rule": "!has(self.publish) || self.publish != 'wap' || self.tasks.exists(t, t.kind == 'quality' && has(t.checks) && size(t.checks) > 0)",
+        "message": "publish: wap needs a quality task with at least one check"
+    },
+    {
+        "rule": "!has(self.publish) || self.publish != 'wap' || self.tasks.exists(t, has(t.writes) && size(t.writes) > 0)",
+        "message": "publish: wap needs a task that writes at least one table"
     }
 ]))]
 pub struct PipelineSpec {
@@ -942,6 +1009,10 @@ pub struct PipelineSpec {
     pub concurrency: PipelineConcurrency,
     #[serde(default)]
     pub engine: PipelineEngine,
+    /// `direct` (default) or `wap`; `wap` needs a `quality` task with at least one check
+    /// (nova#628 decision 1).
+    #[serde(default)]
+    pub publish: PipelinePublish,
 }
 
 /// The `config` keys a `notebook` task accepts. The CEL rule spells the same list.
@@ -1043,6 +1114,31 @@ impl PipelineSpec {
                     ));
                 }
             }
+            if !task.writes.is_empty() && task.kind != TaskKind::Sql {
+                return Err(format!(
+                    "task `{}` is not a sql task: only a sql task declares writes",
+                    task.name
+                ));
+            }
+            for table in &task.writes {
+                let parts: Vec<&str> = table.split('.').collect();
+                if parts.len() != 3
+                    || parts
+                        .iter()
+                        .any(|p| p.is_empty() || p.contains(char::is_whitespace))
+                {
+                    return Err(format!(
+                        "task `{}` writes `{table}`, which is not catalog.schema.table",
+                        task.name
+                    ));
+                }
+            }
+            if !task.checks.is_empty() && task.kind != TaskKind::Quality {
+                return Err(format!(
+                    "task `{}` is not a quality task: only a quality task declares checks",
+                    task.name
+                ));
+            }
         }
         for task in &self.tasks {
             for dep in &task.depends_on {
@@ -1053,6 +1149,18 @@ impl PipelineSpec {
                     ));
                 }
             }
+        }
+        if self.publish == PipelinePublish::Wap
+            && !self
+                .tasks
+                .iter()
+                .any(|t| t.kind == TaskKind::Quality && !t.checks.is_empty())
+        {
+            return Err("publish: wap needs a quality task with at least one check".to_string());
+        }
+        if self.publish == PipelinePublish::Wap && !self.tasks.iter().any(|t| !t.writes.is_empty())
+        {
+            return Err("publish: wap needs a task that writes at least one table".to_string());
         }
         // Kahn's algorithm: whatever cannot be ordered lies on or behind a cycle.
         let mut waiting: std::collections::BTreeMap<&str, usize> = self
@@ -3358,6 +3466,8 @@ mod tests {
             warehouse: None,
             connection: None,
             config: BTreeMap::new(),
+            writes: Vec::new(),
+            checks: Vec::new(),
         }
     }
 
@@ -3372,6 +3482,7 @@ mod tests {
             timeout: None,
             concurrency: PipelineConcurrency::default(),
             engine: PipelineEngine::default(),
+            publish: PipelinePublish::Direct,
         }
     }
 
@@ -3417,7 +3528,8 @@ mod tests {
             "retries": { "attempts": 2, "backoff": "5m" },
             "timeout": "2h",
             "concurrency": "Replace",
-            "engine": "spark"
+            "engine": "spark",
+            "publish": "direct"
         });
         let parsed: PipelineSpec =
             serde_json::from_value(spec.clone()).expect("deserialize PipelineSpec");
@@ -3456,6 +3568,81 @@ mod tests {
             spec.owner_group = Some(good.to_string());
             assert_eq!(spec.validate(), Ok(()), "{good}");
         }
+    }
+
+    #[test]
+    fn a_valid_wap_pipeline_passes_validation() {
+        let mut spec = spec_of(vec![
+            task("load", TaskKind::Sql, &[]),
+            task("assert", TaskKind::Quality, &["load"]),
+        ]);
+        spec.tasks[0].writes = vec!["mobility.silver.trips".to_string()];
+        spec.tasks[1].checks = vec![QualityCheck {
+            name: "no_null_ids".to_string(),
+            sql: "SELECT id FROM ${table} WHERE id IS NULL".to_string(),
+            severity: QualitySeverity::Error,
+        }];
+        spec.publish = PipelinePublish::Wap;
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn wap_needs_a_quality_task_with_a_check() {
+        let mut spec = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        spec.tasks[0].writes = vec!["mobility.silver.trips".to_string()];
+        spec.publish = PipelinePublish::Wap;
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "publish: wap needs a quality task with at least one check"
+        );
+    }
+
+    #[test]
+    fn only_a_sql_task_declares_writes_and_only_a_quality_task_checks() {
+        let mut spec = spec_of(vec![task("nb", TaskKind::Notebook, &[])]);
+        spec.tasks[0]
+            .config
+            .insert("notebook".into(), "x.ipynb".into());
+        spec.tasks[0]
+            .config
+            .insert("objectVersion".into(), "v1".into());
+        spec.tasks[0].writes = vec!["mobility.silver.trips".to_string()];
+        assert!(
+            spec.validate().is_err(),
+            "a notebook task cannot declare writes"
+        );
+
+        let mut spec = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        spec.tasks[0].checks = vec![QualityCheck {
+            name: "c".into(),
+            sql: "SELECT 1".into(),
+            severity: QualitySeverity::Warn,
+        }];
+        assert!(spec.validate().is_err(), "a sql task cannot declare checks");
+    }
+
+    #[test]
+    fn a_write_must_be_catalog_schema_table() {
+        let mut spec = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        spec.tasks[0].writes = vec!["silver.trips".to_string()];
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "task `load` writes `silver.trips`, which is not catalog.schema.table"
+        );
+    }
+
+    #[test]
+    fn publish_defaults_to_direct_and_round_trips() {
+        let p: Pipeline = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "Pipeline",
+            "metadata": { "name": "daily", "namespace": "stardelt" },
+            "spec": { "tasks": [ { "name": "load", "kind": "sql", "sql": "SELECT 1" } ] }
+        }))
+        .expect("a pipeline without publish still parses");
+        assert_eq!(p.spec.publish, PipelinePublish::Direct);
+        let value = serde_json::to_value(&p.spec).expect("serializes");
+        assert_eq!(value["publish"], "direct");
     }
 
     fn notebook_task(file: &str, version: &str) -> PipelineTask {
