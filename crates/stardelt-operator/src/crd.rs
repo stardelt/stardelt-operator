@@ -2424,6 +2424,31 @@ pub struct CatalogDomainStatus {
         skip_serializing_if = "Option::is_none"
     )]
     pub observed_generation: Option<i64>,
+    /// The newest finished maintenance Job's result (operator#476 slice c).
+    #[serde(
+        default,
+        rename = "maintenance",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub maintenance: Option<MaintenanceStatus>,
+}
+
+/// What the newest finished `maint-<name>` Job did (operator#476 slice c).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceStatus {
+    /// The Job's `status.completionTime`, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<String>,
+    /// `Succeeded` when the Job succeeded, `Failed` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_result: Option<String>,
+    /// The summary line's `tablesDone`; absent when the log held no summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables_done: Option<i64>,
+    /// The summary line's `tablesFailed`; absent when the log held no summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tables_failed: Option<i64>,
 }
 
 /// The platform's compute classes. A class is a name for four numbers (running, queued, memory
