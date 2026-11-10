@@ -176,6 +176,9 @@ pub fn roles(namespace: &str) -> Vec<Role> {
         // for the Streams page and written for the stream's create/update (D42,
         // stardelt-nova#617). `SparkCluster` resources are listed and patched for the Compute page
         // (internal#161 slice 5a); create and delete are the administrator's form.
+        // `create` on both is the administrator's New team space (internal#106 decision 3),
+        // stardelt-platform#785: without it an operator install answers 502 where a manifest
+        // install works.
         role(
             PIPELINES_ROLE,
             namespace,
@@ -185,7 +188,11 @@ pub fn roles(namespace: &str) -> Vec<Role> {
                     &["get", "list", "watch", "create", "update", "delete"],
                     "stardelt.io",
                 ),
-                rule(&["serviceprincipals"], &["get", "list"], "stardelt.io"),
+                rule(
+                    &["serviceprincipals"],
+                    &["get", "list", "create"],
+                    "stardelt.io",
+                ),
                 // Streams (stardelt-nova#617 decision 2, stardelt-platform#879): `patch` is stop/resume;
                 // `create` and `delete` are the team's own stream, written through Nova's streams API.
                 rule(
@@ -202,7 +209,11 @@ pub fn roles(namespace: &str) -> Vec<Role> {
                     &["get", "list", "patch", "create", "delete"],
                     "stardelt.io",
                 ),
-                rule(&["catalogs"], &["get", "list", "patch"], "stardelt.io"),
+                rule(
+                    &["catalogs"],
+                    &["get", "list", "patch", "create"],
+                    "stardelt.io",
+                ),
                 rule(&["sqlwarehouses"], &["get", "list"], "stardelt.io"),
             ],
         ),
@@ -468,10 +479,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Every (apiGroup, resource, verb) that Nova may use. 32 entries: the list that
+    /// Every (apiGroup, resource, verb) that Nova may use. 34 entries: the list that
     /// `scripts/check-nova-rbac-parity.sh` in stardelt-platform compares between the manifest
     /// and the chart.
-    const GRANTED: [(&str, &str, &str); 32] = [
+    const GRANTED: [(&str, &str, &str); 34] = [
         ("apps", "deployments", "get"),
         ("apps", "deployments", "list"),
         ("apps", "statefulsets", "get"),
@@ -489,6 +500,7 @@ mod tests {
         ("stardelt.io", "pipelines", "watch"),
         ("stardelt.io", "serviceprincipals", "get"),
         ("stardelt.io", "serviceprincipals", "list"),
+        ("stardelt.io", "serviceprincipals", "create"),
         ("stardelt.io", "streamapps", "create"),
         ("stardelt.io", "streamapps", "delete"),
         ("stardelt.io", "streamapps", "get"),
@@ -502,6 +514,7 @@ mod tests {
         ("stardelt.io", "catalogs", "get"),
         ("stardelt.io", "catalogs", "list"),
         ("stardelt.io", "catalogs", "patch"),
+        ("stardelt.io", "catalogs", "create"),
         ("stardelt.io", "sqlwarehouses", "get"),
         ("stardelt.io", "sqlwarehouses", "list"),
     ];
