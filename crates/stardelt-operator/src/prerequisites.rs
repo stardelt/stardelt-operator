@@ -417,22 +417,29 @@ fn secret_env(name: &str, key: &str) -> EnvVar {
 
 /// Bucket for published notebooks (Nova's publish route writes a new object version per publish,
 /// so the bucket must keep versions). SeaweedFS' chart can create a bucket but not switch
-/// versioning on, so [`notebooks_bucket_job`] does both.
+/// versioning on, so [`notebooks_bucket_job`] does both and keeps executed run copies under
+/// `_runs/` for 30 days.
 pub const NOTEBOOKS_BUCKET: &str = "notebooks";
-/// Creates [`NOTEBOOKS_BUCKET`] and turns versioning on (idempotent).
+/// Creates [`NOTEBOOKS_BUCKET`], turns versioning on and keeps executed run copies under `_runs/`
+/// for 30 days (idempotent).
 pub const NOTEBOOKS_BUCKET_SCRIPT: &str = include_str!("notebooks_bucket.sh");
 
-/// Name of the notebooks-bucket Job. It changes when the endpoint changes, because a Job spec is
-/// immutable and a new object store needs the bucket again.
-pub fn notebooks_bucket_job_name(endpoint: &str) -> String {
+fn notebooks_bucket_job_name_for(endpoint: &str, script: &str) -> String {
     let mut hasher = DefaultHasher::new();
-    (NOTEBOOKS_BUCKET, endpoint).hash(&mut hasher);
+    (NOTEBOOKS_BUCKET, endpoint, script).hash(&mut hasher);
     format!("notebooks-bucket-{:08x}", hasher.finish() as u32)
 }
 
+/// Name of the notebooks-bucket Job. It changes when the endpoint or the script changes: a Job
+/// spec is immutable, and a changed script must run again to reach an existing bucket.
+pub fn notebooks_bucket_job_name(endpoint: &str) -> String {
+    notebooks_bucket_job_name_for(endpoint, NOTEBOOKS_BUCKET_SCRIPT)
+}
+
 /// The Job that creates the versioned notebooks bucket with the AWS CLI, against the object store
-/// of the Lakehouse, with its credentials from Secret `stardelt-s3-creds`. Mirrors
-/// `scripts/create-notebooks-bucket.sh` in stardelt-platform.
+/// of the Lakehouse, with its credentials from Secret `stardelt-s3-creds`, and keeps executed run
+/// copies under `_runs/` for 30 days. Mirrors `scripts/create-notebooks-bucket.sh` in
+/// stardelt-platform.
 pub fn notebooks_bucket_job(
     lakehouse: &str,
     namespace: &str,
@@ -1073,6 +1080,9 @@ mod tests {
         assert!(script.contains("put-bucket-versioning"));
         assert!(script.contains("Status=Enabled"));
         assert!(script.contains("head-bucket"), "an existing bucket is kept");
+        assert!(script.contains("put-bucket-lifecycle-configuration"));
+        assert!(script.contains("_runs/"));
+        assert!(script.contains("run copies kept"));
     }
 
     #[test]
@@ -1087,6 +1097,18 @@ mod tests {
             notebooks_bucket_job_name("http://seaweedfs-s3.other.svc.cluster.local:8333")
         );
         assert!(a.starts_with("notebooks-bucket-"));
+    }
+
+    #[test]
+    fn the_notebooks_bucket_job_name_covers_the_script() {
+        let endpoint = "http://seaweedfs-s3.data.svc.cluster.local:8333";
+        let first = notebooks_bucket_job_name_for(endpoint, "set -e");
+        assert_eq!(first, notebooks_bucket_job_name_for(endpoint, "set -e"));
+        assert_ne!(
+            first,
+            notebooks_bucket_job_name_for(endpoint, "set -e\n# a changed script")
+        );
+        assert!(first.starts_with("notebooks-bucket-"));
     }
 
     #[test]
