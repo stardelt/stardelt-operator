@@ -305,6 +305,14 @@ impl Default for IdentitySpec {
     {
         "rule": "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)",
         "message": "ingress.tls.enabled needs ingress.tls.issuer, the name of a cert-manager ClusterIssuer"
+    },
+    {
+        "rule": "size(self.allowedCidrs) <= 64",
+        "message": "ingress.allowedCidrs: at most 64 entries"
+    },
+    {
+        "rule": "self.allowedCidrs.all(c, c.matches('^[0-9a-fA-F:.]+/[0-9]{1,3}$'))",
+        "message": "ingress.allowedCidrs: each entry is a CIDR such as 203.0.113.0/24"
     }
 ]))]
 pub struct IngressSettings {
@@ -317,6 +325,14 @@ pub struct IngressSettings {
     #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 253))]
     pub class_name: Option<String>,
+    /// Source ranges that may open a connection to the public endpoints
+    /// (`stardelt-platform#427`). Empty = open to everyone. A non-empty list renders
+    /// `nginx.ingress.kubernetes.io/whitelist-source-range` on every Ingress this operator
+    /// applies (ingress-nginx; other controllers ignore it). Entries are CIDRs, at most 64.
+    /// Always include the cluster's own egress address: pods that call the public names
+    /// arrive through it.
+    #[serde(default, rename = "allowedCidrs")]
+    pub allowed_cidrs: Vec<String>,
     /// TLS through cert-manager.
     #[serde(default)]
     pub tls: IngressTls,
@@ -3346,6 +3362,9 @@ mod tests {
         assert!(crd.contains(
             "!has(self.tls) || !has(self.tls.enabled) || !self.tls.enabled || (has(self.tls.issuer) && size(self.tls.issuer) > 0)"
         ));
+        assert!(crd.contains("ingress.allowedCidrs: at most 64 entries"));
+        assert!(crd.contains("ingress.allowedCidrs: each entry is a CIDR such as 203.0.113.0/24"));
+        assert!(crd.contains("\"allowedCidrs\""));
     }
 
     #[test]
