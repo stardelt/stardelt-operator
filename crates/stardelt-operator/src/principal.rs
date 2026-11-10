@@ -31,7 +31,12 @@ pub const PRINCIPAL_FINALIZER: &str = "stardelt.io/principal-keycloak";
 pub enum SecretCheck {
     Missing,
     MissingKeys(Vec<&'static str>),
-    Present { client_id: String },
+    Present {
+        client_id: String,
+        /// The service account's `sub`, when the Secret carries it (a chart install writes it
+        /// with `keycloak-sync-principal.sh`; platform mode learns it from the IdP instead).
+        subject: Option<String>,
+    },
 }
 
 /// Read what the credentials Secret holds. Only whether a key is present and non-empty matters;
@@ -47,6 +52,7 @@ pub fn secret_check(secret: Option<&Secret>) -> SecretCheck {
     };
     let client_id = text("client-id");
     let client_secret = text("client-secret");
+    let subject = text("subject");
     let missing: Vec<&'static str> = [
         ("client-id", client_id.is_none()),
         ("client-secret", client_secret.is_none()),
@@ -59,6 +65,7 @@ pub fn secret_check(secret: Option<&Secret>) -> SecretCheck {
     }
     SecretCheck::Present {
         client_id: client_id.expect("checked above"),
+        subject,
     }
 }
 
@@ -143,7 +150,7 @@ pub fn principal_state(
                     ),
                 ),
                 SecretCheck::MissingKeys(keys) => incomplete(&secret_name, keys),
-                SecretCheck::Present { client_id } if client_id != &secret_name => not_ready(
+                SecretCheck::Present { client_id, .. } if client_id != &secret_name => not_ready(
                     "ClientIdMismatch",
                     format!(
                         "the `client-id` in Secret {secret_name} is not `{secret_name}`: the Secret \
@@ -152,24 +159,30 @@ pub fn principal_state(
                         spec.owner_group
                     ),
                 ),
-                SecretCheck::Present { .. } => PrincipalState {
+                SecretCheck::Present { subject, .. } => PrincipalState {
                     ready: true,
                     reason: "Provisioned",
                     message: None,
                     client_id: Some(secret_name.clone()),
                     secret_name: Some(secret_name),
-                    subject: None,
+                    subject: subject.clone(),
                 },
             }
         }
     }
 }
 
-/// Attach the identity provider's subject the platform-mode converge reported.
-/// Only a ready principal reports one: the field is what Nova maps to `spec.ownerGroup`,
-/// and a half-set-up principal must not claim an owner.
+/// Attach the identity provider's subject. The platform-mode converge wins when it reports one;
+/// otherwise the Secret's `subject` (written by `keycloak-sync-principal.sh` on a chart install)
+/// is used, so `status.subject` is filled on every install that records it. Only a ready
+/// principal reports one: the field is what Nova maps to `spec.ownerGroup`, and a half-set-up
+/// principal must not claim an owner.
 pub fn with_subject(mut state: PrincipalState, subject: Option<String>) -> PrincipalState {
-    state.subject = if state.ready { subject } else { None };
+    state.subject = if state.ready {
+        subject.or(state.subject)
+    } else {
+        None
+    };
     state
 }
 
@@ -439,6 +452,52 @@ mod tests {
             state.subject, None,
             "a principal that is not ready claims no owner"
         );
+    }
+
+    #[test]
+    fn a_chart_install_reports_the_subject_its_secret_carries() {
+        let s = spec(json!({}));
+        let check = secret_check(Some(&secret(
+            "sp-analytics",
+            &[
+                ("client-id", "sp-analytics"),
+                ("client-secret", CANARY),
+                ("subject", "4484404b-a7e1-45e1-8fda-19a46073571b"),
+            ],
+        )));
+        let state = principal_state(&s, "analytics", &check);
+        assert!(state.ready);
+        assert_eq!(
+            state.subject.as_deref(),
+            Some("4484404b-a7e1-45e1-8fda-19a46073571b")
+        );
+        // The platform-mode converge reporting nothing must not erase it.
+        assert_eq!(
+            with_subject(state, None).subject.as_deref(),
+            Some("4484404b-a7e1-45e1-8fda-19a46073571b")
+        );
+    }
+
+    #[test]
+    fn the_converge_subject_wins_over_the_secret_and_a_not_ready_principal_has_none() {
+        let s = spec(json!({}));
+        let check = secret_check(Some(&secret(
+            "sp-analytics",
+            &[
+                ("client-id", "sp-analytics"),
+                ("client-secret", CANARY),
+                ("subject", "from-secret"),
+            ],
+        )));
+        let state = principal_state(&s, "analytics", &check);
+        assert_eq!(
+            with_subject(state, Some("from-idp".into()))
+                .subject
+                .as_deref(),
+            Some("from-idp")
+        );
+        let missing = principal_state(&s, "analytics", &SecretCheck::Missing);
+        assert_eq!(with_subject(missing, Some("x".into())).subject, None);
     }
 
     #[test]
