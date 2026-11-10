@@ -39,6 +39,15 @@
           "description": "Values for `${params.<name>}` in task statements.",
           "type": "object"
         },
+        "publish": {
+          "default": "direct",
+          "description": "`direct` (default) or `wap`; `wap` needs a `quality` task with at least one check\n(nova#628 decision 1).",
+          "enum": [
+            "direct",
+            "wap"
+          ],
+          "type": "string"
+        },
         "retries": {
           "description": "Retry policy applied to every task.",
           "nullable": true,
@@ -92,6 +101,43 @@
           "items": {
             "description": "One task of a `Pipeline`. A task starts when every task in `dependsOn` has succeeded.\n\nA `notebook` task names its source in `config`: `notebook` is the `.ipynb`\nfile name and `objectVersion` the immutable published version; `params` is a\nJSON object string that papermill passes to the notebook. Nothing else is\naccepted, so a typo cannot silently become a default.",
             "properties": {
+              "checks": {
+                "description": "A `quality` task's assertions; empty on every other kind.",
+                "items": {
+                  "description": "One SQL assertion of a `quality` task: the check passes when the query returns no rows.",
+                  "properties": {
+                    "name": {
+                      "description": "Unique within the task; the run page names the check by it.",
+                      "maxLength": 63,
+                      "minLength": 1,
+                      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+                      "type": "string"
+                    },
+                    "severity": {
+                      "default": "error",
+                      "description": "`error` fails the run; `warn` records the rows and lets the run publish.",
+                      "enum": [
+                        "error",
+                        "warn"
+                      ],
+                      "type": "string"
+                    },
+                    "sql": {
+                      "description": "The assertion; it passes when it returns zero rows. `${table}` is the branch-qualified\ntable during the audit (nova#628 decision 2).",
+                      "maxLength": 20000,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "sql"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 50,
+                "type": "array"
+              },
               "config": {
                 "additionalProperties": {
                   "maxLength": 4096,
@@ -146,6 +192,14 @@
                 "description": "Warehouse that runs a `sql` task; absent means the default warehouse.",
                 "nullable": true,
                 "type": "string"
+              },
+              "writes": {
+                "description": "The tables a `sql` task writes, as `catalog.schema.table`. Only these get an audit\nbranch when `spec.publish: wap`; a read leaves them alone (nova#628 decision 3).",
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
               }
             },
             "required": [
@@ -169,6 +223,18 @@
               {
                 "message": "a sql task cannot name a connection: it runs inside the engine",
                 "rule": "self.kind != 'sql' || !has(self.connection)"
+              },
+              {
+                "message": "only a sql task declares writes",
+                "rule": "!has(self.writes) || self.kind == 'sql'"
+              },
+              {
+                "message": "writes must be catalog.schema.table",
+                "rule": "self.kind != 'sql' || !has(self.writes) || self.writes.all(w, w.matches('^[^ .]+[.][^ .]+[.][^ .]+$'))"
+              },
+              {
+                "message": "only a quality task declares checks",
+                "rule": "!has(self.checks) || self.kind == 'quality'"
               }
             ]
           },
@@ -198,6 +264,14 @@
         {
           "message": "a sql task needs a sql statement",
           "rule": "self.tasks.all(t, t.kind != 'sql' || has(t.sql))"
+        },
+        {
+          "message": "publish: wap needs a quality task with at least one check",
+          "rule": "!has(self.publish) || self.publish != 'wap' || self.tasks.exists(t, t.kind == 'quality' && has(t.checks) && size(t.checks) > 0)"
+        },
+        {
+          "message": "publish: wap needs a task that writes at least one table",
+          "rule": "!has(self.publish) || self.publish != 'wap' || self.tasks.exists(t, has(t.writes) && size(t.writes) > 0)"
         }
       ]
     },
