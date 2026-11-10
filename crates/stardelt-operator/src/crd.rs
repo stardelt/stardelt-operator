@@ -331,7 +331,13 @@ pub struct IngressSettings {
     /// applies (ingress-nginx; other controllers ignore it). Entries are CIDRs, at most 64.
     /// Always include the cluster's own egress address: pods that call the public names
     /// arrive through it.
+    ///
+    /// The bounds are not cosmetic: the API server's CEL cost estimator treats an
+    /// unbounded array under a `matches()` rule as unbounded, and refuses the whole
+    /// CRD ("estimated rule cost exceeds budget by factor of more than 100x",
+    /// operator#536). `maxItems`/`maxLength` are what make the rule affordable.
     #[serde(default, rename = "allowedCidrs")]
+    #[schemars(length(max = 64), inner(length(min = 1, max = 64)))]
     pub allowed_cidrs: Vec<String>,
     /// TLS through cert-manager.
     #[serde(default)]
@@ -3428,6 +3434,26 @@ mod tests {
             ["properties"]["secrets"]["properties"]["groups"];
         assert_eq!(groups["maxItems"], 20, "groups schema: {groups}");
         assert_eq!(groups["items"]["maxLength"], 40, "groups schema: {groups}");
+    }
+
+    /// `spec.ingress.allowedCidrs` must carry the bounds its CEL rule is priced against.
+    ///
+    /// The rule runs `matches()` over every entry (`stardelt-platform#427`). Without
+    /// `maxItems` on the array and `maxLength` on the items the API server estimates the
+    /// rule above the CEL budget and refuses the whole CRD — rolling out operator#533
+    /// failed with "estimated rule cost exceeds budget by factor of more than 100x" until
+    /// both were added (operator#536). A server-side dry run on the dev node accepted the
+    /// CRD with `maxItems: 64` / `maxLength: 64`.
+    #[test]
+    fn the_ingress_allowed_cidrs_schema_is_bounded() {
+        let crd = serde_json::to_value(PlatformInstance::crd()).expect("serialize CRD");
+        let cidrs = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["ingress"]["properties"]["allowedCidrs"];
+        assert_eq!(cidrs["maxItems"], 64, "allowedCidrs schema: {cidrs}");
+        assert_eq!(
+            cidrs["items"]["maxLength"], 64,
+            "allowedCidrs schema: {cidrs}"
+        );
     }
 
     #[test]
