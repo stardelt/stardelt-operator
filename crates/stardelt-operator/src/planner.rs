@@ -193,7 +193,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "seaweedfs/seaweedfs" => Some("4.25.1"),
         "lakekeeper/lakekeeper" => Some("0.11.0"),
         "trino/trino" => Some("1.42.2"),
-        "jupyterhub/jupyterhub" => Some("4.4.3"),
+        "jupyterhub/jupyterhub" => Some("4.4.5"),
         "apache-airflow/airflow" => Some("1.21.0"),
         "superset/superset" => Some("0.15.5"),
         "openfga/openfga" => Some("0.2.62"),
