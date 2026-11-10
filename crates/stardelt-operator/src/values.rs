@@ -369,6 +369,26 @@ mod tests {
             "singleuser.storage.dynamic.storageClass must be absent or a real class, got {class}"
         );
         assert_eq!(j["singleuser"]["defaultUrl"], serde_json::json!("/lab"));
+        // The Nova workspace service (operator#484, the operator half of platform#832):
+        // the hub exposes a service, the role carries the four scopes, and the idle
+        // culler the Nova countdown mirrors.
+        assert_eq!(
+            j["hub"]["services"]["nova"],
+            serde_json::json!({}),
+            "the hub needs a `nova` service so the chart generates its token"
+        );
+        assert_eq!(
+            j["hub"]["loadRoles"]["nova-workspace"]["scopes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert_eq!(
+            j["hub"]["networkPolicy"]["ingress"][0]["ports"][0]["port"],
+            8081
+        );
+        assert_eq!(j["cull"]["timeout"].as_i64(), Some(3600));
     }
 
     #[test]

@@ -316,6 +316,19 @@ fn env(namespace: &str, base_domain: Option<&str>, airflow: bool) -> Vec<EnvVar>
         // The query-log collector: a second listener that no Ingress routes.
         value_env("NOVA_INTERNAL_ADDR", "0.0.0.0:8081"),
         secret_env("NOVA_EVENTS_TOKEN", "nova-events", "token", true),
+        // The hub's service API: Nova reads the person's workspace state and starts or
+        // stops their server (stardelt-nova#652 W3). The chart generates the token;
+        // optional so a Nova that starts before `make install-notebooks` is not wedged.
+        value_env("NOVA_JUPYTERHUB_API_URL", "http://hub:8081/hub/api"),
+        secret_env(
+            "NOVA_JUPYTERHUB_API_TOKEN",
+            "hub",
+            "hub.services.nova.apiToken",
+            true,
+        ),
+        // Must equal `cull.timeout` in values/jupyterhub.yaml — the culler is what stops
+        // an idle server; Nova only counts down.
+        value_env("NOVA_WORKSPACE_IDLE_SECONDS", "3600"),
         value_env("RUST_LOG", "info,tower_http=info"),
     ];
     if let Some(domain) = base_domain {
@@ -722,6 +735,9 @@ mod tests {
                 "NOVA_DATABASE_URL",
                 "NOVA_INTERNAL_ADDR",
                 "NOVA_EVENTS_TOKEN",
+                "NOVA_JUPYTERHUB_API_URL",
+                "NOVA_JUPYTERHUB_API_TOKEN",
+                "NOVA_WORKSPACE_IDLE_SECONDS",
                 "RUST_LOG",
             ]
         );
