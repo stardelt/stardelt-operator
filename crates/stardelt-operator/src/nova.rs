@@ -173,8 +173,8 @@ pub fn roles(namespace: &str) -> Vec<Role> {
         // hence update not patch) and deletes them; `ServicePrincipal`, `Catalog` and
         // `SqlWarehouse` resources are read for the group, permission and compute views
         // (a catalog is also patched by the administrators' view). `StreamApp` resources are read
-        // for the Streams page (D42) — list and phase only; the start/stop routes are a later
-        // ticket. `SparkCluster` resources are listed and patched for the Compute page
+        // for the Streams page and written for the stream's create/update (D42,
+        // stardelt-nova#617). `SparkCluster` resources are listed and patched for the Compute page
         // (internal#161 slice 5a); create and delete are the administrator's form.
         role(
             PIPELINES_ROLE,
@@ -186,7 +186,13 @@ pub fn roles(namespace: &str) -> Vec<Role> {
                     "stardelt.io",
                 ),
                 rule(&["serviceprincipals"], &["get", "list"], "stardelt.io"),
-                rule(&["streamapps"], &["get", "list", "patch"], "stardelt.io"),
+                // Streams (stardelt-nova#617 decision 2, stardelt-platform#879): `patch` is stop/resume;
+                // `create` and `delete` are the team's own stream, written through Nova's streams API.
+                rule(
+                    &["streamapps"],
+                    &["get", "list", "patch", "create", "delete"],
+                    "stardelt.io",
+                ),
                 // The Compute page and Start/Stop (internal#161 slice 5a): list the
                 // `SparkCluster` resources and patch `spec.state`; create and delete are the
                 // administrator's cluster form (slice 5). Stardelt-nova#632 and
@@ -462,10 +468,10 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// Every (apiGroup, resource, verb) that Nova may use. 30 entries: the list that
+    /// Every (apiGroup, resource, verb) that Nova may use. 32 entries: the list that
     /// `scripts/check-nova-rbac-parity.sh` in stardelt-platform compares between the manifest
     /// and the chart.
-    const GRANTED: [(&str, &str, &str); 30] = [
+    const GRANTED: [(&str, &str, &str); 32] = [
         ("apps", "deployments", "get"),
         ("apps", "deployments", "list"),
         ("apps", "statefulsets", "get"),
@@ -483,6 +489,8 @@ mod tests {
         ("stardelt.io", "pipelines", "watch"),
         ("stardelt.io", "serviceprincipals", "get"),
         ("stardelt.io", "serviceprincipals", "list"),
+        ("stardelt.io", "streamapps", "create"),
+        ("stardelt.io", "streamapps", "delete"),
         ("stardelt.io", "streamapps", "get"),
         ("stardelt.io", "streamapps", "list"),
         ("stardelt.io", "streamapps", "patch"),
