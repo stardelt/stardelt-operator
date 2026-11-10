@@ -7,20 +7,22 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
+use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, LocalObjectReference, PodSpec,
+    Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, LocalObjectReference, Pod, PodSpec,
     PodTemplateSpec, ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource,
     SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::ResourceExt;
-use kube::api::{Api, ObjectMeta};
+use kube::api::{Api, ListParams, LogParams, ObjectMeta};
 use kube::runtime::controller::Action;
 
 use crate::controller::Context;
-use crate::crd::{Catalog, Condition, MaintenanceSpec, ServicePrincipal, principal_client_id};
+use crate::crd::{
+    Catalog, Condition, MaintenanceSpec, MaintenanceStatus, ServicePrincipal, principal_client_id,
+};
 use crate::identity::PLATFORM_REALM;
 use crate::objects::FIELD_MANAGER;
 
@@ -267,6 +269,92 @@ pub fn merge_condition(existing: &[Condition], next: Condition) -> Vec<Condition
     conditions
 }
 
+/// The summary line `stardelt maintenance run` writes last:
+/// `{"catalog": …, "tablesDone": n, "tablesFailed": m}`. It is the last such line, not the last
+/// line: a warning after it must not hide the result.
+pub fn parse_summary(log: &str) -> Option<(i64, i64)> {
+    log.lines().rev().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        Some((
+            value.get("tablesDone")?.as_i64()?,
+            value.get("tablesFailed")?.as_i64()?,
+        ))
+    })
+}
+
+/// The newest finished Job of this catalog's CronJob and its summary, if it has one.
+async fn last_maintenance(
+    ctx: &Context,
+    namespace: &str,
+    catalog: &str,
+) -> Result<Option<MaintenanceStatus>, kube::Error> {
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    let selector = format!("stardelt.io/catalog={catalog}");
+    let mut finished: Vec<Job> = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items
+        .into_iter()
+        .filter(|job| {
+            job.status
+                .as_ref()
+                .is_some_and(|status| status.completion_time.is_some())
+        })
+        .collect();
+    finished.sort_by_key(|job| {
+        job.status
+            .as_ref()
+            .and_then(|status| status.completion_time.as_ref())
+            .map(|time| time.0.to_string())
+    });
+    let Some(job) = finished.pop() else {
+        return Ok(None);
+    };
+    let status = job.status.clone().unwrap_or_default();
+    let result = if status.succeeded.unwrap_or(0) > 0 {
+        "Succeeded"
+    } else {
+        "Failed"
+    };
+    let summary = pod_summary(
+        ctx,
+        namespace,
+        job.metadata.name.as_deref().unwrap_or_default(),
+    )
+    .await;
+    Ok(Some(MaintenanceStatus {
+        last_run: status.completion_time.map(|time| time.0.to_string()),
+        last_result: Some(result.to_string()),
+        tables_done: summary.map(|(done, _)| done),
+        tables_failed: summary.map(|(_, failed)| failed),
+    }))
+}
+
+/// The pod log of one Job's pod, parsed with [`parse_summary`]. A refusal (the pod was already
+/// deleted, the log is gone) is not a reconcile failure: the counts are simply absent.
+async fn pod_summary(ctx: &Context, namespace: &str, job: &str) -> Option<(i64, i64)> {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+    let selector = format!("job-name={job}");
+    let pod = pods
+        .list(&ListParams::default().labels(&selector))
+        .await
+        .ok()?
+        .items
+        .into_iter()
+        .next()?;
+    let log = pods
+        .logs(
+            &pod.metadata.name?,
+            &LogParams {
+                container: Some("maintenance".to_string()),
+                ..LogParams::default()
+            },
+        )
+        .await
+        .ok()?;
+    parse_summary(&log)
+}
+
 fn catalog_owner(catalog: &Catalog) -> OwnerReference {
     OwnerReference {
         api_version: "stardelt.io/v1alpha1".into(),
@@ -339,6 +427,8 @@ pub async fn reconcile_catalog(
         }
     };
 
+    let maintenance = last_maintenance(&ctx, &namespace, &name).await?;
+
     let existing = catalog
         .status
         .as_ref()
@@ -347,12 +437,18 @@ pub async fn reconcile_catalog(
     let conditions = merge_condition(&existing, condition);
     let observed = catalog.metadata.generation;
     let api: Api<Catalog> = Api::namespaced(ctx.client.clone(), &namespace);
+    let mut status = serde_json::json!({
+        "conditions": conditions,
+        "observedGeneration": observed,
+    });
+    if let Some(maintenance) = maintenance {
+        status["maintenance"] = serde_json::to_value(&maintenance)
+            .expect("MaintenanceStatus is a plain struct and always serializes");
+    }
     api.patch_status(
         &name,
         &kube::api::PatchParams::default(),
-        &kube::api::Patch::Merge(serde_json::json!({
-            "status": { "conditions": conditions, "observedGeneration": observed }
-        })),
+        &kube::api::Patch::Merge(serde_json::json!({ "status": status })),
     )
     .await?;
     tracing::info!(catalog = %name, %namespace, "reconciled maintenance job");
@@ -367,7 +463,7 @@ pub fn error_policy<K>(_object: Arc<K>, error: &kube::Error, _ctx: Arc<Context>)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crd::MaintenanceSpec;
+    use crate::crd::{CatalogDomainStatus, MaintenanceSpec};
     use kube::Client;
     use std::sync::Mutex;
 
@@ -460,6 +556,12 @@ mod tests {
                     r#"{"apiVersion":"batch/v1","kind":"CronJob","metadata":{"name":"maint-mobility","namespace":"data"}}"#.into(),
                 );
             }
+            if method == "GET" && path.ends_with("/jobs") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"JobList","items":[]}"#.into(),
+                );
+            }
             if method == "PATCH" && path.ends_with("/status") {
                 return (
                     200,
@@ -509,6 +611,12 @@ mod tests {
                 return (
                     404,
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/jobs") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"JobList","items":[]}"#.into(),
                 );
             }
             if method == "PATCH" && path.ends_with("/status") {
@@ -749,6 +857,54 @@ mod tests {
         assert_eq!(
             token_endpoint(Some(&external)),
             "https://login.example.com/tenant/protocol/openid-connect/token"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_is_read_from_the_end() {
+        let log = "{\"table\":\"silver.trips\",\"smallFiles\":14,\"optimized\":true,\"seconds\":2.1,\"error\":null}\n\
+                   {\"table\":\"silver.zones\",\"smallFiles\":2,\"optimized\":false,\"seconds\":0.4,\"error\":\"boom\"}\n\
+                   {\"catalog\":\"mobility\",\"tablesDone\":1,\"tablesFailed\":1}\n";
+        assert_eq!(parse_summary(log), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_log_without_a_summary_line_has_no_counts() {
+        assert_eq!(
+            parse_summary("{\"table\":\"silver.trips\"}\nWARNING: slow query\n"),
+            None
+        );
+        assert_eq!(parse_summary(""), None);
+    }
+
+    #[test]
+    fn the_newest_summary_wins_when_a_log_repeats_one() {
+        let log = "{\"catalog\":\"a\",\"tablesDone\":1,\"tablesFailed\":0}\n\
+                   {\"catalog\":\"a\",\"tablesDone\":4,\"tablesFailed\":2}\n";
+        assert_eq!(parse_summary(log), Some((4, 2)));
+    }
+
+    #[test]
+    fn the_status_serializes_camel_case_maintenance() {
+        let status = CatalogDomainStatus {
+            maintenance: Some(MaintenanceStatus {
+                last_run: Some("2026-11-11T02:44:12Z".to_string()),
+                last_result: Some("Succeeded".to_string()),
+                tables_done: Some(3),
+                tables_failed: Some(0),
+            }),
+            ..CatalogDomainStatus::default()
+        };
+        let value = serde_json::to_value(&status).expect("serializes");
+        assert_eq!(value["maintenance"]["lastRun"], "2026-11-11T02:44:12Z");
+        assert_eq!(value["maintenance"]["lastResult"], "Succeeded");
+        assert_eq!(value["maintenance"]["tablesDone"], 3);
+        assert_eq!(
+            serde_json::to_value(MaintenanceStatus::default())
+                .expect("serializes")
+                .get("lastRun"),
+            None,
+            "an absent result is left out, not sent as null"
         );
     }
 }

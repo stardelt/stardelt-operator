@@ -264,6 +264,35 @@
           },
           "type": "array"
         },
+        "maintenance": {
+          "description": "The newest finished maintenance Job's result (operator#476 slice c).",
+          "nullable": true,
+          "properties": {
+            "lastResult": {
+              "description": "`Succeeded` when the Job succeeded, `Failed` otherwise.",
+              "nullable": true,
+              "type": "string"
+            },
+            "lastRun": {
+              "description": "The Job's `status.completionTime`, RFC 3339.",
+              "nullable": true,
+              "type": "string"
+            },
+            "tablesDone": {
+              "description": "The summary line's `tablesDone`; absent when the log held no summary.",
+              "format": "int64",
+              "nullable": true,
+              "type": "integer"
+            },
+            "tablesFailed": {
+              "description": "The summary line's `tablesFailed`; absent when the log held no summary.",
+              "format": "int64",
+              "nullable": true,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
         "observedGeneration": {
           "format": "int64",
           "nullable": true,
