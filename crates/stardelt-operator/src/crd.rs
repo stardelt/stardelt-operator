@@ -2153,7 +2153,9 @@ pub struct CatalogStorage {
 /// On by default and conservative; `excludeTables` opts a table out.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
 pub struct MaintenanceSpec {
-    /// Five-field cron; the default is 02:00 every day.
+    /// Five-field cron; the default is 02:00 every day. A `Catalog` that keeps this
+    /// default is staggered by name at reconcile time (operator#490); any other value is
+    /// applied verbatim.
     #[serde(default = "default_maintenance_schedule")]
     #[schemars(regex(pattern = r"^(\S+\s+){4}\S+$"))]
     pub schedule: String,
@@ -2170,7 +2172,7 @@ pub struct MaintenanceSpec {
 }
 
 fn default_maintenance_schedule() -> String {
-    "0 2 * * *".to_string()
+    MaintenanceSpec::DEFAULT_SCHEDULE.to_string()
 }
 
 impl Default for MaintenanceSpec {
@@ -2186,6 +2188,11 @@ impl Default for MaintenanceSpec {
 }
 
 impl MaintenanceSpec {
+    /// The schedule a `Catalog` carries when it sets none. It is staggered per catalog by
+    /// the maintenance controller (`maintenance::effective_schedule`), so nine catalogs do
+    /// not start their runs in the same second (operator#490).
+    pub const DEFAULT_SCHEDULE: &'static str = "0 2 * * *";
+
     /// The rules the engine enforces at run time, repeated here so a bad policy is refused when
     /// the resource is written. Trino's `iceberg.expire-snapshots.min-retention` and
     /// `iceberg.remove-orphan-files.min-retention` are 7 days; a smaller value fails every run.
