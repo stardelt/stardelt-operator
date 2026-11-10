@@ -282,7 +282,25 @@ pub fn parse_summary(log: &str) -> Option<(i64, i64)> {
     })
 }
 
-/// The newest finished Job of this catalog's CronJob and its summary, if it has one.
+/// When a Job finished: `status.completionTime` for a Job that completed, or the `Failed`
+/// condition's `lastTransitionTime` for one that failed (a failed Job never gets a completion
+/// time). `None` while it still runs.
+fn finished_at(job: &Job) -> Option<String> {
+    let status = job.status.as_ref()?;
+    if let Some(time) = status.completion_time.as_ref() {
+        return Some(time.0.to_string());
+    }
+    status
+        .conditions
+        .iter()
+        .flatten()
+        .find(|condition| condition.type_ == "Failed" && condition.status == "True")
+        .and_then(|condition| condition.last_transition_time.as_ref())
+        .map(|time| time.0.to_string())
+}
+
+/// The newest finished Job of this catalog's CronJob and its summary, if it has one. A Job is
+/// finished when it completed or failed (operator#507); a failed Job has no `completionTime`.
 async fn last_maintenance(
     ctx: &Context,
     namespace: &str,
@@ -290,24 +308,15 @@ async fn last_maintenance(
 ) -> Result<Option<MaintenanceStatus>, kube::Error> {
     let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     let selector = format!("stardelt.io/catalog={catalog}");
-    let mut finished: Vec<Job> = jobs
+    let mut done: Vec<(String, Job)> = jobs
         .list(&ListParams::default().labels(&selector))
         .await?
         .items
         .into_iter()
-        .filter(|job| {
-            job.status
-                .as_ref()
-                .is_some_and(|status| status.completion_time.is_some())
-        })
+        .filter_map(|job| finished_at(&job).map(|at| (at, job)))
         .collect();
-    finished.sort_by_key(|job| {
-        job.status
-            .as_ref()
-            .and_then(|status| status.completion_time.as_ref())
-            .map(|time| time.0.to_string())
-    });
-    let Some(job) = finished.pop() else {
+    done.sort_by(|a, b| a.0.cmp(&b.0));
+    let Some((finished, job)) = done.pop() else {
         return Ok(None);
     };
     let status = job.status.clone().unwrap_or_default();
@@ -323,7 +332,7 @@ async fn last_maintenance(
     )
     .await;
     Ok(Some(MaintenanceStatus {
-        last_run: status.completion_time.map(|time| time.0.to_string()),
+        last_run: Some(finished),
         last_result: Some(result.to_string()),
         tables_done: summary.map(|(done, _)| done),
         tables_failed: summary.map(|(_, failed)| failed),
@@ -464,6 +473,7 @@ pub fn error_policy<K>(_object: Arc<K>, error: &kube::Error, _ctx: Arc<Context>)
 mod tests {
     use super::*;
     use crate::crd::{CatalogDomainStatus, MaintenanceSpec};
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
     use kube::Client;
     use std::sync::Mutex;
 
@@ -906,5 +916,49 @@ mod tests {
             None,
             "an absent result is left out, not sent as null"
         );
+    }
+
+    fn job_with(status: k8s_openapi::api::batch::v1::JobStatus) -> Job {
+        Job {
+            status: Some(status),
+            ..Job::default()
+        }
+    }
+
+    #[test]
+    fn a_failed_job_counts_as_finished() {
+        let at: k8s_openapi::jiff::Timestamp = "2026-11-10T07:23:52Z".parse().expect("a timestamp");
+        let job = job_with(k8s_openapi::api::batch::v1::JobStatus {
+            failed: Some(1),
+            completion_time: None,
+            conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+                type_: "Failed".to_string(),
+                status: "True".to_string(),
+                last_transition_time: Some(Time(at)),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        assert_eq!(finished_at(&job).as_deref(), Some("2026-11-10T07:23:52Z"));
+    }
+
+    #[test]
+    fn a_completed_job_uses_its_completion_time() {
+        let at: k8s_openapi::jiff::Timestamp = "2026-11-11T02:44:12Z".parse().expect("a timestamp");
+        let job = job_with(k8s_openapi::api::batch::v1::JobStatus {
+            succeeded: Some(1),
+            completion_time: Some(Time(at)),
+            ..Default::default()
+        });
+        assert_eq!(finished_at(&job).as_deref(), Some("2026-11-11T02:44:12Z"));
+    }
+
+    #[test]
+    fn a_running_job_is_not_finished() {
+        let job = job_with(k8s_openapi::api::batch::v1::JobStatus {
+            active: Some(1),
+            ..Default::default()
+        });
+        assert_eq!(finished_at(&job), None);
     }
 }
