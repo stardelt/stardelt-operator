@@ -26,10 +26,9 @@ use crate::objects::FIELD_MANAGER;
 
 /// Prefix of the CronJob name; the catalog name follows (`maint-<catalog>`).
 pub const JOB_PREFIX: &str = "maint-";
-/// The CLI image (stardelt/stardelt-python#62). Pinned by digest when the platform's pin
-/// tripwire covers it; the dev registry path is the same `:dev` convention as the other
-/// stardelt images.
-pub const IMAGE: &str = "ghcr.io/stardelt/stardelt-cli:dev";
+/// The CLI image (stardelt/stardelt-python#62), pinned by digest: the digest is what runs and
+/// the `:dev` tag is kept for readability only, as in `values/*.yaml`.
+pub const IMAGE: &str = "ghcr.io/stardelt/stardelt-cli:dev@sha256:ea8b92940f30077479a320338f289d888671527983331b1c6db0c06f7365965b";
 
 pub fn job_name(catalog: &str) -> String {
     format!("{JOB_PREFIX}{catalog}")
@@ -584,6 +583,14 @@ mod tests {
         assert_eq!(
             job.metadata.owner_references.as_ref().unwrap()[0].name,
             "mobility"
+        );
+    }
+
+    #[test]
+    fn the_maintenance_cli_is_pinned_by_digest() {
+        assert!(
+            IMAGE.contains("@sha256:"),
+            "the maintenance CronJob must run a digest, not the mutable dev tag: {IMAGE}"
         );
     }
 
