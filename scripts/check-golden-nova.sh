@@ -26,7 +26,9 @@ else
   curl -fsSL --retry 3 "$PLATFORM_URL" -o "$platform_source" || die "cannot read $PLATFORM_URL"
 fi
 
-references="$(grep -oE 'ghcr\.io/stardelt/nova:dev@sha256:[0-9a-f]{64}' "$platform_source" | head -n 1)"
+# `|| true`: without a match, grep exits 1 and `set -euo pipefail` aborts the assignment
+# before the check below can explain itself (operator#577).
+references="$(grep -oE 'ghcr\.io/stardelt/nova:dev@sha256:[0-9a-f]{64}' "$platform_source" | head -n 1 || true)"
 [[ "$references" =~ ^ghcr\.io/stardelt/nova:dev@sha256:[0-9a-f]{64}$ ]] \
   || die "no nova digest in the platform manifest"
 platform_digest="sha256:${references##*@sha256:}"
