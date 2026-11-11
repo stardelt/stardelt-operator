@@ -1248,7 +1248,7 @@ mod tests {
         let values = identity_values("trino");
         let init = &values["initContainers"]["coordinator"][0];
         assert_eq!(init["name"], serde_json::json!("wait-for-idp"));
-        assert_eq!(init["image"], serde_json::json!("trinodb/trino:480"));
+        assert_eq!(init["image"], serde_json::json!("trinodb/trino:484"));
         assert_eq!(
             init["env"][0]["valueFrom"]["configMapKeyRef"]["name"],
             serde_json::json!("stardelt-identity")

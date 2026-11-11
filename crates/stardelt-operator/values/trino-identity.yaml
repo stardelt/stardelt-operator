@@ -79,7 +79,7 @@ server:
     http-server.https.keystore.key=${ENV:TRINO_TLS_KEYSTORE_PASSWORD}
     http-server.authentication.allow-insecure-over-http=false
     web-ui.authentication.type=oauth2
-    web-ui.preview.enabled=false
+    web-ui.legacy.enabled=true
     http-server.authentication.oauth2.issuer=${ENV:TRINO_OIDC_ISSUER}
     http-server.authentication.oauth2.client-id=trino
     http-server.authentication.oauth2.client-secret=${ENV:TRINO_CLIENT_SECRET}
@@ -122,7 +122,7 @@ accessControl:
 initContainers:
   coordinator:
     - name: wait-for-idp
-      image: trinodb/trino:480
+      image: trinodb/trino:484
       imagePullPolicy: IfNotPresent
       env:
         - name: TRINO_OIDC_ISSUER
