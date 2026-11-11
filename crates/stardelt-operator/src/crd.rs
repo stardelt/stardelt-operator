@@ -939,6 +939,26 @@ pub struct PipelineSchedule {
     pub timezone: Option<String>,
 }
 
+/// Who is told when a run of this pipeline ends. Each list holds at most five destination
+/// names owned by the pipeline's `ownerGroup`; Nova refuses a name the group does not own
+/// (`stardelt-nova#815`). The operator only carries them — it sends nothing.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineNotify {
+    /// Destinations told when the run fails, after the last retry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 5), inner(length(min = 1, max = 64)))]
+    pub on_failure: Vec<String>,
+    /// Destinations told when the run succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 5), inner(length(min = 1, max = 64)))]
+    pub on_success: Vec<String>,
+    /// Destinations told on the first success after a failure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 5), inner(length(min = 1, max = 64)))]
+    pub on_recovered: Vec<String>,
+}
+
 /// Retry policy applied to every task.
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, PartialEq, Eq)]
 pub struct PipelineRetries {
@@ -993,6 +1013,10 @@ pub enum PipelineConcurrency {
     {
         "rule": "!has(self.publish) || self.publish != 'wap' || self.tasks.exists(t, has(t.writes) && size(t.writes) > 0)",
         "message": "publish: wap needs a task that writes at least one table"
+    },
+    {
+        "rule": "!has(self.notify) || has(self.ownerGroup)",
+        "message": "notify needs an ownerGroup: only a pipeline's owner group can name destinations"
     }
 ]))]
 pub struct PipelineSpec {
@@ -1047,6 +1071,10 @@ pub struct PipelineSpec {
     /// (nova#628 decision 1).
     #[serde(default)]
     pub publish: PipelinePublish,
+    /// Who to tell when a run ends; names of destinations owned by `ownerGroup`. Optional:
+    /// a pipeline without it notifies nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<PipelineNotify>,
 }
 
 /// The `config` keys a `notebook` task accepts. The CEL rule spells the same list.
@@ -1195,6 +1223,39 @@ impl PipelineSpec {
         if self.publish == PipelinePublish::Wap && !self.tasks.iter().any(|t| !t.writes.is_empty())
         {
             return Err("publish: wap needs a task that writes at least one table".to_string());
+        }
+        if let Some(notify) = &self.notify {
+            if self.owner_group.is_none() {
+                return Err(
+                    "notify needs an ownerGroup: only a pipeline's owner group can name destinations"
+                        .to_string(),
+                );
+            }
+            for (list, names) in [
+                ("onFailure", &notify.on_failure),
+                ("onSuccess", &notify.on_success),
+                ("onRecovered", &notify.on_recovered),
+            ] {
+                if names.len() > 5 {
+                    return Err(format!("notify.{list} names at most 5 destinations"));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for name in names {
+                    if name.trim().is_empty() || name.chars().count() > 64 {
+                        return Err(format!(
+                            "notify.{list} holds `{name}`, which is not a destination name (1 to 64 characters)"
+                        ));
+                    }
+                    if name != name.trim() {
+                        return Err(format!(
+                            "notify.{list} holds `{name}`, which has leading or trailing whitespace"
+                        ));
+                    }
+                    if !seen.insert(name.as_str()) {
+                        return Err(format!("notify.{list} names `{name}` twice"));
+                    }
+                }
+            }
         }
         // Kahn's algorithm: whatever cannot be ordered lies on or behind a cycle.
         let mut waiting: std::collections::BTreeMap<&str, usize> = self
@@ -3570,6 +3631,7 @@ mod tests {
             concurrency: PipelineConcurrency::default(),
             engine: PipelineEngine::default(),
             publish: PipelinePublish::Direct,
+            notify: None,
         }
     }
 
@@ -3690,6 +3752,96 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&two).unwrap()["viewers"],
             serde_json::json!(["analytics", "visitors"])
+        );
+    }
+
+    #[test]
+    fn pipeline_notify_is_optional_and_bounded() {
+        let schema = pipeline_spec_schema();
+        let notify = &schema["properties"]["notify"];
+        assert_eq!(notify["nullable"], true, "notify is optional");
+        for list in ["onFailure", "onSuccess", "onRecovered"] {
+            assert_eq!(notify["properties"][list]["type"], "array", "{list}");
+            assert_eq!(notify["properties"][list]["maxItems"], 5, "{list}");
+            assert_eq!(
+                notify["properties"][list]["items"]["maxLength"], 64,
+                "{list}"
+            );
+        }
+        let empty = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        assert!(
+            !serde_json::to_value(&empty)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("notify"),
+            "a pipeline without notify leaves it out of the spec"
+        );
+    }
+
+    #[test]
+    fn pipeline_notify_needs_an_owner_group() {
+        let mut spec = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        spec.notify = Some(PipelineNotify {
+            on_failure: vec!["on call".into()],
+            ..PipelineNotify::default()
+        });
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "notify needs an ownerGroup: only a pipeline's owner group can name destinations"
+        );
+        spec.owner_group = Some("analytics".into());
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn pipeline_notify_refuses_bad_names() {
+        let mut spec = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        spec.owner_group = Some("analytics".into());
+
+        spec.notify = Some(PipelineNotify {
+            on_success: vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into(),
+            ],
+            ..PipelineNotify::default()
+        });
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "notify.onSuccess names at most 5 destinations"
+        );
+
+        spec.notify = Some(PipelineNotify {
+            on_failure: vec!["  ".into()],
+            ..PipelineNotify::default()
+        });
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "notify.onFailure holds `  `, which is not a destination name (1 to 64 characters)"
+        );
+
+        spec.notify = Some(PipelineNotify {
+            on_recovered: vec!["pager".into(), "pager".into()],
+            ..PipelineNotify::default()
+        });
+        assert_eq!(
+            spec.validate().unwrap_err(),
+            "notify.onRecovered names `pager` twice"
+        );
+
+        spec.notify = Some(PipelineNotify {
+            on_failure: vec!["on call".into(), "pager".into()],
+            on_success: vec![],
+            on_recovered: vec![],
+        });
+        assert_eq!(
+            spec.validate(),
+            Ok(()),
+            "a space is a legal destination name"
         );
     }
 

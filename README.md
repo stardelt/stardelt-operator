@@ -234,6 +234,8 @@ spec:
   ownerGroup: analytics        # the group whose members see it and run it (optional)
   viewers: [finance]           # further groups that may read it in Nova, never run it (optional)
   runAs: pipeline-analytics   # service principal the tasks run as (optional)
+  notify:                      # who is told when a run ends (optional; needs ownerGroup)
+    onFailure: [on-call]       # destinations owned by ownerGroup, at most 5 per list
   retries: { attempts: 2, backoff: 5m }
   tasks:
     - name: load
