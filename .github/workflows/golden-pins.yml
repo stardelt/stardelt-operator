@@ -1,0 +1,56 @@
+name: Golden pins
+
+# The golden image constants live in this repository; the pins they must equal live in
+# stardelt-platform. Once a day, file one ready ticket when the Nova golden lags
+# (operator#545). No cross-repository secret: an issue needs none, and a pull request
+# opened with GITHUB_TOKEN would get no CI run (GitHub suppresses those events).
+
+on:
+  schedule: [{ cron: "17 5 * * *" }]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  golden-nova:
+    name: golden nova vs the platform pin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare the golden Nova image with the platform pin
+        id: compare
+        run: |
+          set +e
+          bash scripts/check-golden-nova.sh
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: File the bump ticket once
+        if: steps.compare.outputs.status == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create golden-nova --color BFD4F2 \
+            --description "A golden image pin lags the platform pin" --force >/dev/null || true
+          open="$(gh issue list --repo "$GITHUB_REPOSITORY" --label golden-nova --state open \
+            --json number --jq 'length')"
+          if [ "$open" != 0 ]; then
+            echo "::notice::a golden-nova issue is already open; nothing filed"
+            exit 0
+          fi
+          report="$(mktemp)"
+          bash scripts/check-golden-nova.sh --report > "$report"
+          title="$(sed -n '1s/^title: //p' "$report")"
+          tail -n +3 "$report" > "$report.body"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" \
+            --body-file "$report.body" --label golden-nova --label ready-to-implement \
+            --label P2 --milestone v0.4
+
+      - name: Fail when the check itself could not run
+        if: steps.compare.outputs.status != '0' && steps.compare.outputs.status != '1'
+        run: |
+          echo "check-golden-nova.sh exited ${{ steps.compare.outputs.status }}" >&2
+          exit 1
