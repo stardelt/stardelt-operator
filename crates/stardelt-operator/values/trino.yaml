@@ -50,6 +50,23 @@ env:
       name: stardelt-identity
       key: issuerUrl
       optional: true
+# The Iceberg catalog's own client (Secret sp-catalog-trino, written by the
+# ServicePrincipal of the same name in identity mode `platform`). `CATALOG_TOKEN_URL`
+# must stay after TRINO_OIDC_ISSUER: the kubelet expands the earlier variable.
+- name: CATALOG_CLIENT_ID
+  valueFrom:
+    secretKeyRef:
+      name: sp-catalog-trino
+      key: client-id
+      optional: true
+- name: CATALOG_CLIENT_SECRET
+  valueFrom:
+    secretKeyRef:
+      name: sp-catalog-trino
+      key: client-secret
+      optional: true
+- name: CATALOG_TOKEN_URL
+  value: "$(TRINO_OIDC_ISSUER)/protocol/openid-connect/token"
 - name: TRINO_TLS_KEYSTORE_PASSWORD
   valueFrom:
     secretKeyRef:

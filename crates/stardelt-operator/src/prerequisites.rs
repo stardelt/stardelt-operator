@@ -699,12 +699,20 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
                         image: Some("curlimages/curl:8.10.1".into()),
                         command: Some(vec!["/bin/sh".into(), "-c".into()]),
                         args: Some(vec![BOOTSTRAP_SCRIPT.to_string()]),
-                        volume_mounts: Some(vec![VolumeMount {
-                            name: "catalog-principal".into(),
-                            mount_path: "/var/run/secrets/catalog-principal".into(),
-                            read_only: Some(true),
-                            ..VolumeMount::default()
-                        }]),
+                        volume_mounts: Some(vec![
+                            VolumeMount {
+                                name: "catalog-principal".into(),
+                                mount_path: "/var/run/secrets/catalog-principal".into(),
+                                read_only: Some(true),
+                                ..VolumeMount::default()
+                            },
+                            VolumeMount {
+                                name: "catalog-trino".into(),
+                                mount_path: "/var/run/secrets/catalog-trino".into(),
+                                read_only: Some(true),
+                                ..VolumeMount::default()
+                            },
+                        ]),
                         env: Some(vec![
                             EnvVar {
                                 name: "LK".into(),
@@ -731,15 +739,26 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
                         }),
                         ..Default::default()
                     }],
-                    volumes: Some(vec![Volume {
-                        name: "catalog-principal".into(),
-                        secret: Some(SecretVolumeSource {
-                            secret_name: Some("sp-catalog-operator".into()),
-                            optional: Some(true),
-                            ..SecretVolumeSource::default()
-                        }),
-                        ..Volume::default()
-                    }]),
+                    volumes: Some(vec![
+                        Volume {
+                            name: "catalog-principal".into(),
+                            secret: Some(SecretVolumeSource {
+                                secret_name: Some("sp-catalog-operator".into()),
+                                optional: Some(true),
+                                ..SecretVolumeSource::default()
+                            }),
+                            ..Volume::default()
+                        },
+                        Volume {
+                            name: "catalog-trino".into(),
+                            secret: Some(SecretVolumeSource {
+                                secret_name: Some("sp-catalog-trino".into()),
+                                optional: Some(true),
+                                ..SecretVolumeSource::default()
+                            }),
+                            ..Volume::default()
+                        },
+                    ]),
                     ..Default::default()
                 }),
             },
@@ -1049,6 +1068,15 @@ mod tests {
         let v = p.volumes.as_ref().unwrap().first().unwrap();
         let s = v.secret.as_ref().unwrap();
         assert_eq!(s.secret_name.as_deref(), Some("sp-catalog-operator"));
+        assert_eq!(s.optional, Some(true));
+        // Trino's own catalog client rides along: the script's `grant data_admin` reads it.
+        let m = c.volume_mounts.as_ref().unwrap().get(1).unwrap();
+        assert_eq!(m.name, "catalog-trino");
+        assert_eq!(m.mount_path, "/var/run/secrets/catalog-trino");
+        assert_eq!(m.read_only, Some(true));
+        let v = p.volumes.as_ref().unwrap().get(1).unwrap();
+        let s = v.secret.as_ref().unwrap();
+        assert_eq!(s.secret_name.as_deref(), Some("sp-catalog-trino"));
         assert_eq!(s.optional, Some(true));
     }
 

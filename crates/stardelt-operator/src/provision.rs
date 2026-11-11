@@ -443,16 +443,18 @@ pub async fn ensure_bootstrap(
         Ok(None) => return status(NAME, false, "waiting for Secret stardelt-s3-creds"),
         Err(e) => return status(NAME, false, e.to_string()),
     };
-    // The bootstrap Job mounts Secret sp-catalog-operator (optional). Once the object exists, both
-    // the Secret and its subject must be ready, otherwise the first run would bootstrap anonymously
-    // and could never write the project grant.
+    // The bootstrap Job mounts Secrets sp-catalog-operator and sp-catalog-trino (optional). Once
+    // the objects exist, both the Secret and its subject must be ready, otherwise the first run
+    // would bootstrap anonymously and could never write the project grant.
     let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), namespace);
-    match principals.get_opt("catalog-operator").await {
-        Ok(Some(sp)) if !sp.status.as_ref().is_some_and(|s| s.ready) => {
-            return status(NAME, false, "waiting for ServicePrincipal catalog-operator");
+    for name in ["catalog-operator", "catalog-trino"] {
+        match principals.get_opt(name).await {
+            Ok(Some(sp)) if !sp.status.as_ref().is_some_and(|s| s.ready) => {
+                return status(NAME, false, format!("waiting for ServicePrincipal {name}"));
+            }
+            Ok(_) => {}
+            Err(e) => return status(NAME, false, e.to_string()),
         }
-        Ok(_) => {}
-        Err(e) => return status(NAME, false, e.to_string()),
     }
     let job_name = bootstrap_job_name(&keys, &bucket(lh), &s3_endpoint(namespace));
     let done = previous
@@ -2129,7 +2131,8 @@ pub async fn ensure_identity(
 
 /// The platform clients the catalog needs. In platform mode one principal is the operator's own
 /// credential for Lakekeeper's management API (`project_admin`, decision on operator#194); its
-/// Secret is what the bootstrap Job and later the access-sync loop read. None without an IdP.
+/// Secret is what the bootstrap Job and later the access-sync loop read. The second is Trino's
+/// (`data_admin`). None without an IdP.
 pub async fn ensure_catalog_principals(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
@@ -2142,20 +2145,32 @@ pub async fn ensure_catalog_principals(
         return Some(status(
             NAME,
             false,
-            "planned (dry-run): ServicePrincipal catalog-operator",
+            "planned (dry-run): ServicePrincipals catalog-operator, catalog-trino",
         ));
     }
-    match apply::<ServicePrincipal>(
-        &ctx.client,
-        &spec.namespace,
-        &catalog_principal("catalog-operator", &spec.namespace),
-        false,
-    )
-    .await
-    {
-        Ok(_) => Some(status(NAME, true, "ServicePrincipal catalog-operator")),
-        Err(e) => Some(status(NAME, false, e.to_string())),
+    let mut applied = Vec::new();
+    for principal in catalog_principals(&spec.namespace) {
+        let name = principal.metadata.name.clone().unwrap_or_default();
+        match apply::<ServicePrincipal>(&ctx.client, &spec.namespace, &principal, false).await {
+            Ok(_) => applied.push(name),
+            Err(e) => return Some(status(NAME, false, format!("{name}: {e}"))),
+        }
     }
+    Some(status(
+        NAME,
+        true,
+        format!("ServicePrincipals {}", applied.join(", ")),
+    ))
+}
+
+/// The platform's catalog clients. One credential per consumer, the platform's split
+/// (`stardelt-platform/scripts/catalog-authz-bootstrap.sh:204-206`): the operator writes
+/// `project_admin`, Trino gets `data_admin`.
+pub fn catalog_principals(namespace: &str) -> Vec<ServicePrincipal> {
+    ["catalog-operator", "catalog-trino"]
+        .into_iter()
+        .map(|name| catalog_principal(name, namespace))
+        .collect()
 }
 
 /// The ServicePrincipal of the catalog's own client. The owner group is the platform admins, so
@@ -2506,6 +2521,20 @@ mod tests {
             crate::crd::principal_client_id("catalog-operator"),
             "sp-catalog-operator"
         );
+    }
+
+    #[test]
+    fn the_catalog_principals_include_the_trino_client() {
+        let names: Vec<String> = catalog_principals("data")
+            .iter()
+            .map(|sp| sp.metadata.name.clone().expect("name"))
+            .collect();
+        assert_eq!(names, vec!["catalog-operator", "catalog-trino"]);
+        for sp in catalog_principals("data") {
+            assert_eq!(sp.spec.purpose, PrincipalPurpose::Catalog);
+            assert_eq!(sp.spec.owner_group, "stardelt-admins");
+            assert_eq!(sp.spec.audiences, vec![PrincipalAudience::Lakekeeper]);
+        }
     }
 
     #[tokio::test]
