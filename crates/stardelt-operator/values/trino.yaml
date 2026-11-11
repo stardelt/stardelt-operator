@@ -9,6 +9,10 @@
 # a Lakehouse may live in any namespace.
 additionalConfigProperties:
 - http-server.process-forwarded=true
+# Node-level file-system cache (Trino 483+, stardelt-platform#1002). The chart renders
+# this into the coordinator AND worker config.properties; the file it names is the
+# `additionalConfigFiles` entry on both roles below.
+- cache-manager.config-files=etc/cache-manager-alluxio.properties
 env:
 - name: S3_ACCESS_KEY
   valueFrom:
@@ -90,7 +94,7 @@ catalogs:
     iceberg.rest-catalog.uri=http://lakekeeper:8181/catalog
     iceberg.rest-catalog.warehouse=warehouse
     iceberg.rest-catalog.vended-credentials-enabled=false
-    fs.native-s3.enabled=true
+    fs.s3.enabled=true
     s3.endpoint=http://seaweedfs-s3:8333
     s3.region=us-east-1
     s3.path-style-access=true
@@ -102,20 +106,19 @@ catalogs:
     s3.max-connections=16
     iceberg.split-manager-threads=4
     iceberg.metadata.parallelism=2
-    # Worker-local file-system cache for object-store reads (platform#134,
-    # Trino 480: `fs.cache.*` per catalog; there is no cache-manager setting
-    # in 480). Measured on the dev cluster 2026-10-19 against a 38M-row /
-    # 0.66 GB full scan of nyc_taxi.yellow_trips: repeat scans drop from
-    # 154 S3 GETs + 660 MB to 1 GET + 0 MB, wall time 1.5-1.9s -> 1.2-1.7s.
-    # The win is S3 offload (the single-replica SeaweedFS volume server is
-    # the bottleneck the throttles above protect), not latency — Parquet
-    # decode dominates on one node. Best-effort local cache only: a pod
-    # restart or scale-to-zero (M-02) discards it with the emptyDir, and the
-    # next scan repopulates (cold scan is slower: 5.1s vs 3.2s uncached).
+    # Worker-local file-system cache for object-store reads (platform#134).
+    # Trino 483+ (stardelt-platform#1002): the directories, size and TTL moved
+    # out of the catalog into the node-level cache manager
+    # (cache-manager-alluxio.properties, loaded through cache-manager.config-files
+    # in config.properties); a catalog only turns caching on. Measured on the dev
+    # cluster 2026-10-19 against a 38M-row / 0.66 GB full scan of
+    # nyc_taxi.yellow_trips: repeat scans drop from 154 S3 GETs + 660 MB to
+    # 1 GET + 0 MB, wall time 1.5-1.9s -> 1.2-1.7s. The win is S3 offload (the
+    # single-replica SeaweedFS volume server is the bottleneck the throttles
+    # above protect), not latency — Parquet decode dominates on one node.
+    # Best-effort local cache only: a pod restart or scale-to-zero (M-02)
+    # discards it with the emptyDir, and the next scan repopulates.
     fs.cache.enabled=true
-    fs.cache.directories=/var/trino/cache
-    fs.cache.max-sizes=10GB
-    fs.cache.ttl=7d
 # Query memory guards (stardelt-platform#54, operator#73): the per-node limit
 # plus the heap headroom must stay well below the JVM heap, so one oversized
 # join fails with EXCEEDED_LOCAL_MEMORY_LIMIT instead of OOM-killing the worker.
@@ -143,8 +146,9 @@ server:
 # never fills the node.
 #
 # Coordinator and workers get the same block: the file-system cache volume
-# (stardelt-platform#134; the `fs.cache.*` catalog props point at
-# /var/trino/cache and without the mount the coordinator CrashLoops), a bounded
+# (stardelt-platform#134; the node-level cache manager — additionalConfigFiles
+# below plus cache-manager.config-files in additionalConfigProperties — points at
+# /var/trino/cache, and without the mount the coordinator CrashLoops), a bounded
 # heap-dump volume, the 2G heap and the kubelet limits that hold it.
 coordinator:
   jvm:
@@ -175,6 +179,14 @@ coordinator:
     mountPath: /var/trino/cache
   - name: trino-dumps
     mountPath: /dumps
+  # Trino 483+ (stardelt-platform#1002): every node loads this file through
+  # cache-manager.config-files; the directory is the mounted emptyDir above.
+  additionalConfigFiles:
+    cache-manager-alluxio.properties: |
+      cache-manager.name=alluxio
+      fs.cache.directories=/var/trino/cache
+      fs.cache.max-sizes=10GB
+      fs.cache.ttl=7d
 worker:
   jvm:
     maxHeapSize: 2G
@@ -204,6 +216,14 @@ worker:
     mountPath: /var/trino/cache
   - name: trino-dumps
     mountPath: /dumps
+  # Trino 483+ (stardelt-platform#1002): every node loads this file through
+  # cache-manager.config-files; the directory is the mounted emptyDir above.
+  additionalConfigFiles:
+    cache-manager-alluxio.properties: |
+      cache-manager.name=alluxio
+      fs.cache.directories=/var/trino/cache
+      fs.cache.max-sizes=10GB
+      fs.cache.ttl=7d
 
 # Query log feed (stardelt-nova#116, decision D25): Trino's HTTP event listener posts every
 # query-created and query-completed event to Nova's internal port, where the collector turns

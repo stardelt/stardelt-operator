@@ -255,7 +255,10 @@ mod tests {
         let trino = golden_values("trino");
         assert_eq!(
             trino["additionalConfigProperties"],
-            serde_json::json!(["http-server.process-forwarded=true"])
+            serde_json::json!([
+                "http-server.process-forwarded=true",
+                "cache-manager.config-files=etc/cache-manager-alluxio.properties",
+            ])
         );
 
         let seaweedfs = golden_values("seaweedfs");
@@ -545,18 +548,53 @@ mod tests {
                 warehouse.contains("s3.endpoint=http://seaweedfs-s3:8333"),
                 "profile {profile:?}: {warehouse}"
             );
-            // File-system cache (stardelt-platform#134): the four catalog props
-            // that point at the worker-local cache directory.
-            for prop in [
-                "fs.cache.enabled=true",
-                "fs.cache.directories=/var/trino/cache",
-                "fs.cache.max-sizes=10GB",
-                "fs.cache.ttl=7d",
-            ] {
+            // File-system cache (stardelt-platform#134): Trino 483+ keeps only
+            // the switch in the catalog. The directories, size and TTL are the
+            // node-level cache manager's, below.
+            for prop in ["fs.cache.enabled=true", "fs.s3.enabled=true"] {
                 assert!(
                     warehouse.contains(prop),
                     "profile {profile:?}: missing {prop} in {warehouse}"
                 );
+            }
+            for gone in [
+                "fs.cache.directories",
+                "fs.cache.max-sizes",
+                "fs.cache.ttl",
+                "fs.native-s3.enabled",
+            ] {
+                assert!(
+                    !warehouse.contains(gone),
+                    "profile {profile:?}: the catalog still sets {gone}; Trino 484 refuses it"
+                );
+            }
+            // Every node loads the cache manager through config.properties and
+            // the file itself must exist on both roles.
+            assert!(
+                trino["additionalConfigProperties"]
+                    .as_array()
+                    .is_some_and(|props| props.contains(&serde_json::json!(
+                        "cache-manager.config-files=etc/cache-manager-alluxio.properties"
+                    ))),
+                "profile {profile:?}: config.properties does not name the cache manager"
+            );
+            for role in ["coordinator", "worker"] {
+                let file = trino[role]["additionalConfigFiles"]["cache-manager-alluxio.properties"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("profile {profile:?}: {role} lacks the cache-manager file")
+                    });
+                for line in [
+                    "cache-manager.name=alluxio",
+                    "fs.cache.directories=/var/trino/cache",
+                    "fs.cache.max-sizes=10GB",
+                    "fs.cache.ttl=7d",
+                ] {
+                    assert!(
+                        file.contains(line),
+                        "profile {profile:?}: {role} cache-manager file lacks {line}"
+                    );
+                }
             }
             // The props without the mount hard-fail the coordinator at startup
             // (CrashLoop: Cannot write to cache directory /var/trino/cache),
@@ -605,6 +643,7 @@ mod tests {
             "iceberg.rest-catalog.oauth2.credential=${ENV:CATALOG_CLIENT_ID}:${ENV:CATALOG_CLIENT_SECRET}",
             "iceberg.rest-catalog.oauth2.scope=openid",
             "fs.cache.enabled=true",
+            "fs.s3.enabled=true",
             "s3.endpoint=http://seaweedfs-s3:8333",
         ] {
             assert!(
@@ -612,6 +651,11 @@ mod tests {
                 "the identity overlay lacks `{needle}`"
             );
         }
+        assert!(
+            !warehouse.contains("fs.native-s3.enabled")
+                && !warehouse.contains("fs.cache.directories"),
+            "the identity overlay still carries 480-era cache properties"
+        );
         let env = merged["env"].as_array().expect("env");
         let id = env
             .iter()
@@ -702,8 +746,12 @@ mod tests {
             assert!(extra.contains("query.max-run-time=15m"), "{profile:?}");
             assert_eq!(
                 trino["additionalConfigProperties"],
-                serde_json::json!(["http-server.process-forwarded=true"]),
-                "{profile:?}: coordinator-only keys must not reach the worker"
+                serde_json::json!([
+                    "http-server.process-forwarded=true",
+                    "cache-manager.config-files=etc/cache-manager-alluxio.properties",
+                ]),
+                "{profile:?}: coordinator-only keys must not reach the worker, and the \
+                 node-level cache manager must stay"
             );
         }
     }
@@ -846,7 +894,10 @@ mod tests {
         let merged = effective_values("trino", Profile::Full, None, Some(&inline));
         assert_eq!(
             merged["additionalConfigProperties"],
-            serde_json::json!(["http-server.process-forwarded=true"]),
+            serde_json::json!([
+                "http-server.process-forwarded=true",
+                "cache-manager.config-files=etc/cache-manager-alluxio.properties",
+            ]),
             "pinning resources must not drop the curated trino settings"
         );
         assert!(
