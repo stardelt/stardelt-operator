@@ -593,6 +593,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_trino_catalog_signs_in_as_the_catalog_principal() {
+        let merged = deep_merge(golden_values("trino"), identity_values("trino"));
+        let warehouse = merged["catalogs"]["warehouse"]
+            .as_str()
+            .expect("catalogs.warehouse is a properties document");
+        for needle in [
+            "iceberg.rest-catalog.security=OAUTH2",
+            "iceberg.rest-catalog.oauth2.server-uri=${ENV:CATALOG_TOKEN_URL}",
+            "iceberg.rest-catalog.oauth2.credential=${ENV:CATALOG_CLIENT_ID}:${ENV:CATALOG_CLIENT_SECRET}",
+            "iceberg.rest-catalog.oauth2.scope=openid",
+            "fs.cache.enabled=true",
+            "s3.endpoint=http://seaweedfs-s3:8333",
+        ] {
+            assert!(
+                warehouse.contains(needle),
+                "the identity overlay lacks `{needle}`"
+            );
+        }
+        let env = merged["env"].as_array().expect("env");
+        let id = env
+            .iter()
+            .find(|e| e["name"] == "CATALOG_CLIENT_ID")
+            .expect("CATALOG_CLIENT_ID");
+        assert_eq!(id["valueFrom"]["secretKeyRef"]["name"], "sp-catalog-trino");
+        assert!(
+            env.iter().any(|e| e["name"] == "CATALOG_TOKEN_URL"
+                && e["value"] == "$(TRINO_OIDC_ISSUER)/protocol/openid-connect/token"),
+            "CATALOG_TOKEN_URL must derive from the identity contract"
+        );
+    }
+
     /// A Trino size such as `600MB`, `1500m` or `2G`, in mebibytes.
     fn megabytes(size: &str) -> u64 {
         let unit_at = size

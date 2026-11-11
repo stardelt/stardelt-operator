@@ -414,16 +414,19 @@ async fn trino_warehouses_stamp(client: &Client, namespace: &str) -> Option<Stri
         .and_then(|cm| cm.metadata.resource_version)
 }
 
-/// The three Secrets the identity overlay reads: the PKCS12 keystore (`trino-coordinator-tls`,
+/// The Secrets the identity overlay reads: the PKCS12 keystore (`trino-coordinator-tls`,
 /// cert-manager writes it only once the certificate is issued), the coordinator↔worker shared
-/// secret and the PASSWORD-authenticator file. Without all three Trino would crash-loop, so
-/// their absence is a reason to wait, not to install with an authenticator.
+/// secret, the PASSWORD-authenticator file and the Iceberg catalog's own client. Without the key
+/// material Trino would crash-loop, and a catalog with security=OAUTH2 and no credential is
+/// refused at load time (operator#194), so their absence is a reason to wait, not to install
+/// with an authenticator.
 async fn trino_key_material_present(client: &Client, namespace: &str) -> bool {
     let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     for name in [
         "trino-coordinator-tls",
         "trino-internal-secret",
         "trino-password-db",
+        "sp-catalog-trino",
     ] {
         if secrets.get_opt(name).await.ok().flatten().is_none() {
             return false;
@@ -1368,7 +1371,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
             ready: false,
             message: Some(
                 "waiting for the Trino key material (trino-coordinator-tls, \
-                 trino-internal-secret, trino-password-db)"
+                 trino-internal-secret, trino-password-db, sp-catalog-trino)"
                     .into(),
             ),
             applied_hash: None,
