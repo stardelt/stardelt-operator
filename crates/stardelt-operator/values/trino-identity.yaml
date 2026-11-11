@@ -35,7 +35,7 @@ catalogs:
     iceberg.rest-catalog.oauth2.credential=${ENV:CATALOG_CLIENT_ID}:${ENV:CATALOG_CLIENT_SECRET}
     # Without this Iceberg asks for scope=catalog, which this realm does not have.
     iceberg.rest-catalog.oauth2.scope=openid
-    fs.native-s3.enabled=true
+    fs.s3.enabled=true
     s3.endpoint=http://seaweedfs-s3:8333
     s3.region=us-east-1
     s3.path-style-access=true
@@ -47,20 +47,11 @@ catalogs:
     s3.max-connections=16
     iceberg.split-manager-threads=4
     iceberg.metadata.parallelism=2
-    # Worker-local file-system cache for object-store reads (platform#134,
-    # Trino 480: `fs.cache.*` per catalog; there is no cache-manager setting
-    # in 480). Measured on the dev cluster 2026-10-19 against a 38M-row /
-    # 0.66 GB full scan of nyc_taxi.yellow_trips: repeat scans drop from
-    # 154 S3 GETs + 660 MB to 1 GET + 0 MB, wall time 1.5-1.9s -> 1.2-1.7s.
-    # The win is S3 offload (the single-replica SeaweedFS volume server is
-    # the bottleneck the throttles above protect), not latency — Parquet
-    # decode dominates on one node. Best-effort local cache only: a pod
-    # restart or scale-to-zero (M-02) discards it with the emptyDir, and the
-    # next scan repopulates (cold scan is slower: 5.1s vs 3.2s uncached).
+    # Worker-local file-system cache for object-store reads (platform#134).
+    # Trino 483+ (stardelt-platform#1002): the directories, size and TTL live in
+    # the node-level cache manager in values/trino.yaml; a catalog only turns
+    # caching on. The measured win is recorded there.
     fs.cache.enabled=true
-    fs.cache.directories=/var/trino/cache
-    fs.cache.max-sizes=10GB
-    fs.cache.ttl=7d
 server:
   config:
     # PASSWORD first: a Basic header from the service account is not parsed as a
@@ -181,3 +172,7 @@ coordinator:
 additionalConfigProperties:
   - http-server.process-forwarded=true
   - internal-communication.shared-secret=${ENV:TRINO_INTERNAL_SHARED_SECRET}
+  # Node-level file-system cache (Trino 483+, stardelt-platform#1002). This list
+  # REPLACES the base one, so the cache-manager line must be repeated here; the
+  # file itself comes from values/trino.yaml (additionalConfigFiles, merged).
+  - cache-manager.config-files=etc/cache-manager-alluxio.properties
