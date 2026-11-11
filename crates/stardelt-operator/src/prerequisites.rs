@@ -10,7 +10,8 @@ use k8s_openapi::{
         batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec},
         core::v1::{
             Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec,
-            SeccompProfile, Secret, SecretKeySelector, SecurityContext,
+            SeccompProfile, Secret, SecretKeySelector, SecretVolumeSource, SecurityContext, Volume,
+            VolumeMount,
         },
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
@@ -392,12 +393,18 @@ pub fn discovery_config_map(
     }
 }
 
-/// Name of the bootstrap Job. It changes when the access key, bucket or
-/// endpoint change, so a rotated key gets a fresh Job (Job specs are immutable).
-pub fn bootstrap_job_name(keys: &S3Keys, bucket: &str, endpoint: &str) -> String {
+/// Name of the bootstrap Job. It changes when the access key, bucket, endpoint or
+/// script change, so a rotated key or a new script gets a fresh Job (Job specs are
+/// immutable).
+fn bootstrap_job_name_for(keys: &S3Keys, bucket: &str, endpoint: &str, script: &str) -> String {
     let mut hasher = DefaultHasher::new();
-    (&keys.access_key, bucket, endpoint).hash(&mut hasher);
+    (&keys.access_key, bucket, endpoint, script).hash(&mut hasher);
     format!("lakekeeper-bootstrap-{:08x}", hasher.finish() as u32)
+}
+
+/// [`bootstrap_job_name_for`] for the embedded script.
+pub fn bootstrap_job_name(keys: &S3Keys, bucket: &str, endpoint: &str) -> String {
+    bootstrap_job_name_for(keys, bucket, endpoint, BOOTSTRAP_SCRIPT)
 }
 
 fn secret_env(name: &str, key: &str) -> EnvVar {
@@ -692,6 +699,12 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
                         image: Some("curlimages/curl:8.10.1".into()),
                         command: Some(vec!["/bin/sh".into(), "-c".into()]),
                         args: Some(vec![BOOTSTRAP_SCRIPT.to_string()]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "catalog-principal".into(),
+                            mount_path: "/var/run/secrets/catalog-principal".into(),
+                            read_only: Some(true),
+                            ..VolumeMount::default()
+                        }]),
                         env: Some(vec![
                             EnvVar {
                                 name: "LK".into(),
@@ -718,6 +731,15 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
                         }),
                         ..Default::default()
                     }],
+                    volumes: Some(vec![Volume {
+                        name: "catalog-principal".into(),
+                        secret: Some(SecretVolumeSource {
+                            secret_name: Some("sp-catalog-operator".into()),
+                            optional: Some(true),
+                            ..SecretVolumeSource::default()
+                        }),
+                        ..Volume::default()
+                    }]),
                     ..Default::default()
                 }),
             },
@@ -999,6 +1021,52 @@ mod tests {
         assert_eq!(a, bootstrap_job_name(&keys(), "lakehouse", "http://s3"));
         assert_ne!(a, bootstrap_job_name(&other, "lakehouse", "http://s3"));
         assert!(a.starts_with("lakekeeper-bootstrap-"));
+    }
+
+    #[test]
+    fn bootstrap_job_name_changes_with_the_script() {
+        let a = bootstrap_job_name_for(&keys(), "lakehouse", "http://s3", "script-a");
+        let b = bootstrap_job_name_for(&keys(), "lakehouse", "http://s3", "script-b");
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            bootstrap_job_name_for(&keys(), "lakehouse", "http://s3", "script-a")
+        );
+    }
+
+    #[test]
+    fn bootstrap_job_mounts_the_catalog_principal() {
+        let owner = OwnerReference {
+            name: "main".into(),
+            ..Default::default()
+        };
+        let job = bootstrap_job("main", "data", "lakekeeper-bootstrap-1", owner);
+        let p = job.spec.unwrap().template.spec.unwrap();
+        let c = &p.containers[0];
+        let m = c.volume_mounts.as_ref().unwrap().first().unwrap();
+        assert_eq!(m.name, "catalog-principal");
+        assert_eq!(m.mount_path, "/var/run/secrets/catalog-principal");
+        let v = p.volumes.as_ref().unwrap().first().unwrap();
+        let s = v.secret.as_ref().unwrap();
+        assert_eq!(s.secret_name.as_deref(), Some("sp-catalog-operator"));
+        assert_eq!(s.optional, Some(true));
+    }
+
+    #[test]
+    fn the_bootstrap_script_writes_the_project_grant() {
+        for needle in [
+            "/management/v1/permissions/project/assignments",
+            "\"type\":\"%s\"",
+            "grant project_admin \"$CRED_DIR\"",
+            "grant data_admin /var/run/secrets/catalog-trino",
+            "authz-backend",
+            "AUTH_ARGS=\"-H @$AUTH_FILE\"",
+        ] {
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(needle),
+                "the script lacks `{needle}`"
+            );
+        }
     }
 
     #[test]
