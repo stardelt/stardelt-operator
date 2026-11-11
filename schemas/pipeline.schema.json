@@ -24,6 +24,43 @@
           ],
           "type": "string"
         },
+        "notify": {
+          "description": "Who to tell when a run ends; names of destinations owned by `ownerGroup`. Optional:\na pipeline without it notifies nobody.",
+          "nullable": true,
+          "properties": {
+            "onFailure": {
+              "description": "Destinations told when the run fails, after the last retry.",
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            },
+            "onRecovered": {
+              "description": "Destinations told on the first success after a failure.",
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            },
+            "onSuccess": {
+              "description": "Destinations told when the run succeeds.",
+              "items": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            }
+          },
+          "type": "object"
+        },
         "ownerGroup": {
           "description": "The group that owns the pipeline: its members see it, run it and pause it in Nova. Optional so\nthat existing pipelines keep working; a pipeline without an owner is visible to administrators only.",
           "maxLength": 64,
@@ -285,6 +322,10 @@
         {
           "message": "publish: wap needs a task that writes at least one table",
           "rule": "!has(self.publish) || self.publish != 'wap' || self.tasks.exists(t, has(t.writes) && size(t.writes) > 0)"
+        },
+        {
+          "message": "notify needs an ownerGroup: only a pipeline's owner group can name destinations",
+          "rule": "!has(self.notify) || has(self.ownerGroup)"
         }
       ]
     },

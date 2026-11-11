@@ -295,6 +295,7 @@ mod tests {
             concurrency: PipelineConcurrency::default(),
             engine,
             publish: PipelinePublish::Direct,
+            notify: None,
         }
     }
 
