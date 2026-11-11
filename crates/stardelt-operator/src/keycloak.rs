@@ -45,7 +45,7 @@ pub const REALM_KEY: &str = "stardelt-realm.json";
 pub const REALM_MOUNT: &str = "/opt/keycloak/data/import";
 /// Image of the identity provider. `stardelt-platform` pins the same tag in the Makefile, the
 /// manifest and `chart/values.yaml` (their `check-version-parity.sh` keeps the three equal).
-pub const IMAGE: &str = "quay.io/keycloak/keycloak:26.8.1";
+pub const IMAGE: &str = "quay.io/keycloak/keycloak:26.8.2";
 
 /// The realm template, verbatim from `stardelt-platform` (`chart/files/keycloak-realm.json`).
 /// Hosts are rendered per instance; the client secrets stay `${STARDELT_*_SECRET}` placeholders
@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(container.name, "keycloak");
         assert_eq!(
             container.image.as_deref(),
-            Some("quay.io/keycloak/keycloak:26.8.1")
+            Some("quay.io/keycloak/keycloak:26.8.2")
         );
         assert_eq!(
             container
