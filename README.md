@@ -90,7 +90,7 @@ spec:
             tokenSecretRef: { name: vault-token, key: token }
 ```
 
-In `secrets.mode: platform` the operator installs OpenBao (`openbao/openbao` 0.30.4, standalone,
+In `secrets.mode: platform` the operator installs OpenBao (`openbao/openbao` 0.30.7, standalone,
 `pebbledb` on one 10 GiB volume) and generates Secret `openbao-seal-key` once. The store is
 **initialised once** by the operator: `ensure_openbao_init` calls `/v1/sys/init` and keeps the
 recovery key and the initial root token in Secret `openbao-init`; an initialised store is never

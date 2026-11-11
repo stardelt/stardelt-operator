@@ -197,8 +197,8 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "apache-airflow/airflow" => Some("1.21.0"),
         "superset/superset" => Some("0.15.5"),
         "openfga/openfga" => Some("0.2.62"),
-        "external-secrets/external-secrets" => Some("2.13.0"),
-        "openbao/openbao" => Some("0.30.4"),
+        "external-secrets/external-secrets" => Some("2.15.0"),
+        "openbao/openbao" => Some("0.30.7"),
         "strimzi/strimzi-kafka-operator" => Some("1.3.1"),
         "spark-operator/spark-operator" => Some("2.5.2"),
         _ => None,
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn external_secrets_is_pinned_at_the_platform_version_and_repo() {
         let chart = "external-secrets/external-secrets";
-        assert_eq!(chart_version(chart), Some("2.13.0"));
+        assert_eq!(chart_version(chart), Some("2.15.0"));
         assert_eq!(
             chart_repo(chart),
             Some("https://charts.external-secrets.io")
@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn openbao_is_pinned_at_the_platform_version_and_repo() {
-        assert_eq!(chart_version("openbao/openbao"), Some("0.30.4"));
+        assert_eq!(chart_version("openbao/openbao"), Some("0.30.7"));
         assert_eq!(
             chart_repo("openbao/openbao"),
             Some("https://openbao.github.io/openbao-helm")
