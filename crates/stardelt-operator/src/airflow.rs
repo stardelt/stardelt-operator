@@ -147,7 +147,8 @@ pub fn group_roles_cron_job(namespace: &str, image: &str) -> CronJob {
             EnvVar {
                 name: "AIRFLOW__CORE__AUTH_MANAGER".to_string(),
                 value: Some(
-                    "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager".to_string(),
+                    "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
+                        .to_string(),
                 ),
                 ..EnvVar::default()
             },
