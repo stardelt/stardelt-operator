@@ -422,6 +422,9 @@ Notes:
 Unit and schema tests run in CI. Integration is checked on a real cluster (the dev cluster); a
 Lakehouse or PlatformInstance cannot be exercised on laptop-size clusters.
 
+`parity/steps.tsv` lists every install step of stardelt-platform and what the operator does for
+it; `scripts/check-parity.sh` keeps it complete.
+
 ### Safety: `dryRun`
 
 A new `Lakehouse` **plans only** (`spec.dryRun` defaults to `true`): the controller computes the
