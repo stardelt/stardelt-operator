@@ -13,6 +13,15 @@ from airflow.providers.fab.auth_manager.cli_commands.utils import get_applicatio
 API_HOST = "https://kubernetes.default.svc"
 API_BASE = f"{API_HOST}/apis/stardelt.io/v1alpha1"
 
+# The API checks these three resources globally, not per DAG (demos#76): a DAG's access_control
+# cannot grant Task Instances / Task Logs, and the DAG read still gates every run, so a global read
+# does not leak another group's data.
+GROUP_GLOBAL = (
+    ("can_read", "DAG Runs"),
+    ("can_read", "Task Instances"),
+    ("can_read", "Task Logs"),
+)
+
 
 def _sa_token():
     with open("/var/run/secrets/kubernetes.io/serviceaccount/token", "r") as f:
@@ -71,45 +80,51 @@ def main():
                     role = None
             if role:
                 print(f"exists {role_name}")
-                continue
-            added = False
-            if sm and hasattr(sm, "add_role"):
-                try:
-                    sm.add_role(role_name)
-                    added = True
-                except Exception:
-                    pass
-            if not added and sm is not None:
-                # some FAB versions
-                try:
-                    sm.add_role(name=role_name)
-                    added = True
-                except Exception:
-                    pass
-            if not added:
-                # use session
-                from flask import current_app
-
-                session = appbuilder.session
-                Role = None
-                try:
-                    from airflow.providers.fab.auth_manager.models import Role
-                except Exception:
+            else:
+                added = False
+                if sm and hasattr(sm, "add_role"):
                     try:
-                        from airflow.www.fab_security.sqla.models import Role
+                        sm.add_role(role_name)
+                        added = True
                     except Exception:
-                        Role = None
-                if Role:
-                    if session.query(Role).filter_by(name=role_name).first():
-                        print(f"exists {role_name}")
-                        continue
-                    r = Role(name=role_name)
-                    session.add(r)
-                    session.commit()
+                        pass
+                if not added and sm is not None:
+                    # some FAB versions
+                    try:
+                        sm.add_role(name=role_name)
+                        added = True
+                    except Exception:
+                        pass
+                if added:
                     print(f"created {role_name}")
-                    continue
-                raise
-            print(f"created {role_name}")
+                else:
+                    # use session
+                    session = appbuilder.session
+                    Role = None
+                    try:
+                        from airflow.providers.fab.auth_manager.models import Role
+                    except Exception:
+                        try:
+                            from airflow.www.fab_security.sqla.models import Role
+                        except Exception:
+                            Role = None
+                    if Role is None:
+                        raise RuntimeError(f"no FAB Role model to create {role_name}")
+                    role = session.query(Role).filter_by(name=role_name).first()
+                    if role:
+                        print(f"exists {role_name}")
+                    else:
+                        role = Role(name=role_name)
+                        session.add(role)
+                        session.commit()
+                        print(f"created {role_name}")
+                if role is None and sm and hasattr(sm, "find_role"):
+                    role = sm.find_role(role_name)
+            if role is None:
+                raise RuntimeError(f"could not read back role {role_name}")
+            for action, resource in GROUP_GLOBAL:
+                sm.add_permission_to_role(role, sm.create_permission(action, resource))
+            print(f"converged {role_name}")
     print(f"owner groups: {len(groups_list)}")
 
 

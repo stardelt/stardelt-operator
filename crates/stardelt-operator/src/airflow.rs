@@ -336,6 +336,8 @@ mod tests {
         assert!(script.contains("get_application_builder"));
         assert!(script.contains("ownerGroup"));
         assert!(script.contains("stardelt-group-"));
+        assert!(script.contains("Task Instances"));
+        assert!(script.contains("Task Logs"));
         let job = group_roles_cron_job("stardelt", &image());
         let env = job
             .spec
