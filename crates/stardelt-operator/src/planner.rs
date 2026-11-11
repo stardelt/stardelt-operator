@@ -194,7 +194,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
         "lakekeeper/lakekeeper" => Some("0.11.0"),
         "trino/trino" => Some("1.45.0"),
         "jupyterhub/jupyterhub" => Some("4.4.5"),
-        "apache-airflow/airflow" => Some("1.21.0"),
+        "apache-airflow/airflow" => Some("1.22.0"),
         "superset/superset" => Some("0.15.5"),
         "openfga/openfga" => Some("0.2.62"),
         "external-secrets/external-secrets" => Some("2.15.0"),
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn airflow_is_pinned_at_the_version_and_repo_of_the_platform() {
-        assert_eq!(chart_version("apache-airflow/airflow"), Some("1.21.0"));
+        assert_eq!(chart_version("apache-airflow/airflow"), Some("1.22.0"));
         assert_eq!(
             chart_repo("apache-airflow/airflow"),
             Some("https://airflow.apache.org")
