@@ -443,6 +443,17 @@ pub async fn ensure_bootstrap(
         Ok(None) => return status(NAME, false, "waiting for Secret stardelt-s3-creds"),
         Err(e) => return status(NAME, false, e.to_string()),
     };
+    // The bootstrap Job mounts Secret sp-catalog-operator (optional). Once the object exists, both
+    // the Secret and its subject must be ready, otherwise the first run would bootstrap anonymously
+    // and could never write the project grant.
+    let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), namespace);
+    match principals.get_opt("catalog-operator").await {
+        Ok(Some(sp)) if !sp.status.as_ref().is_some_and(|s| s.ready) => {
+            return status(NAME, false, "waiting for ServicePrincipal catalog-operator");
+        }
+        Ok(_) => {}
+        Err(e) => return status(NAME, false, e.to_string()),
+    }
     let job_name = bootstrap_job_name(&keys, &bucket(lh), &s3_endpoint(namespace));
     let done = previous
         .iter()
