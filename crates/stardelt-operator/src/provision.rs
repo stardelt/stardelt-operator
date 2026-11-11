@@ -1861,7 +1861,7 @@ fn password_db_line(password: &str) -> String {
 
 /// The CronJob that turns `Catalog` objects into Lakekeeper warehouses and `SqlWarehouse`
 /// objects into Trino resource groups (platform#305/#306/#312). Applied only when Secret
-/// `svc-catalog-operator` exists: it is the job's Lakekeeper credential, and a tick without
+/// `sp-catalog-operator` exists: it is the job's Lakekeeper credential, and a tick without
 /// it fails every two minutes. `None` without the platform identity.
 pub async fn ensure_access_sync(
     ctx: &Context,
@@ -1880,7 +1880,7 @@ pub async fn ensure_access_sync(
                 return Some(status(
                     NAME,
                     false,
-                    "waiting for Secret svc-catalog-operator",
+                    format!("waiting for Secret {}", access_sync::CLIENT_SECRET),
                 ));
             }
             Err(e) => return Some(status(NAME, false, e.to_string())),
@@ -4607,7 +4607,7 @@ mod tests {
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
-            Some("waiting for Secret svc-catalog-operator")
+            Some("waiting for Secret sp-catalog-operator")
         );
         assert_eq!(patch_count(&_requests), 0);
     }
