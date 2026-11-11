@@ -140,6 +140,18 @@ pub fn group_roles_cron_job(namespace: &str, image: &str) -> CronJob {
             "/opt/scripts/sync.py".to_string(),
         ]),
         env: Some(vec![
+            // The chart sets the FAB auth manager for the Airflow deployments; this pod mounts no
+            // airflow.cfg, so without it `get_application_builder()` hands back
+            // AirflowSecurityManagerV2, which has no find_role/create_permission/
+            // add_permission_to_role (platform#994).
+            EnvVar {
+                name: "AIRFLOW__CORE__AUTH_MANAGER".to_string(),
+                value: Some(
+                    "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager"
+                        .to_string(),
+                ),
+                ..EnvVar::default()
+            },
             EnvVar {
                 name: "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN".to_string(),
                 value_from: Some(EnvVarSource {
@@ -358,6 +370,14 @@ mod tests {
         assert!(names.contains(&"AIRFLOW__API__SECRET_KEY"));
         assert!(names.contains(&"AIRFLOW__API_AUTH__JWT_SECRET"));
         assert!(names.contains(&"AIRFLOW__CORE__FERNET_KEY"));
+        assert_eq!(
+            env.iter()
+                .find(|e| e.name == "AIRFLOW__CORE__AUTH_MANAGER")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager")
+        );
         assert_eq!(
             env.iter()
                 .find(|e| e.name == "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN")
