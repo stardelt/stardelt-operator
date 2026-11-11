@@ -1,15 +1,15 @@
 # The Spark Connect endpoint (stardelt-platform/manifests/spark.yaml). Not Helm values: Spark has
 # no chart in the operator, so this file is the single source for the image digest and the
 # ConfigMap body. `spark.rs` parses it and replaces the namespace placeholder in the defaults.
-image: ghcr.io/stardelt/spark:dev@sha256:e80bf4765d52c28ac09a08960d72c50d5a01c194599b605bf13480b88fd282ee
+image: ghcr.io/stardelt/spark:dev@sha256:f0a46bf943504620822532e41e2dcbcdcafffdc4469776921d9b1698738f689a
 defaults: |
   spark.master                                            k8s://https://kubernetes.default.svc
   spark.kubernetes.namespace                              __NAMESPACE__
-  # Executors are built from the same image as the driver: Spark 4.1.3 plus the
+  # Executors are built from the same image as the driver: Spark 4.1.4 plus the
   # Iceberg runtime, the AWS bundle and the Kafka connector (images/spark/Dockerfile).
   # Single space before the digest: the pinned reference is 136 characters,
   # just inside the 140 the YAML lint allows.
-  spark.kubernetes.container.image ghcr.io/stardelt/spark:dev@sha256:e80bf4765d52c28ac09a08960d72c50d5a01c194599b605bf13480b88fd282ee
+  spark.kubernetes.container.image ghcr.io/stardelt/spark:dev@sha256:f0a46bf943504620822532e41e2dcbcdcafffdc4469776921d9b1698738f689a
   spark.kubernetes.container.image.pullPolicy             IfNotPresent
   spark.kubernetes.container.image.pullSecrets            ghcr-creds
   spark.kubernetes.authenticate.executor.serviceAccountName spark-connect

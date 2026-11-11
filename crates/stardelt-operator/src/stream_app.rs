@@ -218,7 +218,7 @@ pub fn spark_application(
         // connector, platform#601). `spark.jars.packages` would resolve them from Maven
         // Central at submit time — against the "pinned artifacts, not Maven at pod start"
         // rule — and the published coordinates are Scala 2.12/3.5, while the image is
-        // Spark 4.1.3/Scala 2.13, so the fetched jars could not link.
+        // Spark 4.1.4/Scala 2.13, so the fetched jars could not link.
         "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
         "spark.hadoop.fs.s3a.endpoint": "http://seaweedfs-s3:8333",
         "spark.hadoop.fs.s3a.path.style.access": "true",
@@ -270,7 +270,7 @@ pub fn spark_application(
                 "mode": "cluster",
                 "image": spark::image(),
                 "imagePullPolicy": "IfNotPresent",
-                "sparkVersion": "4.1.3",
+                "sparkVersion": "4.1.4",
                 "mainApplicationFile": "local:///opt/job/stream.py",
                 "arguments": [
                     "--bootstrap-servers", bootstrap,
@@ -1431,10 +1431,10 @@ mod tests {
         let s = spec(SinkMode::Merge, vec!["id"]);
         let a =
             spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
-        assert_eq!(a.data["spec"]["sparkVersion"], "4.1.3");
+        assert_eq!(a.data["spec"]["sparkVersion"], "4.1.4");
         // The image carries the Iceberg runtime and the Kafka connector (platform#601).
         // Resolving either through `spark.jars.packages` would download Scala 2.12 / Spark
-        // 3.5 coordinates into a Scala 2.13 / Spark 4.1.3 runtime at submit time.
+        // 3.5 coordinates into a Scala 2.13 / Spark 4.1.4 runtime at submit time.
         assert!(
             a.data["spec"]["sparkConf"]
                 .get("spark.jars.packages")
