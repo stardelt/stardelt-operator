@@ -25,8 +25,8 @@ use crate::{
     access_sync, airflow,
     controller::Context,
     crd::{
-        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec, SecretsMode,
-        StorageImpl,
+        CatalogImpl, ComponentStatus, IdentityMode, Lakehouse, PlatformInstanceSpec,
+        PrincipalAudience, PrincipalPurpose, SecretsMode, ServicePrincipal, StorageImpl,
     },
     identity, ingress, kafka, keycloak, network_policy, nova,
     objects::{
@@ -2116,6 +2116,60 @@ pub async fn ensure_identity(
     )
 }
 
+/// The platform clients the catalog needs. In platform mode one principal is the operator's own
+/// credential for Lakekeeper's management API (`project_admin`, decision on operator#194); its
+/// Secret is what the bootstrap Job and later the access-sync loop read. None without an IdP.
+pub async fn ensure_catalog_principals(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "catalog-principals";
+    if spec.identity.mode != IdentityMode::Platform {
+        return None;
+    }
+    if spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): ServicePrincipal catalog-operator",
+        ));
+    }
+    match apply::<ServicePrincipal>(
+        &ctx.client,
+        &spec.namespace,
+        &catalog_principal("catalog-operator", &spec.namespace),
+        false,
+    )
+    .await
+    {
+        Ok(_) => Some(status(NAME, true, "ServicePrincipal catalog-operator")),
+        Err(e) => Some(status(NAME, false, e.to_string())),
+    }
+}
+
+/// The ServicePrincipal of the catalog's own client. The owner group is the platform admins, so
+/// the platform — not one team — owns the credential. Audiences: the catalog only.
+pub fn catalog_principal(name: &str, namespace: &str) -> ServicePrincipal {
+    ServicePrincipal {
+        metadata: ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(namespace.into()),
+            labels: Some(BTreeMap::from([(
+                "app.kubernetes.io/part-of".to_string(),
+                "stardelt".to_string(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        spec: crate::crd::ServicePrincipalSpec {
+            owner_group: "stardelt-admins".into(),
+            purpose: PrincipalPurpose::Catalog,
+            audiences: vec![PrincipalAudience::Lakekeeper],
+            existing_secret_ref: None,
+        },
+        status: None,
+    }
+}
+
 /// The secrets contract (decision D23): ConfigMap `stardelt-secrets` tells a namespace's
 /// `Connection` objects which store to sync from. Published for every mode, `none` included, so
 /// the value is never stale.
@@ -2427,6 +2481,38 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn the_catalog_principal_is_a_platform_client_owned_by_admins() {
+        let sp = catalog_principal("catalog-operator", "data");
+        assert_eq!(sp.metadata.name.as_deref(), Some("catalog-operator"));
+        assert_eq!(sp.metadata.namespace.as_deref(), Some("data"));
+        assert_eq!(sp.spec.owner_group, "stardelt-admins");
+        assert_eq!(sp.spec.purpose, PrincipalPurpose::Catalog);
+        assert_eq!(sp.spec.audiences, vec![PrincipalAudience::Lakekeeper]);
+        assert!(sp.spec.existing_secret_ref.is_none());
+        assert_eq!(
+            crate::crd::principal_client_id("catalog-operator"),
+            "sp-catalog-operator"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_catalog_principal_exists_only_for_mode_platform() {
+        for mode in ["none", "external"] {
+            let (client, _store, requests) = identity_client(BTreeMap::new());
+            assert!(
+                ensure_catalog_principals(&context(client), &platform(mode, false))
+                    .await
+                    .is_none(),
+                "{mode}"
+            );
+            assert!(
+                requests.lock().expect("requests poisoned").is_empty(),
+                "{mode} must not touch the cluster"
+            );
+        }
+    }
 
     #[test]
     fn read_keys_needs_both_keys() {

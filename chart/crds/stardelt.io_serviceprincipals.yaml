@@ -62,12 +62,14 @@ spec:
               purpose:
                 default: pipeline
                 description: |-
-                  What a service principal is for. It decides nothing by itself (grants do); it makes the intent
-                  visible in `kubectl get` and in Nova.
+                  What a service principal is for — a pipeline, maintenance, a collector, or the platform's own
+                  client. It decides nothing by itself (grants do); it makes the intent visible in `kubectl get`
+                  and in Nova.
                 enum:
                 - pipeline
                 - maintenance
                 - collector
+                - catalog
                 type: string
             required:
             - ownerGroup
