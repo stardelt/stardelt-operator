@@ -232,6 +232,7 @@ spec:
     cron: "0 3 * * *"
     timezone: Europe/Berlin
   ownerGroup: analytics        # the group whose members see it and run it (optional)
+  viewers: [finance]           # further groups that may read it in Nova, never run it (optional)
   runAs: pipeline-analytics   # service principal the tasks run as (optional)
   retries: { attempts: 2, backoff: 5m }
   tasks:

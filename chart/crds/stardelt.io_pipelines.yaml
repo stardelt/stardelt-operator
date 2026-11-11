@@ -231,6 +231,18 @@ spec:
                 description: Longest a whole run may take, for example `2h`.
                 nullable: true
                 type: string
+              viewers:
+                description: |-
+                  Groups that may READ the pipeline in Nova — list it, open it, see its runs — and
+                  nothing else. Running, pausing, resuming and deleting stay with `ownerGroup`.
+                  Absent means the owner group only, which is what every pipeline had before this field.
+                items:
+                  maxLength: 64
+                  minLength: 1
+                  pattern: ^[A-Za-z0-9][A-Za-z0-9._-]*$
+                  type: string
+                maxItems: 16
+                type: array
             required:
             - tasks
             type: object
