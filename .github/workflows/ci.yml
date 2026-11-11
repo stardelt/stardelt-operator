@@ -41,3 +41,6 @@ jobs:
 
       - name: Chart pins agree with stardelt-platform
         run: bash scripts/check-platform-pins.sh
+
+      - name: Every platform install step has a parity row
+        run: bash scripts/check-parity.sh
