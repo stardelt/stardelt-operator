@@ -1104,7 +1104,7 @@ mod tests {
             .as_str()
             .expect("a digest");
         assert_eq!(
-            digest, "sha256:86e89f438f43f0187d8967f80a08cdb99a92ebcc95831c443519faf4e26c95c7",
+            digest, "sha256:e7589e6ab66d627de28c9e8bf4d69af4adc184108e6ec884c7dffc9919cd44d1",
             "the golden Airflow image must carry the loader's access_control (platform#493) and the PEGELONLINE demo DAGs (demos#46); and a notebook task's CONN_ variables (demos#64); and the refusal of a connection without a synced Secret (demos#65)"
         );
         let worker = values["env"]
