@@ -11,7 +11,7 @@ step-access-sync	missing	ensure_access_sync	stardelt-operator#194 (the job waits
 step-trino	built	ensure_trino_tls	-
 step-app-secrets	built	ensure_airflow_secrets	-
 step-airflow	built	airflow	-
-step-superset	missing	superset	stardelt-platform#558 (the image cannot be pulled on a clean node)
+step-superset	built	superset	-
 step-pgdump	built	ensure_pg_dumps	-
 step-nova	built	ensure_nova	-
 step-pins	not-planned	-	the operator carries its pins; see stardelt-operator#545
