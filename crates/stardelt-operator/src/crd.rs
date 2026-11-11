@@ -1781,8 +1781,9 @@ pub struct VolumeStatus {
     pub observed_generation: Option<i64>,
 }
 
-/// What a service principal is for. It decides nothing by itself (grants do); it makes the intent
-/// visible in `kubectl get` and in Nova.
+/// What a service principal is for — a pipeline, maintenance, a collector, or the platform's own
+/// client. It decides nothing by itself (grants do); it makes the intent visible in `kubectl get`
+/// and in Nova.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PrincipalPurpose {
@@ -1793,6 +1794,9 @@ pub enum PrincipalPurpose {
     Maintenance,
     /// Delivers events or metrics into the platform (for example the query-log collector).
     Collector,
+    /// The platform's own client for the catalog (Lakekeeper's management API): grants, warehouses
+    /// and the `project_admin` assignment. Not a pipeline identity and not a person.
+    Catalog,
 }
 
 /// What a principal's tokens are valid for (the `aud` claim of its access token).
@@ -1924,7 +1928,7 @@ impl ServicePrincipalSpec {
 }
 
 /// The client id of the principal `name` in the identity provider (platform mode) and the name of
-/// the Secret that holds its credentials: `client-id` and `client-secret`.
+/// the Secret that holds its credentials: `client-id`, `client-secret`, `token-url` and `subject`.
 pub fn principal_client_id(name: &str) -> String {
     format!("sp-{name}")
 }
@@ -4723,6 +4727,17 @@ mod tests {
             "sp-maintenance"
         );
         assert!(sp.spec.validate("maintenance").is_ok());
+    }
+
+    #[test]
+    fn a_catalog_principal_is_accepted() {
+        let sp = principal(serde_json::json!({
+            "ownerGroup": "stardelt-admins",
+            "purpose": "catalog",
+            "audiences": ["lakekeeper"]
+        }));
+        assert_eq!(sp.spec.purpose, PrincipalPurpose::Catalog);
+        assert!(sp.spec.validate("catalog-operator").is_ok());
     }
 
     #[test]

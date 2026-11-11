@@ -5,7 +5,7 @@ step-cnpg	built	cnpg	-
 step-cnpg-cluster	built	ensure_catalog_database	-
 step-storage	built	seaweedfs	-
 step-openfga	built	openfga	-
-step-catalog-clients	missing	-	stardelt-operator#194
+step-catalog-clients	built	ensure_catalog_principals	-
 step-lakekeeper	built	ensure_bootstrap	-
 step-access-sync	missing	ensure_access_sync	stardelt-operator#194 (the job waits for a Secret nothing creates)
 step-trino	built	ensure_trino_tls	-

@@ -101,10 +101,17 @@ fn audience_value(audience: PrincipalAudience) -> &'static str {
     }
 }
 
-/// Secret `sp-<name>` with the two keys `principal.rs` already checks for.
+/// Secret `sp-<name>` with the keys the platform's own clients carry.
 ///
-/// `client-id` is `sp-<name>` and `client-secret` is `secret`, both as `ByteString`.
-pub fn credentials_secret(name: &str, namespace: &str, secret: &str) -> Secret {
+/// `client-id` is `sp-<name>`, `client-secret` is `secret`, and `token-url` and `subject` let a
+/// caller sign in as this principal; all as `ByteString`.
+pub fn credentials_secret(
+    name: &str,
+    namespace: &str,
+    secret: &str,
+    token_url: &str,
+    subject: &str,
+) -> Secret {
     let client_id = principal_client_id(name);
     Secret {
         metadata: kube::api::ObjectMeta {
@@ -127,6 +134,14 @@ pub fn credentials_secret(name: &str, namespace: &str, secret: &str) -> Secret {
             (
                 "client-secret".to_string(),
                 ByteString(secret.as_bytes().to_vec()),
+            ),
+            (
+                "token-url".to_string(),
+                ByteString(token_url.as_bytes().to_vec()),
+            ),
+            (
+                "subject".to_string(),
+                ByteString(subject.as_bytes().to_vec()),
             ),
         ])),
         ..Default::default()
@@ -482,7 +497,12 @@ async fn ensure_principal_client_inner(
             let cid = secret_text(secret, "client-id");
             let csec = secret_text(secret, "client-secret");
             match (cid, csec) {
-                (Some(cid), Some(csec)) => (Some(csec), cid != client_id),
+                (Some(cid), Some(csec)) => (
+                    Some(csec),
+                    cid != client_id
+                        || secret_text(secret, "token-url").is_none()
+                        || secret_text(secret, "subject").is_none(),
+                ),
                 _ => (None, false),
             }
         }
@@ -659,12 +679,23 @@ async fn ensure_principal_client_inner(
     )
     .await?;
 
-    // 6. Write the Secret when the value is new or client-id disagrees.
+    // 6. Write the Secret when the value is new, the client-id disagrees, or the
+    // contract keys a caller reads (token-url, subject) are missing.
     if !secret_value.is_empty() && (created || secret_needs_write || existing_secret.is_none()) {
+        let instance = platform_instance_for_namespace(ctx, namespace)
+            .await
+            .map_err(|e| format!("cannot list PlatformInstances: {e}"))?;
+        let token_url = instance
+            .as_ref()
+            .and_then(|pi| crate::identity::issuer_url(&pi.spec).ok().flatten())
+            .map(|issuer| format!("{issuer}/protocol/openid-connect/token"))
+            .ok_or_else(|| {
+                "the platform instance has no issuerUrl; cannot write token-url".to_string()
+            })?;
         objects::apply(
             &ctx.client,
             namespace,
-            &credentials_secret(name, namespace, &secret_value),
+            &credentials_secret(name, namespace, &secret_value, &token_url, &subject),
             false,
         )
         .await
@@ -693,6 +724,24 @@ mod tests {
             "audiences": audiences,
         }))
         .expect("spec")
+    }
+
+    #[test]
+    fn the_credentials_secret_carries_the_platform_keys() {
+        let s = credentials_secret(
+            "demo",
+            "data",
+            "s3cret",
+            "https://id.example/realms/stardelt/protocol/openid-connect/token",
+            "69a2b3c4",
+        );
+        assert_eq!(secret_text(&s, "client-id").as_deref(), Some("sp-demo"));
+        assert_eq!(secret_text(&s, "client-secret").as_deref(), Some("s3cret"));
+        assert_eq!(
+            secret_text(&s, "token-url").as_deref(),
+            Some("https://id.example/realms/stardelt/protocol/openid-connect/token")
+        );
+        assert_eq!(secret_text(&s, "subject").as_deref(), Some("69a2b3c4"));
     }
 
     #[test]
@@ -841,6 +890,26 @@ mod tests {
             }
             if method == "GET" && uri.contains("/users/uid-1/groups") {
                 return (200, serde_json::json!([]));
+            }
+            if method == "GET" && uri.contains("/apis/stardelt.io/v1alpha1/platforminstances") {
+                return (
+                    200,
+                    serde_json::json!({
+                        "apiVersion": "stardelt.io/v1alpha1",
+                        "kind": "PlatformInstanceList",
+                        "metadata": {},
+                        "items": [{
+                            "apiVersion": "stardelt.io/v1alpha1",
+                            "kind": "PlatformInstance",
+                            "metadata": { "name": "cluster" },
+                            "spec": {
+                                "namespace": "stardelt",
+                                "baseDomain": "data.example.com",
+                                "identity": { "mode": "platform" }
+                            }
+                        }]
+                    }),
+                );
             }
             if method == "PUT" || method == "POST" || method == "DELETE" || method == "PATCH" {
                 return (200, serde_json::json!({}));
