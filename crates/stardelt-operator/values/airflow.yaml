@@ -24,7 +24,7 @@ images:
     # would silently redeploy a different DAG image.
     repository: ghcr.io/stardelt/airflow
     tag: demo
-    digest: sha256:e7589e6ab66d627de28c9e8bf4d69af4adc184108e6ec884c7dffc9919cd44d1
+    digest: sha256:465ca8862f9a886a42891c57aa9156194e153b082aace744fb2a5eb29ad7e211
     pullPolicy: IfNotPresent
 
 # No secrets in this file: scripts/app-secrets.sh generates them per cluster
@@ -86,7 +86,7 @@ apiServer:
   # source keeps a platform installed without `make install-identity` booting on
   # the local admin login (see below), and only the api-server — the only
   # component that builds the FAB app — gets them. (`apiServer.env` would be
-  # smaller, but chart 1.21.0's env helper drops `optional`, so an absent
+  # smaller, but chart 1.22.0's env helper drops `optional`, so an absent
   # ConfigMap would block the pod on clusters that never ran install-identity.)
   extraVolumes:
     - name: stardelt-identity
@@ -252,7 +252,7 @@ env:
   - name: AIRFLOW__KUBERNETES_EXECUTOR__WORKER_CONTAINER_REPOSITORY
     value: ghcr.io/stardelt/airflow
   - name: AIRFLOW__KUBERNETES_EXECUTOR__WORKER_CONTAINER_TAG
-    value: "demo@sha256:e7589e6ab66d627de28c9e8bf4d69af4adc184108e6ec884c7dffc9919cd44d1"
+    value: "demo@sha256:465ca8862f9a886a42891c57aa9156194e153b082aace744fb2a5eb29ad7e211"
 
 # Secret-backed envs use extraEnv (templated string accepting valueFrom).
 extraEnv: |
@@ -380,7 +380,7 @@ volumeMounts:
 # installing with `--wait` (what `make install` and a GitOps toolkit do) deadlocks
 # against these two Jobs as hooks. Upstream requires them off for waiters, and
 # Job specs are immutable anyway, which makes the release un-reinstallable.
-#   https://airflow.apache.org/docs/helm-chart/1.21.0/index.html
+#   https://airflow.apache.org/docs/helm-chart/1.22.0/index.html
 migrateDatabaseJob:
   useHelmHooks: false
   applyCustomEnv: false
