@@ -1019,6 +1019,18 @@ pub struct PipelineSpec {
     /// writes that name.
     #[serde(default, rename = "runAs", skip_serializing_if = "Option::is_none")]
     pub run_as: Option<String>,
+    /// Groups that may READ the pipeline in Nova — list it, open it, see its runs — and
+    /// nothing else. Running, pausing, resuming and deleting stay with `ownerGroup`.
+    /// Absent means the owner group only, which is what every pipeline had before this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(
+        length(max = 16),
+        inner(
+            length(min = 1, max = 64),
+            regex(pattern = r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+        )
+    )]
+    pub viewers: Vec<String>,
     /// Values for `${params.<name>}` in task statements.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
@@ -3547,6 +3559,7 @@ mod tests {
             schedule: None,
             run_as: None,
             owner_group: None,
+            viewers: Vec::new(),
             params: BTreeMap::new(),
             retries: None,
             timeout: None,
@@ -3638,6 +3651,42 @@ mod tests {
             spec.owner_group = Some(good.to_string());
             assert_eq!(spec.validate(), Ok(()), "{good}");
         }
+    }
+
+    fn pipeline_spec_schema() -> serde_json::Value {
+        let yaml = serde_yaml::to_string(&Pipeline::crd()).unwrap();
+        let crd: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+        crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"].clone()
+    }
+
+    #[test]
+    fn pipeline_viewers_are_optional_group_names() {
+        let schema = pipeline_spec_schema();
+        let viewers = &schema["properties"]["viewers"];
+        assert_eq!(viewers["type"], "array");
+        assert_eq!(viewers["maxItems"], 16);
+        assert_eq!(viewers["items"]["type"], "string");
+        assert_eq!(viewers["items"]["maxLength"], 64);
+        assert_eq!(
+            viewers["items"]["pattern"], schema["properties"]["ownerGroup"]["pattern"],
+            "a viewer is a group name, exactly as the owner group is"
+        );
+
+        let empty = spec_of(vec![task("load", TaskKind::Sql, &[])]);
+        assert!(
+            !serde_json::to_value(&empty)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("viewers"),
+            "an empty viewers list is left out of the spec"
+        );
+        let mut two = empty;
+        two.viewers = vec!["analytics".into(), "visitors".into()];
+        assert_eq!(
+            serde_json::to_value(&two).unwrap()["viewers"],
+            serde_json::json!(["analytics", "visitors"])
+        );
     }
 
     #[test]
