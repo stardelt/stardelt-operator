@@ -4618,8 +4618,8 @@ mod tests {
         {
             let mut s = store.lock().expect("store poisoned");
             s.insert(
-                "svc-catalog-operator".to_string(),
-                serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"svc-catalog-operator"}}),
+                "sp-catalog-operator".to_string(),
+                serde_json::json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"sp-catalog-operator"}}),
             );
         }
         let ctx = context(client);

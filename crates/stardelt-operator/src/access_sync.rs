@@ -22,9 +22,10 @@ pub const JOB: &str = "access-sync";
 pub const SCRIPT: &str = include_str!("access_sync_job.py");
 /// Key of the script inside the ConfigMap (the platform's `--from-file=job.py=`).
 pub const SCRIPT_KEY: &str = "job.py";
-/// The Lakekeeper management client, keys client-id/client-secret/token-url. Created by
-/// `make sync-catalog-clients` in the platform; part 2 of O4 in the operator.
-pub const CLIENT_SECRET: &str = "svc-catalog-operator";
+/// The Lakekeeper management client, keys client-id/client-secret/token-url. Created by the
+/// operator as `ServicePrincipal` `catalog-operator` (operator#194, platform mode); the Secret
+/// name is the operator's convention, `sp-<name>`.
+pub const CLIENT_SECRET: &str = "sp-catalog-operator";
 /// stdlib only, no build of ours (the platform's `manifests/access-sync.yaml`).
 pub const IMAGE: &str = "python:3.13.16-slim-bookworm";
 /// Realm the group reads come from; the same literal `keycloak.rs:224` substitutes.
@@ -176,6 +177,11 @@ pub fn cron_job(namespace: &str, admin_group: &str) -> CronJob {
                 value: Some(format!(
                     "http://lakekeeper-opa.{namespace}.svc.cluster.local:8282/v1/data/stardelt/access"
                 )),
+                ..Default::default()
+            },
+            EnvVar {
+                name: "CLIENT_SECRET_NAME".into(),
+                value: Some(CLIENT_SECRET.into()),
                 ..Default::default()
             },
         ]),
@@ -405,6 +411,37 @@ mod tests {
         assert_eq!(
             opa,
             "http://lakekeeper-opa.data.svc.cluster.local:8282/v1/data/stardelt/access"
+        );
+    }
+
+    #[test]
+    fn the_access_sync_reads_the_catalog_principal_secret() {
+        assert_eq!(CLIENT_SECRET, "sp-catalog-operator");
+        let cj = cron_job("data", "stardelt-admins");
+        let pod = cj.spec.job_template.spec.unwrap().template.spec.unwrap();
+        let env: Vec<(String, Option<String>)> = pod.containers[0]
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect();
+        assert!(
+            env.iter()
+                .any(|(n, v)| n == "CLIENT_SECRET_NAME"
+                    && v.as_deref() == Some("sp-catalog-operator")),
+            "the CronJob must name the catalog principal's Secret explicitly: {env:?}"
+        );
+        let role = role("data");
+        let first = &role.rules.as_ref().unwrap()[0];
+        assert!(
+            first
+                .resource_names
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|n| n == "sp-catalog-operator"),
+            "the Role must allow get on sp-catalog-operator"
         );
     }
 }
