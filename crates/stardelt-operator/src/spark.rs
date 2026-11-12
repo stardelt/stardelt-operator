@@ -8,6 +8,11 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::{
+    admissionregistration::v1::{
+        MatchCondition, MatchResources, NamedRuleWithOperations, ValidatingAdmissionPolicy,
+        ValidatingAdmissionPolicyBinding, ValidatingAdmissionPolicyBindingSpec,
+        ValidatingAdmissionPolicySpec, Validation,
+    },
     apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
     core::v1::{
         Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort,
@@ -377,6 +382,99 @@ pub fn service(namespace: &str) -> Service {
     }
 }
 
+/// The pod guard's name. The platform's manifest uses the same string, so a
+/// namespace cut over from `make install` keeps one policy object.
+pub const POD_GUARD: &str = "spark-connect-executor-pods";
+
+fn validation(expression: &str, message: &str) -> Validation {
+    Validation {
+        expression: expression.into(),
+        message: Some(message.into()),
+        ..Validation::default()
+    }
+}
+
+fn rule(resources: &[&str], operations: &[&str]) -> NamedRuleWithOperations {
+    NamedRuleWithOperations {
+        api_groups: Some(vec![String::new()]),
+        api_versions: Some(vec!["v1".into()]),
+        operations: Some(operations.iter().map(|s| (*s).into()).collect()),
+        resources: Some(resources.iter().map(|s| (*s).into()).collect()),
+        ..NamedRuleWithOperations::default()
+    }
+}
+
+/// What a pod created by the Spark Connect driver may be (platform#1096 question 2).
+/// The allow-list is the measured executor shape; the platform manifest is the same
+/// policy and `scripts/verify-spark-pod-guard.sh` is the live proof.
+pub fn pod_guard_policy() -> ValidatingAdmissionPolicy {
+    ValidatingAdmissionPolicy {
+        metadata: ObjectMeta {
+            name: Some(POD_GUARD.into()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ValidatingAdmissionPolicySpec {
+            failure_policy: Some("Fail".into()),
+            match_constraints: Some(MatchResources {
+                resource_rules: Some(vec![
+                    rule(&["pods"], &["CREATE"]),
+                    rule(&["pods/ephemeralcontainers"], &["UPDATE"]),
+                ]),
+                ..MatchResources::default()
+            }),
+            match_conditions: Some(vec![MatchCondition {
+                name: "created-by-spark-connect".into(),
+                expression: "request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':spark-connect'".into(),
+            }]),
+            validations: Some(vec![
+                validation("object.spec.serviceAccountName == 'spark-executor'", "a pod created by the Spark Connect driver must run as ServiceAccount spark-executor"),
+                validation("!has(object.spec.hostNetwork) || object.spec.hostNetwork == false", "the Spark Connect driver may not create a host-network pod"),
+                validation("!has(object.spec.hostPID) || object.spec.hostPID == false", "the Spark Connect driver may not create a host-PID pod"),
+                validation("!has(object.spec.hostIPC) || object.spec.hostIPC == false", "the Spark Connect driver may not create a host-IPC pod"),
+                validation("!has(object.spec.initContainers) || object.spec.initContainers.size() == 0", "the Spark Connect driver may not create a pod with init containers"),
+                validation("!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0", "the Spark Connect driver may not add an ephemeral container"),
+                validation("object.spec.containers.all(c, c.image.startsWith('ghcr.io/stardelt/spark:'))", "every container a Spark Connect driver creates must use the stardelt Spark image"),
+                validation("object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged != true)", "the Spark Connect driver may not create a privileged container"),
+                validation("object.spec.containers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))", "the Spark Connect driver may not bind a host port"),
+                validation("!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.configMap) || has(v.emptyDir))", "executor pods may mount only configMap and emptyDir volumes (no secret, hostPath, PVC, projected or csi volume)"),
+                validation("object.spec.containers.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == 'stardelt-s3-creds'))", "executor pods may read only Secret stardelt-s3-creds (secretKeyRef)"),
+                validation("object.spec.containers.all(c, !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) || e.secretRef.name == 'stardelt-s3-creds'))", "executor pods may read only Secret stardelt-s3-creds (envFrom)"),
+            ]),
+            ..ValidatingAdmissionPolicySpec::default()
+        }),
+        status: None,
+    }
+}
+
+/// The binding is per namespace (the policy object itself is cluster-scoped and
+/// shared): the second Lakehouse in a cluster adds a second binding, never a
+/// second policy.
+pub fn pod_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
+    ValidatingAdmissionPolicyBinding {
+        metadata: ObjectMeta {
+            name: Some(format!("{POD_GUARD}-{namespace}")),
+            ..ObjectMeta::default()
+        },
+        // `spec`, `spec.policyName` and `spec.validationActions` are required in
+        // k8s-openapi 0.29's `latest` (v1.37), so they are not wrapped in `Some`.
+        spec: ValidatingAdmissionPolicyBindingSpec {
+            policy_name: POD_GUARD.into(),
+            validation_actions: vec!["Deny".into()],
+            match_resources: Some(MatchResources {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        namespace.to_string(),
+                    )])),
+                    match_expressions: None,
+                }),
+                ..MatchResources::default()
+            }),
+            ..ValidatingAdmissionPolicyBindingSpec::default()
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,5 +720,113 @@ mod tests {
                 assert!(!groups.contains(&"*".to_string()));
             }
         }
+    }
+
+    #[test]
+    fn pod_guard_is_cluster_scoped() {
+        let policy = pod_guard_policy();
+        assert!(policy.metadata.namespace.is_none());
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("spark-connect-executor-pods")
+        );
+    }
+
+    #[test]
+    fn pod_guard_fails_closed() {
+        let policy = pod_guard_policy();
+        let spec = policy.spec.as_ref().expect("spec");
+        assert_eq!(spec.failure_policy.as_deref(), Some("Fail"));
+        let binding = pod_guard_binding("data");
+        let binding_spec = &binding.spec;
+        assert_eq!(binding_spec.validation_actions, vec!["Deny".to_string()]);
+        let selector = binding_spec
+            .match_resources
+            .as_ref()
+            .expect("match resources")
+            .namespace_selector
+            .as_ref()
+            .expect("namespace selector");
+        let labels = selector.match_labels.as_ref().expect("match labels");
+        assert_eq!(
+            labels
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str),
+            Some("data")
+        );
+    }
+
+    #[test]
+    fn pod_guard_covers_pods_and_ephemeral_containers() {
+        let policy = pod_guard_policy();
+        let rules = policy
+            .spec
+            .as_ref()
+            .expect("spec")
+            .match_constraints
+            .as_ref()
+            .expect("match constraints")
+            .resource_rules
+            .as_ref()
+            .expect("resource rules")
+            .clone();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].resources, Some(vec!["pods".to_string()]));
+        assert_eq!(rules[0].operations, Some(vec!["CREATE".to_string()]));
+        assert_eq!(
+            rules[1].resources,
+            Some(vec!["pods/ephemeralcontainers".to_string()])
+        );
+        assert_eq!(rules[1].operations, Some(vec!["UPDATE".to_string()]));
+        for rule in &rules {
+            assert_eq!(rule.api_groups, Some(vec![String::new()]));
+            assert_eq!(rule.api_versions, Some(vec!["v1".to_string()]));
+        }
+    }
+
+    #[test]
+    fn pod_guard_has_twelve_validations() {
+        let policy = pod_guard_policy();
+        let actual: Vec<String> = policy
+            .spec
+            .as_ref()
+            .expect("spec")
+            .validations
+            .as_ref()
+            .expect("validations")
+            .iter()
+            .map(|v| v.expression.clone())
+            .collect();
+        let expected = vec![
+            "object.spec.serviceAccountName == 'spark-executor'",
+            "!has(object.spec.hostNetwork) || object.spec.hostNetwork == false",
+            "!has(object.spec.hostPID) || object.spec.hostPID == false",
+            "!has(object.spec.hostIPC) || object.spec.hostIPC == false",
+            "!has(object.spec.initContainers) || object.spec.initContainers.size() == 0",
+            "!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0",
+            "object.spec.containers.all(c, c.image.startsWith('ghcr.io/stardelt/spark:'))",
+            "object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged != true)",
+            "object.spec.containers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))",
+            "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.configMap) || has(v.emptyDir))",
+            "object.spec.containers.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == 'stardelt-s3-creds'))",
+            "object.spec.containers.all(c, !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) || e.secretRef.name == 'stardelt-s3-creds'))",
+        ];
+        assert_eq!(actual.len(), 12);
+        assert_eq!(actual, expected);
+        for expression in &expected {
+            assert_eq!(
+                actual.iter().filter(|a| a.as_str() == *expression).count(),
+                1,
+                "{expression} must appear exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_guard_binding_name_carries_the_namespace() {
+        assert_eq!(
+            pod_guard_binding("data").metadata.name.as_deref(),
+            Some("spark-connect-executor-pods-data")
+        );
     }
 }
