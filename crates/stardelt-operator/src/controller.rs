@@ -63,6 +63,17 @@ pub struct Context {
 
 pub async fn run() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
+    // Leader election (#75): only the replica that holds the Lease reconciles. Outside a
+    // pod (`cargo run`) there is no POD_NAME and every controller starts at once.
+    if let Some((pod, namespace)) = crate::leader::identity() {
+        crate::leader::acquire(client.clone(), &namespace, &pod).await?;
+        let renewer = client.clone();
+        tokio::spawn(async move {
+            let reason = crate::leader::keep(renewer, namespace, pod).await;
+            tracing::error!(reason = %reason, "lost the leader lease; exiting so another replica leads");
+            std::process::exit(1);
+        });
+    }
     let ctx = Arc::new(Context {
         client: client.clone(),
         helm: Arc::new(CommandHelmRunner),
