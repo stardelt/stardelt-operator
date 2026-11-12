@@ -128,6 +128,14 @@
                 "entra"
               ],
               "type": "string"
+            },
+            "tokenEndpoint": {
+              "description": "`external` only: the provider's OAuth2 token endpoint — `token_endpoint` in\n`<issuerUrl>/.well-known/openid-configuration`. Required for `external`: neither the\noperator (API-server proxy only) nor Helm can fetch an external discovery document.\nA `platform` instance derives it from the Keycloak it deploys and must leave it out.",
+              "maxLength": 512,
+              "minLength": 1,
+              "nullable": true,
+              "pattern": "^https://\\S+$",
+              "type": "string"
             }
           },
           "type": "object",
@@ -139,6 +147,10 @@
             {
               "message": "external mode needs issuerUrl",
               "rule": "self.mode != 'external' || has(self.issuerUrl)"
+            },
+            {
+              "message": "external mode needs tokenEndpoint",
+              "rule": "self.mode != 'external' || has(self.tokenEndpoint)"
             },
             {
               "message": "external mode needs apiAudience",
@@ -428,6 +440,10 @@
         {
           "message": "identity.mode platform derives the issuer from baseDomain; leave identity.issuerUrl out",
           "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode != 'platform' || !has(self.identity.issuerUrl)"
+        },
+        {
+          "message": "identity.mode platform derives the token endpoint from the issuer; leave identity.tokenEndpoint out",
+          "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode != 'platform' || !has(self.identity.tokenEndpoint)"
         },
         {
           "message": "identity needs baseDomain (the application hosts and redirect addresses are built from it)",

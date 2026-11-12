@@ -223,6 +223,7 @@ mod tests {
                 "mode": "external",
                 "provider": provider,
                 "issuerUrl": "https://idp.example.com",
+                "tokenEndpoint": "https://idp.example.com/token",
                 "apiAudience": "api://stardelt",
                 "clients": clients,
             },
