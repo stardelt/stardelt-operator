@@ -395,10 +395,13 @@ fn catalog_owner(catalog: &Catalog) -> OwnerReference {
     }
 }
 
-/// `token_url` for this platform: the external issuer's endpoint when the contract carries
-/// `provider`, the in-cluster Keycloak otherwise.
+/// `token_url` for this platform: the contract's `tokenEndpoint` (#611) when it is there, else
+/// the pre-#611 derivation (external issuer, or the in-cluster Keycloak).
 fn token_endpoint(identity: Option<&ConfigMap>) -> String {
     let data = identity.and_then(|c| c.data.as_ref());
+    if let Some(endpoint) = data.and_then(|d| d.get("tokenEndpoint")) {
+        return endpoint.clone();
+    }
     let external = data.is_some_and(|d| d.contains_key("provider"));
     let issuer = data.and_then(|d| d.get("issuerUrl")).map(String::as_str);
     token_url(if external { issuer } else { None })
@@ -1066,6 +1069,28 @@ mod tests {
         assert_eq!(
             token_url(Some("https://login.example.com/tenant/")),
             "https://login.example.com/tenant/protocol/openid-connect/token"
+        );
+    }
+
+    #[test]
+    fn the_contracts_token_endpoint_wins_over_the_issuer() {
+        let cm = ConfigMap {
+            data: Some(BTreeMap::from([
+                (
+                    "issuerUrl".to_string(),
+                    "https://login.microsoftonline.com/tenant/v2.0".to_string(),
+                ),
+                ("provider".to_string(), "entra".to_string()),
+                (
+                    "tokenEndpoint".to_string(),
+                    "https://login.microsoftonline.com/tenant/oauth2/v2.0/token".to_string(),
+                ),
+            ])),
+            ..ConfigMap::default()
+        };
+        assert_eq!(
+            token_endpoint(Some(&cm)),
+            "https://login.microsoftonline.com/tenant/oauth2/v2.0/token"
         );
     }
 

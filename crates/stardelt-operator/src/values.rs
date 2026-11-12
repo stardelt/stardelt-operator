@@ -1017,6 +1017,16 @@ mod tests {
             );
         }
         assert_eq!(values["fernetKeySecretName"], "airflow-fernet-key");
+        // #611: the pipeline runner's token endpoint comes from the identity contract.
+        let extra_env = values["extraEnv"].as_str().expect("extraEnv");
+        assert!(
+            extra_env.contains("key: tokenEndpoint"),
+            "PIPELINE_TOKEN_URL must come from the identity contract"
+        );
+        assert!(
+            !extra_env.contains("http://keycloak:8080"),
+            "no literal Keycloak token URL may remain in the Airflow values"
+        );
     }
 
     /// platform#680: Nova's Airflow service user `nova-api` holds `stardelt-nova-operator` —
