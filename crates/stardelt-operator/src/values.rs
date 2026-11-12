@@ -1150,6 +1150,18 @@ mod tests {
     }
 
     #[test]
+    fn superset_only_nova_may_frame_it() {
+        let values = golden_values("superset");
+        let snippet = values["configOverrides"]["iframe_embedding"]
+            .as_str()
+            .unwrap();
+        assert!(snippet.contains("frame-ancestors 'self' "));
+        assert!(snippet.contains("STARDELT_PUBLIC_URL"));
+        assert!(snippet.contains("SESSION_COOKIE_SECURE"));
+        assert!(!snippet.contains("HTTP_HEADERS = {}"));
+    }
+
+    #[test]
     fn superset_init_converges_the_analyst_role() {
         let values = golden_values("superset");
         assert_eq!(
