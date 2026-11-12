@@ -317,7 +317,7 @@ mod tests {
             o["image"]["repository"],
             serde_json::json!("openfga/openfga")
         );
-        assert_eq!(o["image"]["tag"], serde_json::json!("v1.14.0"));
+        assert_eq!(o["image"]["tag"], serde_json::json!("v1.22.1"));
         assert_eq!(
             o["livenessProbe"]["enabled"],
             serde_json::json!(false),
