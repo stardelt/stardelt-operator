@@ -19,7 +19,7 @@ use kube::ResourceExt;
 use kube::api::{Api, ListParams, LogParams, ObjectMeta};
 use kube::runtime::controller::Action;
 
-use crate::controller::Context;
+use crate::controller::{Context, delete_ignoring_not_found};
 use crate::crd::{
     Catalog, Condition, MaintenanceSpec, MaintenanceStatus, ServicePrincipal, principal_client_id,
 };
@@ -404,6 +404,25 @@ fn token_endpoint(identity: Option<&ConfigMap>) -> String {
     token_url(if external { issuer } else { None })
 }
 
+/// What to say about a principal that exists but is not ready: its own reason and message when
+/// it has one, and the Secret it should have written otherwise (operator#583).
+fn principal_not_ready_detail(principal: &str, sp: &ServicePrincipal) -> String {
+    let detail = sp
+        .status
+        .as_ref()
+        .and_then(|status| status.conditions.iter().find(|c| c.status != "True"))
+        .map(|c| match (c.reason.as_deref(), c.message.as_deref()) {
+            (Some(reason), Some(message)) => format!("{reason}: {message}"),
+            (Some(reason), None) => reason.to_string(),
+            (None, Some(message)) => message.to_string(),
+            (None, None) => "no condition says why".to_string(),
+        });
+    match detail {
+        Some(detail) => format!("{principal} is not ready: {detail}"),
+        None => format!("{principal} is not ready: Secret sp-{principal} is missing or incomplete"),
+    }
+}
+
 /// One `Catalog` -> one `maint-<catalog>` CronJob. On a missing `pipeline-<owner>` principal the
 /// condition says so and nothing is applied (the principal controller creates it).
 pub async fn reconcile_catalog(
@@ -420,17 +439,32 @@ pub async fn reconcile_catalog(
         .await?;
 
     let principals: Api<ServicePrincipal> = Api::namespaced(ctx.client.clone(), &namespace);
+    let cron_jobs: Api<CronJob> = Api::namespaced(ctx.client.clone(), &namespace);
     let condition = match principals.get_opt(&principal).await? {
-        None => Condition {
-            type_: "MaintenanceReady".into(),
-            status: "False".into(),
-            reason: Some("NoRunner".into()),
-            message: Some(format!(
-                "create ServicePrincipal {principal} to run maintenance"
-            )),
-            last_transition_time: Some(k8s_openapi::jiff::Timestamp::now().to_string()),
-            observed_generation: catalog.metadata.generation,
-        },
+        None => {
+            delete_ignoring_not_found(&cron_jobs, &job_name(&name)).await?;
+            Condition {
+                type_: "MaintenanceReady".into(),
+                status: "False".into(),
+                reason: Some("NoRunner".into()),
+                message: Some(format!(
+                    "create ServicePrincipal {principal} to run maintenance"
+                )),
+                last_transition_time: Some(k8s_openapi::jiff::Timestamp::now().to_string()),
+                observed_generation: catalog.metadata.generation,
+            }
+        }
+        Some(sp) if !sp.status.as_ref().is_some_and(|status| status.ready) => {
+            delete_ignoring_not_found(&cron_jobs, &job_name(&name)).await?;
+            Condition {
+                type_: "MaintenanceReady".into(),
+                status: "False".into(),
+                reason: Some("RunnerNotReady".into()),
+                message: Some(principal_not_ready_detail(&principal, &sp)),
+                last_transition_time: Some(k8s_openapi::jiff::Timestamp::now().to_string()),
+                observed_generation: catalog.metadata.generation,
+            }
+        }
         Some(_) => {
             let job = cron_job(
                 &namespace,
@@ -580,7 +614,7 @@ mod tests {
             if method == "GET" && path.ends_with("/serviceprincipals/pipeline-analytics") {
                 return (
                     200,
-                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"}}"#.into(),
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"},"status":{"ready":true}}"#.into(),
                 );
             }
             if method == "PATCH" && path.contains("/cronjobs/maint-mobility") {
@@ -630,9 +664,9 @@ mod tests {
         assert!(status.contains("\"observedGeneration\":3"), "{status}");
     }
 
-    /// Without `pipeline-<owner>` the condition says so and no CronJob is applied.
+    /// Without `pipeline-<owner>` the condition says so and the CronJob it left is removed.
     #[tokio::test]
-    async fn a_missing_pipeline_principal_writes_no_runner_and_applies_nothing() {
+    async fn a_missing_pipeline_principal_writes_no_runner_and_removes_the_job() {
         let (client, requests) = mock_client(|method, path, _body| {
             if method == "GET" && path.ends_with("/configmaps/stardelt-identity") {
                 return (
@@ -644,6 +678,12 @@ mod tests {
                 return (
                     404,
                     r#"{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}"#.into(),
+                );
+            }
+            if method == "DELETE" && path.ends_with("/cronjobs/maint-mobility") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"CronJob","metadata":{"name":"maint-mobility","namespace":"data"}}"#.into(),
                 );
             }
             if method == "GET" && path.ends_with("/jobs") {
@@ -667,13 +707,81 @@ mod tests {
             .await
             .expect("reconcile");
         let log = requests.lock().expect("requests").join("\n");
-        assert!(!log.contains("/cronjobs/"), "{log}");
+        assert!(
+            log.contains("DELETE /apis/batch/v1/namespaces/data/cronjobs/maint-mobility"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("PATCH /apis/batch/v1/namespaces/data/cronjobs/"),
+            "{log}"
+        );
         let status = log
             .lines()
             .find(|line| line.contains("/status"))
             .unwrap_or_else(|| panic!("no status patch\n{log}"));
         assert!(status.contains("\"NoRunner\""), "{status}");
         assert!(status.contains("\"MaintenanceReady\""), "{status}");
+    }
+
+    /// A principal that exists but is not ready does not get a schedule: the condition carries
+    /// its own reason, and any CronJob left from an earlier ready principal is removed.
+    #[tokio::test]
+    async fn an_unready_pipeline_principal_writes_runner_not_ready_and_removes_the_job() {
+        let (client, requests) = mock_client(|method, path, _body| {
+            if method == "GET" && path.ends_with("/configmaps/stardelt-identity") {
+                return (
+                    200,
+                    r#"{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"stardelt-identity","namespace":"data"},"data":{"issuerUrl":"https://id.example.com/realms/stardelt"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/serviceprincipals/pipeline-analytics") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"},"status":{"ready":false,"conditions":[{"type":"Ready","status":"False","reason":"ClientNotSetUp","message":"the identity provider has no client for this principal yet"}]}}"#.into(),
+                );
+            }
+            if method == "DELETE" && path.ends_with("/cronjobs/maint-mobility") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"CronJob","metadata":{"name":"maint-mobility","namespace":"data"}}"#.into(),
+                );
+            }
+            if method == "GET" && path.ends_with("/jobs") {
+                return (
+                    200,
+                    r#"{"apiVersion":"batch/v1","kind":"JobList","items":[]}"#.into(),
+                );
+            }
+            if method == "PATCH" && path.ends_with("/status") {
+                return (
+                    200,
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"Catalog","metadata":{"name":"mobility","namespace":"data"},"spec":{"lakehouseRef":{"name":"main"},"owner":"analytics"},"status":{"conditions":[]}}"#.into(),
+                );
+            }
+            (
+                200,
+                r#"{"kind":"Status","apiVersion":"v1","status":"Success"}"#.into(),
+            )
+        });
+        reconcile_catalog(Arc::new(catalog()), ctx(client))
+            .await
+            .expect("reconcile");
+        let log = requests.lock().expect("requests").join("\n");
+        assert!(
+            log.contains("DELETE /apis/batch/v1/namespaces/data/cronjobs/maint-mobility"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("PATCH /apis/batch/v1/namespaces/data/cronjobs/"),
+            "{log}"
+        );
+        let status = log
+            .lines()
+            .find(|line| line.contains("/status"))
+            .unwrap_or_else(|| panic!("no status patch\n{log}"));
+        assert!(status.contains("\"RunnerNotReady\""), "{status}");
+        assert!(status.contains("ClientNotSetUp"), "{status}");
+        assert!(!status.contains("\"Scheduled\""), "{status}");
     }
 
     /// The API of a reconcile that applies `maint-mobility`: the identity ConfigMap, the pipeline
@@ -693,7 +801,7 @@ mod tests {
             if method == "GET" && path.ends_with("/serviceprincipals/pipeline-analytics") {
                 return (
                     200,
-                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"}}"#.into(),
+                    r#"{"apiVersion":"stardelt.io/v1alpha1","kind":"ServicePrincipal","metadata":{"name":"pipeline-analytics","namespace":"data"},"spec":{"ownerGroup":"analytics"},"status":{"ready":true}}"#.into(),
                 );
             }
             if method == "PATCH" && path.contains("/cronjobs/maint-mobility") {
