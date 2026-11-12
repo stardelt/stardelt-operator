@@ -632,6 +632,16 @@ pub async fn ensure_spark(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply::<ServiceAccount>(
+        client,
+        namespace,
+        &spark::executor_service_account(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if let Err(e) = apply::<Role>(client, namespace, &spark::role(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
@@ -5147,6 +5157,7 @@ mod tests {
             .collect();
         let expected = [
             "/api/v1/namespaces/data/serviceaccounts/spark-connect",
+            "/api/v1/namespaces/data/serviceaccounts/spark-executor",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-connect",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-connect",
             "/api/v1/namespaces/data/configmaps/spark-connect-config",

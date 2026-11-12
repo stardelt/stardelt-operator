@@ -26,6 +26,10 @@ use kube::api::ObjectMeta;
 pub const NAME: &str = "spark-connect";
 pub const CONFIG_MAP: &str = "spark-connect-config";
 
+/// Executors run user code and never call the Kubernetes API (platform#1096): no Role is
+/// bound to this ServiceAccount and its token is not mounted.
+pub const EXECUTOR: &str = "spark-executor";
+
 /// The digest-pinned Spark image every pod in this repo runs (the Connect server and a
 /// `StreamApp`'s driver/executors share it, D42).
 pub fn image() -> String {
@@ -73,6 +77,27 @@ fn meta_with_name_labels(name: &str, namespace: &str) -> ObjectMeta {
 pub fn service_account(namespace: &str) -> ServiceAccount {
     ServiceAccount {
         metadata: meta_with_name_labels(NAME, namespace),
+        ..ServiceAccount::default()
+    }
+}
+
+/// The identity the executor pods run as: no Role is bound to it and the token is not mounted,
+/// so user code inside an executor holds no Kubernetes API identity.
+pub fn executor_service_account(namespace: &str) -> ServiceAccount {
+    let mut labels = BTreeMap::new();
+    labels.insert("app.kubernetes.io/name".to_string(), EXECUTOR.to_string());
+    labels.insert(
+        "app.kubernetes.io/part-of".to_string(),
+        "stardelt".to_string(),
+    );
+    ServiceAccount {
+        metadata: ObjectMeta {
+            name: Some(EXECUTOR.into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels),
+            ..ObjectMeta::default()
+        },
+        automount_service_account_token: Some(false),
         ..ServiceAccount::default()
     }
 }
@@ -478,6 +503,48 @@ mod tests {
                 .get("app.kubernetes.io/name")
                 .unwrap(),
             "spark-connect"
+        );
+    }
+
+    #[test]
+    fn the_executor_service_account_mounts_no_token() {
+        let sa = executor_service_account("data");
+        assert_eq!(sa.metadata.name.as_deref(), Some("spark-executor"));
+        assert_eq!(sa.metadata.namespace.as_deref(), Some("data"));
+        assert_eq!(sa.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn the_executor_is_not_bound_to_the_drivers_role() {
+        let binding = role_binding("data");
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].name, "spark-connect");
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+    }
+
+    #[test]
+    fn the_executor_uses_its_own_service_account() {
+        let cm = config_map("data");
+        let data = cm.data.expect("data");
+        let conf = data
+            .get("spark-defaults.conf")
+            .expect("spark-defaults.conf");
+        assert!(
+            conf.contains(
+                "spark.kubernetes.authenticate.executor.serviceAccountName spark-executor"
+            ),
+            "the rendered defaults must name the executor ServiceAccount"
+        );
+    }
+
+    #[test]
+    fn the_driver_keeps_its_token() {
+        let sa = service_account("data");
+        assert_eq!(sa.metadata.name.as_deref(), Some("spark-connect"));
+        assert_eq!(
+            sa.automount_service_account_token, None,
+            "the driver's ServiceAccount keeps the default and mounts its token"
         );
     }
 

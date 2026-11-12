@@ -12,7 +12,7 @@ defaults: |
   spark.kubernetes.container.image ghcr.io/stardelt/spark:dev@sha256:1acae61431891d5354fc959374adf3d5c1fbfc5cf7a7a39b099ef7c6eba89709
   spark.kubernetes.container.image.pullPolicy             IfNotPresent
   spark.kubernetes.container.image.pullSecrets            ghcr-creds
-  spark.kubernetes.authenticate.executor.serviceAccountName spark-connect
+  spark.kubernetes.authenticate.executor.serviceAccountName spark-executor
   # The driver needs permission to create/delete executor pods and services; the Role
   # is bound to ServiceAccount spark-connect. RBAC is namespaced.
   spark.kubernetes.driver.pod.name                       spark-connect
