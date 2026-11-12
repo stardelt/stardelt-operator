@@ -318,7 +318,8 @@ pub fn openfga_ingress(namespace: &str) -> NetworkPolicy {
     }
 }
 
-/// Only SeaweedFS's own pods may reach the filer, master and volume servers.
+/// SeaweedFS's own pods reach the filer, master and volume servers on every port; a pod
+/// labelled `app.kubernetes.io/name: prometheus` in any namespace reads 9327 only.
 /// The S3 gateway (8333) stays open: it checks an access key.
 pub fn seaweedfs_internal(namespace: &str) -> NetworkPolicy {
     NetworkPolicy {
@@ -340,10 +341,22 @@ pub fn seaweedfs_internal(namespace: &str) -> NetworkPolicy {
                 }]),
             }),
             policy_types: Some(vec!["Ingress".to_string()]),
-            ingress: Some(vec![NetworkPolicyIngressRule {
-                from: Some(vec![peer(&[("app.kubernetes.io/name", "seaweedfs")])]),
-                ports: None,
-            }]),
+            ingress: Some(vec![
+                NetworkPolicyIngressRule {
+                    from: Some(vec![peer(&[("app.kubernetes.io/name", "seaweedfs")])]),
+                    ports: None,
+                },
+                // The customer's Prometheus (stardelt-operator#607): read-only metrics on 9327.
+                // master/filer/volume answer Prometheus text there; the unsigned data ports
+                // (8888, 9333, 8080) stay closed by the rule above.
+                NetworkPolicyIngressRule {
+                    from: Some(vec![peer_any_namespace(&[(
+                        "app.kubernetes.io/name",
+                        "prometheus",
+                    )])]),
+                    ports: Some(vec![port(9327)]),
+                },
+            ]),
             egress: None,
         }),
     }
@@ -509,7 +522,7 @@ mod tests {
         );
         assert!(spec.egress.is_none());
         let ingress = spec.ingress.as_ref().expect("ingress");
-        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress.len(), 2);
         assert!(ingress[0].ports.is_none(), "every port, not a list");
         let from = ingress[0].from.as_ref().expect("from");
         assert_eq!(from.len(), 1);
@@ -520,6 +533,14 @@ mod tests {
                 "seaweedfs".to_string()
             )])
         );
+    }
+
+    #[test]
+    fn seaweedfs_policy_admits_a_prometheus_scraper_on_9327() {
+        let policy = seaweedfs_internal("data");
+        let ingress = policy.spec.as_ref().unwrap().ingress.as_ref().unwrap();
+        assert_eq!(ingress.len(), 2);
+        assert_scrape_rule(&ingress[1], 9327);
     }
 
     #[test]
