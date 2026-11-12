@@ -1959,20 +1959,44 @@ async fn reconcile_platform(
     if let Some(ingress) = ensure_ingress(&ctx, &instance.spec, &owner).await {
         outcome.components.push(ingress);
     }
+    // The customer's Prometheus (operator#607): ServiceMonitors for the components that expose
+    // metrics, gated on the CRDs — an apply without them would fail the whole reconcile.
+    let monitoring_crds = crate::monitoring::crds_present(&ctx.client).await;
+    if let Some(monitoring) =
+        crate::monitoring::ensure(&ctx, &instance, &owner, monitoring_crds).await
+    {
+        outcome.components.push(monitoring);
+    }
     let phase = phase(instance.spec.dry_run, &outcome);
 
     let prev = instance
         .status
         .as_ref()
         .and_then(|s| s.conditions.iter().find(|c| c.type_ == "Ready"));
+    let now = now_rfc3339();
+    let mut conditions = vec![ready_condition(
+        phase,
+        instance.metadata.generation,
+        prev,
+        &now,
+    )];
+    let previous_monitoring = instance.status.as_ref().and_then(|s| {
+        s.conditions
+            .iter()
+            .find(|c| c.type_ == "MonitoringCRDsMissing")
+    });
+    if let Some(condition) = crate::monitoring::condition(
+        instance.spec.monitoring.enabled,
+        monitoring_crds,
+        instance.metadata.generation,
+        previous_monitoring,
+        &now,
+    ) {
+        conditions.push(condition);
+    }
     let status = PlatformInstanceStatus {
         phase: phase.into(),
-        conditions: vec![ready_condition(
-            phase,
-            instance.metadata.generation,
-            prev,
-            &now_rfc3339(),
-        )],
+        conditions,
         observed_generation: instance.metadata.generation,
         components: outcome.components,
     };

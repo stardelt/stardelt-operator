@@ -250,6 +250,29 @@
             }
           ]
         },
+        "monitoring": {
+          "default": {
+            "enabled": false,
+            "labels": {}
+          },
+          "description": "The customer's Prometheus: the scrape objects, or a condition that says why not.",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "description": "Render a ServiceMonitor for every component that exposes Prometheus metrics.\nNeeds the monitoring.coreos.com/v1 CRDs; without them the operator renders\nnothing and reports MonitoringCRDsMissing.",
+              "type": "boolean"
+            },
+            "labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "description": "Labels added to every rendered object, so the customer's Prometheus selects them\n(for example `release: kube-prometheus-stack`).",
+              "type": "object"
+            }
+          },
+          "type": "object"
+        },
         "namespace": {
           "default": "stardelt",
           "description": "Namespace the platform's own components are installed into.",
