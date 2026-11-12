@@ -16,6 +16,7 @@ pub mod identity_checklist;
 pub mod ingress;
 pub mod kafka;
 pub mod keycloak;
+pub mod leader;
 pub mod maintenance;
 pub mod network_policy;
 pub mod nova;

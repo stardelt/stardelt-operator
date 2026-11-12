@@ -1,4 +1,3 @@
-{{- if gt (int .Values.replicaCount) 1 }}{{- fail "replicaCount > 1 is not supported yet: the operator has no leader election, and replicas would run concurrent helm upgrades" }}{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -114,5 +113,14 @@ spec:
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
+            # Leader election (#75): the Lease stardelt-operator-leader names this pod.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
