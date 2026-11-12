@@ -680,8 +680,9 @@ mod tests {
         assert_eq!(id["valueFrom"]["secretKeyRef"]["name"], "sp-catalog-trino");
         assert!(
             env.iter().any(|e| e["name"] == "CATALOG_TOKEN_URL"
-                && e["value"] == "$(TRINO_OIDC_ISSUER)/protocol/openid-connect/token"),
-            "CATALOG_TOKEN_URL must derive from the identity contract"
+                && e["valueFrom"]["configMapKeyRef"]["name"] == "stardelt-identity"
+                && e["valueFrom"]["configMapKeyRef"]["key"] == "tokenEndpoint"),
+            "CATALOG_TOKEN_URL must come from the identity contract"
         );
     }
 
