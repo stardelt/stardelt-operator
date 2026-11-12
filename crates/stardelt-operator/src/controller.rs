@@ -754,7 +754,10 @@ async fn remove_lakehouse_finalizer(ctx: &Context, lh: &Lakehouse) -> Result<(),
 /// Delete a named object, treating `404` as success. A `Delete` is not atomic:
 /// after a partial run the next reconcile starts from the top, and the objects
 /// removed before the failure must not stop it.
-async fn delete_ignoring_not_found<K>(api: &Api<K>, name: &str) -> Result<(), kube::Error>
+pub(crate) async fn delete_ignoring_not_found<K>(
+    api: &Api<K>,
+    name: &str,
+) -> Result<(), kube::Error>
 where
     K: Clone + serde::de::DeserializeOwned + std::fmt::Debug,
 {
