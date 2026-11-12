@@ -324,8 +324,9 @@ extraEnv: |
   # Scheduled pipelines (platform#118, phase J0): the loader DAG in the image
   # (stardelt-demos dags/pipeline_loader.py) runs `sql` tasks on the query engine as the
   # service-account client `pipeline-runner` (scripts/keycloak-sync-pipeline-runner-client.sh).
-  # All optional: without the identity install the variables are simply absent and a
-  # pipeline task fails with a clear message instead of the pod failing to start.
+  # The token endpoint comes from the identity contract key `tokenEndpoint` (#611), never a
+  # literal realm path. All optional: without the identity install the variables are simply
+  # absent and a pipeline task fails with a clear message instead of the pod failing to start.
   - name: PIPELINE_TRINO_URL
     valueFrom:
       configMapKeyRef:
@@ -333,7 +334,11 @@ extraEnv: |
         key: trinoUrl
         optional: true
   - name: PIPELINE_TOKEN_URL
-    value: http://keycloak:8080/realms/stardelt/protocol/openid-connect/token
+    valueFrom:
+      configMapKeyRef:
+        name: stardelt-identity
+        key: tokenEndpoint
+        optional: true
   - name: PIPELINE_CLIENT_ID
     value: pipeline-runner
   - name: PIPELINE_CLIENT_SECRET
