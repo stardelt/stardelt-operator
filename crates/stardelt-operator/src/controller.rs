@@ -697,6 +697,15 @@ async fn patch_lakehouse_status(
 /// (wave 3a-ii, decision D18).
 const LAKEHOUSE_FINALIZER: &str = "stardelt.io/lakehouse-deletion";
 
+/// Finalizer that keeps a `PlatformInstance` around until the releases it owns are
+/// uninstalled (D18, epic#55 definition of done 3).
+const PLATFORM_FINALIZER: &str = "stardelt.io/platform-instance-deletion";
+
+/// Cluster-scoped controllers every instance shares. A delete never uninstalls them: the
+/// CNPG operator manages the databases whose data is retained, and External Secrets owns
+/// the ClusterSecretStores and synced Secrets that outlive the instance.
+const PLATFORM_SHARED_RELEASES: [&str; 2] = ["cnpg", "external-secrets"];
+
 /// Label the SeaweedFS chart puts on its three data PVCs. Only volumes carrying
 /// it are ever deleted; another release's volumes in the same namespace are
 /// never touched.
@@ -749,6 +758,63 @@ async fn remove_lakehouse_finalizer(ctx: &Context, lh: &Lakehouse) -> Result<(),
         .cloned()
         .collect();
     patch_lakehouse_finalizers(ctx, lh, finalizers).await
+}
+
+fn platform_api(ctx: &Context) -> Api<PlatformInstance> {
+    Api::all(ctx.client.clone())
+}
+
+/// Replace `metadata.finalizers` with exactly `finalizers` (a merge patch replaces the whole
+/// list, so it never appends a duplicate).
+async fn patch_platform_finalizers(
+    ctx: &Context,
+    instance: &PlatformInstance,
+    finalizers: Vec<String>,
+) -> Result<(), kube::Error> {
+    platform_api(ctx)
+        .patch(
+            &instance.name_any(),
+            &PatchParams::default(),
+            &Patch::Merge(json!({ "metadata": { "finalizers": finalizers } })),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_platform_finalizer(
+    ctx: &Context,
+    instance: &PlatformInstance,
+) -> Result<(), kube::Error> {
+    if instance
+        .finalizers()
+        .iter()
+        .any(|f| f == PLATFORM_FINALIZER)
+    {
+        return Ok(());
+    }
+    let mut finalizers = instance.finalizers().to_vec();
+    finalizers.push(PLATFORM_FINALIZER.to_string());
+    patch_platform_finalizers(ctx, instance, finalizers).await
+}
+
+async fn remove_platform_finalizer(
+    ctx: &Context,
+    instance: &PlatformInstance,
+) -> Result<(), kube::Error> {
+    if !instance
+        .finalizers()
+        .iter()
+        .any(|f| f == PLATFORM_FINALIZER)
+    {
+        return Ok(());
+    }
+    let finalizers: Vec<String> = instance
+        .finalizers()
+        .iter()
+        .filter(|f| *f != PLATFORM_FINALIZER)
+        .cloned()
+        .collect();
+    patch_platform_finalizers(ctx, instance, finalizers).await
 }
 
 /// Delete a named object, treating `404` as success. A `Delete` is not atomic:
@@ -899,6 +965,80 @@ async fn delete_lakehouse(lh: &Lakehouse, ctx: &Context) -> Result<Action, kube:
             "releases uninstalled and data deleted (deletionPolicy Delete)"
         ),
     }
+    Ok(Action::await_change())
+}
+
+/// Deletion path of a `PlatformInstance` (D18, epic#55 definition of done 3). The finalizer
+/// keeps the resource visible until the releases this operator owns are uninstalled in the
+/// reverse of the apply order. Two releases are shared cluster-scoped controllers and are
+/// skipped. Data is never touched: the CNPG `Cluster`s, their PVCs, every Secret and the
+/// object store stay. A release whose history lacks the operator's marker is not ours (the
+/// lab's Makefile install) and is left alone.
+async fn delete_platform(
+    instance: &PlatformInstance,
+    ctx: &Context,
+) -> Result<Action, kube::Error> {
+    let name = instance.name_any();
+    let namespace = instance.spec.namespace.clone();
+
+    if instance.spec.dry_run {
+        tracing::info!(
+            instance = %name,
+            "dry-run PlatformInstance deleted; nothing was applied to the cluster"
+        );
+        remove_platform_finalizer(ctx, instance).await?;
+        return Ok(Action::await_change());
+    }
+
+    for component in plan_platform(&instance.spec).iter().rev() {
+        if PLATFORM_SHARED_RELEASES.contains(&component.name) {
+            tracing::info!(
+                instance = %name,
+                component = component.name,
+                "shared cluster-scoped controller; left installed"
+            );
+            continue;
+        }
+        let Some(chart) = component.chart else {
+            // No adapter, so this operator never installed it.
+            continue;
+        };
+        let release = HelmRelease {
+            name: component.name.to_string(),
+            chart: chart.to_string(),
+            repo: chart_repo(chart).map(str::to_string),
+            version: chart_version(chart).map(str::to_string),
+            namespace: namespace.clone(),
+            dry_run: false,
+            set: Default::default(),
+            values: None,
+        };
+        let foreign = matches!(
+            ctx.helm.run(release.history_args(), None).await,
+            Ok(history) if !is_owned(&history)
+        );
+        if foreign {
+            tracing::info!(
+                instance = %name,
+                component = component.name,
+                "release is not owned by this operator; leaving it alone"
+            );
+            continue;
+        }
+        if let Err(e) = ctx.helm.run(release.uninstall_args(), None).await {
+            tracing::warn!(
+                instance = %name,
+                component = component.name,
+                error = %e,
+                "uninstall failed; keeping the finalizer"
+            );
+            return Ok(Action::requeue(Duration::from_secs(30)));
+        }
+        tracing::info!(instance = %name, component = component.name, "release uninstalled");
+    }
+
+    remove_platform_finalizer(ctx, instance).await?;
+    tracing::info!(instance = %name, "releases uninstalled; data retained (D18)");
     Ok(Action::await_change())
 }
 
@@ -1604,6 +1744,15 @@ async fn reconcile_platform(
     ctx: Arc<Context>,
 ) -> Result<Action, kube::Error> {
     let name = instance.name_any();
+    // Deletion first (D18, epic#55 DoD 3): while the finalizer holds the object, its releases
+    // are uninstalled in reverse apply order and no status is written.
+    if instance.metadata.deletion_timestamp.is_some() {
+        return delete_platform(&instance, &ctx).await;
+    }
+    // From here the resource owns the releases, so it must not disappear before they are
+    // uninstalled. A paused instance may have applied them; a dry-run one never did, and its
+    // delete branch above removes the finalizer without a Helm call.
+    ensure_platform_finalizer(&ctx, &instance).await?;
     if instance.spec.cluster_operation.reconciliation_paused {
         let phase = "Paused";
         let prev = instance
@@ -2982,6 +3131,175 @@ mod tests {
         assert!(
             patched_finalizers(&requests).is_empty(),
             "the finalizer stays until every release is gone"
+        );
+    }
+
+    /// A `PlatformInstance` the API server is deleting: it carries the operator's finalizer
+    /// and no longer accepts spec changes.
+    fn deleting_platform(spec: serde_json::Value) -> PlatformInstance {
+        serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": {
+                "name": "cluster",
+                "generation": 2,
+                "deletionTimestamp": "2026-01-02T00:00:00Z",
+                "finalizers": [PLATFORM_FINALIZER]
+            },
+            "spec": spec
+        }))
+        .expect("deserialize PlatformInstance")
+    }
+
+    #[tokio::test]
+    async fn platform_deletion_uninstalls_owned_releases_in_reverse_order() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance = deleting_platform(json!({
+            "dryRun": false,
+            "secrets": { "mode": "platform" },
+            "pillars": { "notebooks": true, "pipelines": true, "dashboards": true }
+        }));
+
+        let action = reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("delete PlatformInstance");
+
+        assert_eq!(action, Action::await_change());
+        assert_eq!(
+            uninstalled(&helm),
+            vec![
+                "superset".to_string(),
+                "airflow".to_string(),
+                "jupyterhub".to_string(),
+                "openbao".to_string()
+            ],
+            "reverse plan order, and the shared controllers are skipped"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "the finalizer is removed once every release is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn platform_deletion_keeps_the_finalizer_when_an_uninstall_fails() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        helm.fail("uninstall", "helm uninstall failed: boom");
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance = deleting_platform(json!({
+            "dryRun": false,
+            "secrets": { "mode": "platform" },
+            "pillars": { "notebooks": true, "pipelines": true, "dashboards": true }
+        }));
+
+        let action = reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("delete PlatformInstance");
+
+        assert_eq!(action, Action::requeue(Duration::from_secs(30)));
+        assert_eq!(
+            uninstalled(&helm),
+            vec!["superset".to_string()],
+            "the reverse order stops at the first failure"
+        );
+        assert!(
+            patched_finalizers(&requests).is_empty(),
+            "the finalizer stays until every release is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_foreign_platform_release_is_never_uninstalled() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = Arc::new(RecordingRunner::default());
+        helm.reply(
+            "history",
+            r#"[{"revision":1,"description":"Install complete"}]"#,
+        );
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+        let instance = deleting_platform(json!({
+            "dryRun": false,
+            "secrets": { "mode": "platform" },
+            "pillars": { "notebooks": true, "pipelines": true, "dashboards": true }
+        }));
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("delete PlatformInstance");
+
+        assert!(
+            uninstalled(&helm).is_empty(),
+            "a release the operator did not install is left alone"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "nothing of ours is installed, so the finalizer goes"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_platform_deletion_makes_no_helm_calls_and_removes_the_finalizer() {
+        let (client, requests) = status_mock_client(json!([]));
+        let helm = owned_helm();
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm.clone(),
+        });
+
+        reconcile_platform(Arc::new(deleting_platform(json!({}))), ctx)
+            .await
+            .expect("delete a dry-run PlatformInstance");
+
+        assert!(
+            helm.calls.lock().expect("calls poisoned").is_empty(),
+            "a dry-run instance never applied anything, so nothing is uninstalled"
+        );
+        assert_eq!(
+            patched_finalizers(&requests),
+            vec![Vec::<String>::new()],
+            "the finalizer is removed without a Helm call"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_platform_reconcile_adds_the_deletion_finalizer() {
+        let (client, requests) = status_mock_client(json!([]));
+        let ctx = Arc::new(Context {
+            client,
+            helm: helm_stub(),
+        });
+        let instance: PlatformInstance = serde_json::from_value(json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster", "generation": 1 },
+            "spec": {}
+        }))
+        .expect("deserialize PlatformInstance");
+
+        reconcile_platform(Arc::new(instance), ctx)
+            .await
+            .expect("reconcile PlatformInstance");
+
+        assert!(
+            patched_finalizers(&requests)
+                .iter()
+                .any(|list| list == &vec![PLATFORM_FINALIZER.to_string()]),
+            "a live instance carries the deletion finalizer: {:?}",
+            patched_finalizers(&requests)
         );
     }
 
