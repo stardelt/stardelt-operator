@@ -360,6 +360,7 @@ mod tests {
                 groups: Vec::new(),
             },
             ingress: IngressSettings::default(),
+            monitoring: Default::default(),
         };
         for (mode, label) in [
             (SecretsMode::None, "none"),
@@ -397,6 +398,7 @@ mod tests {
                 groups: Vec::new(),
             },
             ingress: IngressSettings::default(),
+            monitoring: Default::default(),
         };
         assert!(external_store(&spec).unwrap().is_none());
         spec.secrets.mode = SecretsMode::Platform;
@@ -442,6 +444,7 @@ mod tests {
                 groups: Vec::new(),
             },
             ingress: IngressSettings::default(),
+            monitoring: Default::default(),
         };
         let store = external_store(&spec).unwrap().unwrap();
         assert_eq!(store["spec"]["provider"], kubernetes_auth);

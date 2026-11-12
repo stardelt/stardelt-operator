@@ -321,6 +321,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert!(!without.pillars.notebooks, "notebooks stay opt-in");
         assert_eq!(names(&plan_platform(&without)), vec!["cnpg"]);
@@ -348,6 +349,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert_eq!(names(&plan_platform(&base)), vec!["cnpg"]);
     }
@@ -365,6 +367,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         let plan_external = plan_platform(&PlatformInstanceSpec {
             secrets: SecretsSpec {
@@ -427,6 +430,7 @@ mod tests {
                 groups: Vec::new(),
             },
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert_eq!(
             names(&plan_platform(&base)),
@@ -451,6 +455,7 @@ mod tests {
                 groups: Vec::new(),
             },
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert_eq!(
             names(&plan_platform(&base)),
@@ -480,6 +485,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert!(!base.pillars.pipelines, "pipelines stay opt-in");
         let plan = plan_platform(&PlatformInstanceSpec {
@@ -524,6 +530,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert!(!base.pillars.dashboards, "dashboards stay opt-in");
         let plan = plan_platform(&PlatformInstanceSpec {
@@ -562,6 +569,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         let plan = plan_platform(&with);
         let kafka = plan
@@ -607,6 +615,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         };
         assert_eq!(names(&plan_platform(&pi)), vec!["cnpg"]);
         // It must not leak into a per-Lakehouse plan.
@@ -649,6 +658,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
             .into_iter()
@@ -677,6 +687,7 @@ mod tests {
             identity: Default::default(),
             secrets: Default::default(),
             ingress: Default::default(),
+            monitoring: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
             .into_iter()

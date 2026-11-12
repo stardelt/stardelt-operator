@@ -551,6 +551,23 @@ pub struct PlatformInstanceSpec {
     /// How the applications are reached from outside the cluster; see [`IngressSettings`].
     #[serde(default)]
     pub ingress: IngressSettings,
+    /// The customer's Prometheus: the scrape objects, or a condition that says why not.
+    #[serde(default)]
+    pub monitoring: MonitoringSpec,
+}
+
+/// The customer's Prometheus (operator#607, decision of 2026-11-12T20:27Z).
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct MonitoringSpec {
+    /// Render a ServiceMonitor for every component that exposes Prometheus metrics.
+    /// Needs the monitoring.coreos.com/v1 CRDs; without them the operator renders
+    /// nothing and reports MonitoringCRDsMissing.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Labels added to every rendered object, so the customer's Prometheus selects them
+    /// (for example `release: kube-prometheus-stack`).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
