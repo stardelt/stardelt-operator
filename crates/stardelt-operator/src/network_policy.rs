@@ -25,6 +25,10 @@ pub const BOOTSTRAP_POD_VALUE: &str = "lakekeeper-bootstrap";
 /// stardelt-platform/manifests/openfga-network-policy.yaml.
 pub const OPENFGA_POLICY: &str = "openfga-ingress";
 
+/// The object store's unsigned ports (platform#1100). Mirrors
+/// stardelt-platform/manifests/seaweedfs-network-policy.yaml.
+pub const SEAWEEDFS_POLICY: &str = "seaweedfs-internal";
+
 fn meta(name: &str, namespace: &str) -> ObjectMeta {
     ObjectMeta {
         name: Some(name.to_string()),
@@ -278,6 +282,37 @@ pub fn openfga_ingress(namespace: &str) -> NetworkPolicy {
     }
 }
 
+/// Only SeaweedFS's own pods may reach the filer, master and volume servers.
+/// The S3 gateway (8333) stays open: it checks an access key.
+pub fn seaweedfs_internal(namespace: &str) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta(SEAWEEDFS_POLICY, namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "seaweedfs".to_string(),
+                )])),
+                match_expressions: Some(vec![LabelSelectorRequirement {
+                    key: "app.kubernetes.io/component".to_string(),
+                    operator: "In".to_string(),
+                    values: Some(vec![
+                        "master".to_string(),
+                        "filer".to_string(),
+                        "volume".to_string(),
+                    ]),
+                }]),
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: Some(vec![peer(&[("app.kubernetes.io/name", "seaweedfs")])]),
+                ports: None,
+            }]),
+            egress: None,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,6 +436,63 @@ mod tests {
         for p in ports {
             assert_eq!(p.protocol.as_ref().unwrap(), "TCP");
         }
+    }
+
+    #[test]
+    fn seaweedfs_policy_selects_the_three_internal_components() {
+        let policy = seaweedfs_internal("data");
+        let spec = policy.spec.as_ref().expect("spec");
+        let pod_sel = spec.pod_selector.as_ref().expect("pod selector");
+        let labels = pod_sel.match_labels.as_ref().expect("labels");
+        assert_eq!(
+            labels.get("app.kubernetes.io/name").map(String::as_str),
+            Some("seaweedfs")
+        );
+        assert_eq!(labels.len(), 1);
+        let expressions = pod_sel.match_expressions.as_ref().expect("expressions");
+        assert_eq!(expressions.len(), 1);
+        assert_eq!(expressions[0].key, "app.kubernetes.io/component");
+        assert_eq!(expressions[0].operator, "In");
+        assert_eq!(
+            expressions[0].values.as_ref().expect("values"),
+            &vec![
+                "master".to_string(),
+                "filer".to_string(),
+                "volume".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn seaweedfs_policy_admits_seaweedfs_on_every_port() {
+        let policy = seaweedfs_internal("data");
+        let spec = policy.spec.as_ref().expect("spec");
+        assert_eq!(
+            spec.policy_types.as_ref().expect("policy types"),
+            &vec!["Ingress".to_string()]
+        );
+        assert!(spec.egress.is_none());
+        let ingress = spec.ingress.as_ref().expect("ingress");
+        assert_eq!(ingress.len(), 1);
+        assert!(ingress[0].ports.is_none(), "every port, not a list");
+        let from = ingress[0].from.as_ref().expect("from");
+        assert_eq!(from.len(), 1);
+        assert_eq!(
+            owner_labels(&from[0]),
+            BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "seaweedfs".to_string()
+            )])
+        );
+    }
+
+    #[test]
+    fn seaweedfs_policy_name_matches_the_platform() {
+        let policy = seaweedfs_internal("data");
+        assert_eq!(policy.metadata.name.as_deref(), Some("seaweedfs-internal"));
+        assert_eq!(policy.metadata.name.as_deref(), Some(SEAWEEDFS_POLICY));
+        assert_eq!(policy.metadata.namespace.as_deref(), Some("data"));
+        assert!(policy.metadata.owner_references.is_none());
     }
 
     fn owner_labels(peer: &NetworkPolicyPeer) -> BTreeMap<String, String> {
