@@ -100,6 +100,10 @@ spec:
     metadata:
       labels:
         app: stardelt-operator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8082"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: stardelt-operator
       {{- with .Values.imagePullSecrets }}
@@ -110,6 +114,9 @@ spec:
         - name: operator
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: 8082
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}
@@ -124,3 +131,25 @@ spec:
                   fieldPath: metadata.namespace
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+---
+# The operator's Prometheus endpoint (stardelt-operator#607): a stable name to select,
+# ClusterIP only — no ingress exposes it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: stardelt-operator-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: stardelt-operator
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8082"
+    prometheus.io/path: /metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: stardelt-operator
+  ports:
+    - name: metrics
+      port: 8082
+      targetPort: metrics

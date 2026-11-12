@@ -18,6 +18,7 @@ pub mod kafka;
 pub mod keycloak;
 pub mod leader;
 pub mod maintenance;
+pub mod metrics;
 pub mod network_policy;
 pub mod nova;
 pub mod objects;

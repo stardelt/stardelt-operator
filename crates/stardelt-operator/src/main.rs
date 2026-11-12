@@ -126,6 +126,14 @@ async fn run_controller() -> anyhow::Result<()> {
 
     tracing::info!("stardelt-operator v{}", env!("CARGO_PKG_VERSION"));
 
+    stardelt_operator::metrics::init();
+    let metrics_addr = std::env::var("METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:8082".into());
+    tokio::spawn(async move {
+        if let Err(e) = stardelt_operator::metrics::serve(&metrics_addr).await {
+            tracing::warn!(error = %e, "metrics listener stopped");
+        }
+    });
+
     match stardelt_operator::controller::run().await {
         Ok(()) => {}
         Err(e) => {
