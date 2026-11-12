@@ -675,6 +675,14 @@ pub async fn ensure_spark(
     if let Err(e) = apply_cluster(client, &spark::pod_guard_binding(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply_cluster(client, &spark::config_map_guard_policy(), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) =
+        apply_cluster(client, &spark::config_map_guard_binding(namespace), dry_run).await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     let applied = match apply::<Deployment>(
         client,
         namespace,
@@ -5177,7 +5185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spark_applies_the_nine_objects_and_reports_the_deployment() {
+    async fn spark_applies_its_objects_and_reports_the_deployment() {
         let (client, requests) = mock_client(true);
         let mut lh = lakehouse();
         lh.spec.compute.spark.enabled = true;
@@ -5203,6 +5211,8 @@ mod tests {
             "/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/spark-connect-ingress",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-connect-executor-pods",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-connect-executor-pods-data",
+            "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-connect-configmaps",
+            "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-connect-configmaps-data",
             "/apis/apps/v1/namespaces/data/deployments/spark-connect",
         ];
         assert_eq!(paths, expected);
