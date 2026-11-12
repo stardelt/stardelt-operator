@@ -822,6 +822,37 @@ pub async fn ensure_openfga_network_policy(
     Some(status(NAME, true, "applied: openfga-ingress"))
 }
 
+/// The object store's ingress policy, for a SeaweedFS lakehouse only. `byoS3`
+/// installs no store, so there is nothing to select.
+pub async fn ensure_seaweedfs_network_policy(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "seaweedfs-network-policy";
+    if lh.spec.storage.implementation != StorageImpl::Seaweedfs {
+        return None;
+    }
+    if let Err(e) = apply::<NetworkPolicy>(
+        &ctx.client,
+        namespace,
+        &network_policy::seaweedfs_internal(namespace),
+        lh.spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if lh.spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): NetworkPolicy seaweedfs-internal",
+        ));
+    }
+    Some(status(NAME, true, "applied: seaweedfs-internal"))
+}
+
 /// `<lakehouse>-discovery`: the ConfigMap that tells consumers where the catalog, the
 /// object store and Trino are. Published once the warehouse is bootstrapped, with
 /// server-side apply on every reconcile, and owned by the Lakehouse (it is derived
