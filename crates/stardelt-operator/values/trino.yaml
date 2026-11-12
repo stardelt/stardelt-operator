@@ -55,8 +55,7 @@ env:
       key: issuerUrl
       optional: true
 # The Iceberg catalog's own client (Secret sp-catalog-trino, written by the
-# ServicePrincipal of the same name in identity mode `platform`). `CATALOG_TOKEN_URL`
-# must stay after TRINO_OIDC_ISSUER: the kubelet expands the earlier variable.
+# ServicePrincipal of the same name in identity mode `platform`).
 - name: CATALOG_CLIENT_ID
   valueFrom:
     secretKeyRef:
@@ -69,8 +68,14 @@ env:
       name: sp-catalog-trino
       key: client-secret
       optional: true
+# The catalog's client-credentials token endpoint, from ConfigMap `stardelt-identity` key
+# `tokenEndpoint` (#611) — never built from the issuer, whose path is Keycloak's alone.
 - name: CATALOG_TOKEN_URL
-  value: "$(TRINO_OIDC_ISSUER)/protocol/openid-connect/token"
+  valueFrom:
+    configMapKeyRef:
+      name: stardelt-identity
+      key: tokenEndpoint
+      optional: true
 - name: TRINO_TLS_KEYSTORE_PASSWORD
   valueFrom:
     secretKeyRef:
