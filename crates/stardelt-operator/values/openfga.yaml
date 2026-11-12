@@ -1,5 +1,5 @@
 # OpenFGA — the catalog's permission store (platform#302, authz 1/8). Chart:
-# openfga/openfga 0.2.62, appVersion v1.14.0, Apache-2.0.
+# openfga/openfga 0.4.1, appVersion v1.22.1, Apache-2.0.
 #
 # Deployed, backed up and **enforced**: Lakekeeper runs `authz.backend: openfga`
 # (stardelt-platform/helm-values/lakekeeper.yaml, cut-over platform#304), so every
@@ -16,8 +16,8 @@
 image:
   repository: openfga/openfga
   # Explicit, so a chart bump cannot silently move the application: Lakekeeper 0.12.2
-  # requires OpenFGA >= 1.11 and is tested against 1.14.
-  tag: v1.14.0
+  # requires OpenFGA >= 1.11; #972 moves the store to the pair Lakekeeper 0.15 ships with.
+  tag: v1.22.1
 
 replicaCount: 1
 
