@@ -12,7 +12,7 @@ use kube::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::crd::Lakehouse;
+use crate::crd::{Lakehouse, PlatformInstance};
 
 /// Field manager every server-side apply of this operator uses.
 pub const FIELD_MANAGER: &str = "stardelt-operator";
@@ -29,6 +29,33 @@ pub fn owner_reference(lh: &Lakehouse) -> OwnerReference {
         controller: Some(true),
         block_owner_deletion: Some(true),
     }
+}
+
+/// Owner reference that makes Kubernetes delete an object with its `PlatformInstance`
+/// (D18, epic#55 definition of done 3). Only for workload objects: a Secret, a PVC and the
+/// CNPG `Cluster`s are retained and must never carry it.
+pub fn platform_owner(instance: &PlatformInstance) -> OwnerReference {
+    OwnerReference {
+        api_version: "stardelt.io/v1alpha1".into(),
+        kind: "PlatformInstance".into(),
+        name: instance.name_any(),
+        uid: instance.uid().unwrap_or_default(),
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    }
+}
+
+/// Stamp `owner` on an object before it is applied. Idempotent: an object that already
+/// carries the same uid is left as it is, so re-applying never duplicates the list.
+pub fn own<K>(object: &mut K, owner: &OwnerReference)
+where
+    K: kube::Resource<DynamicType = ()>,
+{
+    let owners = object.owner_references_mut();
+    if owners.iter().any(|existing| existing.uid == owner.uid) {
+        return;
+    }
+    owners.push(owner.clone());
 }
 
 /// Labels on everything the operator creates (decision D18).
@@ -227,6 +254,28 @@ mod tests {
             (r.group.as_str(), r.version.as_str(), r.plural.as_str()),
             ("cert-manager.io", "v1", "certificates")
         );
+    }
+
+    #[test]
+    fn an_owned_object_carries_the_platform_instance_reference() {
+        let instance: crate::crd::PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster", "uid": "6f1c2e8a-0000-4000-8000-000000000001" },
+            "spec": {}
+        }))
+        .expect("deserialize PlatformInstance");
+        let mut service = crate::nova::service_account("data");
+        own(&mut service, &platform_owner(&instance));
+        let owners = service.owner_references();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].kind, "PlatformInstance");
+        assert_eq!(owners[0].name, "cluster");
+        assert_eq!(owners[0].uid, "6f1c2e8a-0000-4000-8000-000000000001");
+        assert_eq!(owners[0].controller, Some(true));
+        // A second stamp is a no-op, not a duplicate.
+        own(&mut service, &platform_owner(&instance));
+        assert_eq!(service.owner_references().len(), 1);
     }
 
     #[test]
