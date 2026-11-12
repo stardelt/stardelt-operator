@@ -107,8 +107,10 @@ pub fn executor_service_account(namespace: &str) -> ServiceAccount {
     }
 }
 
-/// The `deletecollection` grants are what Spark's Kubernetes client needs to clean up after a
-/// driver exits.
+/// Pods and one ConfigMap per session; no Services, no PVCs, and no `update` or
+/// `deletecollection` on ConfigMaps (platform#1121, #1096 slice 3): a client's code runs
+/// in the driver, and those verbs would rewrite or remove another workload's ConfigMap.
+/// The two verbs that remain are bounded to `spark-*-conf-map` by `config_map_guard_policy`.
 pub fn role(namespace: &str) -> Role {
     Role {
         metadata: meta_with_name_labels(NAME, namespace),
@@ -128,38 +130,12 @@ pub fn role(namespace: &str) -> Role {
             },
             PolicyRule {
                 api_groups: Some(vec!["".into()]),
-                resources: Some(vec!["services".into()]),
-                verbs: vec![
-                    "get".into(),
-                    "list".into(),
-                    "create".into(),
-                    "delete".into(),
-                    "deletecollection".into(),
-                ],
-                ..PolicyRule::default()
-            },
-            PolicyRule {
-                api_groups: Some(vec!["".into()]),
                 resources: Some(vec!["configmaps".into()]),
                 verbs: vec![
                     "get".into(),
                     "list".into(),
                     "create".into(),
-                    "update".into(),
                     "delete".into(),
-                    "deletecollection".into(),
-                ],
-                ..PolicyRule::default()
-            },
-            PolicyRule {
-                api_groups: Some(vec!["".into()]),
-                resources: Some(vec!["persistentvolumeclaims".into()]),
-                verbs: vec![
-                    "get".into(),
-                    "list".into(),
-                    "create".into(),
-                    "delete".into(),
-                    "deletecollection".into(),
                 ],
                 ..PolicyRule::default()
             },
@@ -386,6 +362,8 @@ pub fn service(namespace: &str) -> Service {
 /// namespace cut over from `make install` keeps one policy object.
 pub const POD_GUARD: &str = "spark-connect-executor-pods";
 
+pub const CONFIG_MAP_GUARD: &str = "spark-connect-configmaps";
+
 fn validation(expression: &str, message: &str) -> Validation {
     Validation {
         expression: expression.into(),
@@ -459,6 +437,62 @@ pub fn pod_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
         // k8s-openapi 0.29's `latest` (v1.37), so they are not wrapped in `Some`.
         spec: ValidatingAdmissionPolicyBindingSpec {
             policy_name: POD_GUARD.into(),
+            validation_actions: vec!["Deny".into()],
+            match_resources: Some(MatchResources {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        namespace.to_string(),
+                    )])),
+                    match_expressions: None,
+                }),
+                ..MatchResources::default()
+            }),
+            ..ValidatingAdmissionPolicyBindingSpec::default()
+        },
+    }
+}
+
+/// What ConfigMaps the driver may create or delete (platform#1121): one
+/// `spark-exec-<hash>-conf-map` per session and nothing else. A client's code runs in the
+/// driver, so without the name filter a session could create or delete any ConfigMap in
+/// the namespace — `trino-catalog`, `keycloak-realm`, `airflow-config`.
+pub fn config_map_guard_policy() -> ValidatingAdmissionPolicy {
+    ValidatingAdmissionPolicy {
+        metadata: ObjectMeta {
+            name: Some(CONFIG_MAP_GUARD.into()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ValidatingAdmissionPolicySpec {
+            failure_policy: Some("Fail".into()),
+            match_constraints: Some(MatchResources {
+                resource_rules: Some(vec![rule(&["configmaps"], &["CREATE", "DELETE"])]),
+                ..MatchResources::default()
+            }),
+            match_conditions: Some(vec![MatchCondition {
+                name: "created-by-spark-connect".into(),
+                expression: "request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':spark-connect'".into(),
+            }]),
+            validations: Some(vec![validation(
+                "request.name.startsWith('spark-') && request.name.endsWith('-conf-map')",
+                "the Spark Connect driver may create or delete only its own spark-*-conf-map ConfigMaps",
+            )]),
+            ..ValidatingAdmissionPolicySpec::default()
+        }),
+        status: None,
+    }
+}
+
+/// Per namespace, like the pod guard: a second Lakehouse adds a binding, never a second
+/// policy.
+pub fn config_map_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
+    ValidatingAdmissionPolicyBinding {
+        metadata: ObjectMeta {
+            name: Some(format!("{CONFIG_MAP_GUARD}-{namespace}")),
+            ..ObjectMeta::default()
+        },
+        spec: ValidatingAdmissionPolicyBindingSpec {
+            policy_name: CONFIG_MAP_GUARD.into(),
             validation_actions: vec!["Deny".into()],
             match_resources: Some(MatchResources {
                 namespace_selector: Some(LabelSelector {
@@ -647,12 +681,10 @@ mod tests {
     }
 
     #[test]
-    fn the_role_manages_pods_and_nothing_cluster_wide() {
+    fn the_role_manages_pods_and_its_own_configmaps_only() {
         let r = role("stardelt");
         let rules = r.rules.as_ref().unwrap();
-        assert_eq!(rules.len(), 4);
-        // pods
-        assert_eq!(rules[0].api_groups.as_ref().unwrap(), &vec!["".to_string()]);
+        assert_eq!(rules.len(), 2);
         assert_eq!(
             rules[0].resources.as_ref().unwrap(),
             &vec!["pods".to_string()]
@@ -668,10 +700,9 @@ mod tests {
                 "deletecollection".to_string()
             ]
         );
-        // services
         assert_eq!(
             rules[1].resources.as_ref().unwrap(),
-            &vec!["services".to_string()]
+            &vec!["configmaps".to_string()]
         );
         assert_eq!(
             rules[1].verbs,
@@ -679,46 +710,14 @@ mod tests {
                 "get".to_string(),
                 "list".to_string(),
                 "create".to_string(),
-                "delete".to_string(),
-                "deletecollection".to_string()
+                "delete".to_string()
             ]
         );
-        // configmaps
-        assert_eq!(
-            rules[2].resources.as_ref().unwrap(),
-            &vec!["configmaps".to_string()]
-        );
-        assert_eq!(
-            rules[2].verbs,
-            vec![
-                "get".to_string(),
-                "list".to_string(),
-                "create".to_string(),
-                "update".to_string(),
-                "delete".to_string(),
-                "deletecollection".to_string()
-            ]
-        );
-        // persistentvolumeclaims
-        assert_eq!(
-            rules[3].resources.as_ref().unwrap(),
-            &vec!["persistentvolumeclaims".to_string()]
-        );
-        assert_eq!(
-            rules[3].verbs,
-            vec![
-                "get".to_string(),
-                "list".to_string(),
-                "create".to_string(),
-                "delete".to_string(),
-                "deletecollection".to_string()
-            ]
-        );
-        // no cluster wide
         for rule in rules {
-            if let Some(groups) = &rule.api_groups {
-                assert!(!groups.contains(&"*".to_string()));
-            }
+            let resources = rule.resources.as_ref().unwrap();
+            assert!(!resources.contains(&"services".to_string()));
+            assert!(!resources.contains(&"persistentvolumeclaims".to_string()));
+            assert!(!rule.verbs.contains(&"update".to_string()));
         }
     }
 
@@ -827,6 +826,80 @@ mod tests {
         assert_eq!(
             pod_guard_binding("data").metadata.name.as_deref(),
             Some("spark-connect-executor-pods-data")
+        );
+    }
+
+    #[test]
+    fn config_map_guard_bounds_create_and_delete_by_name() {
+        let policy = config_map_guard_policy();
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("spark-connect-configmaps")
+        );
+        assert!(policy.metadata.namespace.is_none());
+        let spec = policy.spec.as_ref().expect("spec");
+        assert_eq!(spec.failure_policy.as_deref(), Some("Fail"));
+        assert_eq!(
+            spec.match_constraints
+                .as_ref()
+                .unwrap()
+                .resource_rules
+                .as_ref()
+                .unwrap(),
+            &vec![rule(&["configmaps"], &["CREATE", "DELETE"])]
+        );
+        let expressions: Vec<&str> = spec
+            .validations
+            .as_ref()
+            .expect("validations")
+            .iter()
+            .map(|v| v.expression.as_str())
+            .collect();
+        assert_eq!(
+            expressions,
+            vec!["request.name.startsWith('spark-') && request.name.endsWith('-conf-map')"]
+        );
+    }
+
+    #[test]
+    fn config_map_guard_applies_to_the_driver_only() {
+        let policy = config_map_guard_policy();
+        let conditions = policy
+            .spec
+            .as_ref()
+            .unwrap()
+            .match_conditions
+            .as_ref()
+            .unwrap();
+        assert!(
+            conditions
+                .iter()
+                .any(|c| c.expression.contains(":spark-connect'"))
+        );
+    }
+
+    #[test]
+    fn config_map_guard_binding_name_carries_the_namespace() {
+        let binding = config_map_guard_binding("data");
+        assert_eq!(
+            binding.metadata.name.as_deref(),
+            Some("spark-connect-configmaps-data")
+        );
+        assert_eq!(binding.spec.policy_name, "spark-connect-configmaps");
+        assert_eq!(binding.spec.validation_actions, vec!["Deny".to_string()]);
+        let selector = binding
+            .spec
+            .match_resources
+            .unwrap()
+            .namespace_selector
+            .unwrap();
+        assert_eq!(
+            selector
+                .match_labels
+                .unwrap()
+                .get("kubernetes.io/metadata.name")
+                .map(String::as_str),
+            Some("data")
         );
     }
 }
