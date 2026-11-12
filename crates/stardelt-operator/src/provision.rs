@@ -648,6 +648,16 @@ pub async fn ensure_spark(
     if let Err(e) = apply::<Service>(client, namespace, &spark::service(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply::<NetworkPolicy>(
+        client,
+        namespace,
+        &network_policy::shared_spark_connect_ingress(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     let applied = match apply::<Deployment>(
         client,
         namespace,
@@ -5119,7 +5129,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spark_applies_the_six_objects_and_reports_the_deployment() {
+    async fn spark_applies_the_seven_objects_and_reports_the_deployment() {
         let (client, requests) = mock_client(true);
         let mut lh = lakehouse();
         lh.spec.compute.spark.enabled = true;
@@ -5141,6 +5151,7 @@ mod tests {
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-connect",
             "/api/v1/namespaces/data/configmaps/spark-connect-config",
             "/api/v1/namespaces/data/services/spark-connect",
+            "/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/spark-connect-ingress",
             "/apis/apps/v1/namespaces/data/deployments/spark-connect",
         ];
         assert_eq!(paths, expected);

@@ -8,7 +8,7 @@ use k8s_openapi::api::networking::v1::{
     IPBlock, NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
     NetworkPolicySpec,
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 
@@ -138,6 +138,52 @@ pub fn spark_connect_ingress(
 
 /// The Spark Operator labels a `SparkConnect`'s server pod with the connect's name.
 pub const CONNECT_POD_LABEL: &str = "sparkoperator.k8s.io/connect-name";
+
+/// Ingress to the Lakehouse's shared Spark Connect server (platform#1097). The server
+/// authenticates nobody, so the network admits members' notebook pods on 15002 (not a
+/// pod labelled `stardelt.io/group.visitors`) and the server's own driver and executor
+/// pods on any port. Both carry `app.kubernetes.io/name: spark-connect`
+/// (values/spark.yaml), so one peer covers the driver-executor traffic both ways.
+pub fn shared_spark_connect_ingress(namespace: &str) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta("spark-connect-ingress", namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "spark-connect".to_string(),
+                )])),
+                match_expressions: None,
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![
+                NetworkPolicyIngressRule {
+                    from: Some(vec![NetworkPolicyPeer {
+                        pod_selector: Some(LabelSelector {
+                            match_labels: Some(BTreeMap::from([(
+                                "component".to_string(),
+                                "singleuser-server".to_string(),
+                            )])),
+                            match_expressions: Some(vec![LabelSelectorRequirement {
+                                key: "stardelt.io/group.visitors".to_string(),
+                                operator: "DoesNotExist".to_string(),
+                                values: None,
+                            }]),
+                        }),
+                        namespace_selector: None,
+                        ip_block: None::<IPBlock>,
+                    }]),
+                    ports: Some(vec![port(SPARK_CONNECT_PORT)]),
+                },
+                NetworkPolicyIngressRule {
+                    from: Some(vec![peer(&[("app.kubernetes.io/name", "spark-connect")])]),
+                    ports: None,
+                },
+            ]),
+            egress: None,
+        }),
+    }
+}
 
 fn port(number: i32) -> NetworkPolicyPort {
     NetworkPolicyPort {
@@ -439,6 +485,67 @@ mod tests {
             .flat_map(|p| owner_labels(p).into_keys())
             .collect::<Vec<_>>();
         assert!(!keys.iter().any(|key| key.contains("group.")), "{keys:?}");
+    }
+
+    #[test]
+    fn shared_spark_connect_ingress_admits_members_and_own_pods() {
+        let policy = shared_spark_connect_ingress("data");
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("spark-connect-ingress")
+        );
+        assert_eq!(policy.metadata.namespace.as_deref(), Some("data"));
+        let spec = policy.spec.as_ref().expect("spec");
+        assert_eq!(
+            spec.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "spark-connect".to_string()
+            )])
+        );
+        assert_eq!(
+            spec.policy_types.as_ref().unwrap(),
+            &vec!["Ingress".to_string()]
+        );
+        let ingress = spec.ingress.as_ref().expect("rules");
+        assert_eq!(ingress.len(), 2);
+        // Rule 1: members' notebook pods only, on the Connect port.
+        let members = ingress[0].from.as_ref().unwrap();
+        assert_eq!(members.len(), 1);
+        let selector = members[0].pod_selector.as_ref().expect("pod selector");
+        assert_eq!(
+            selector.match_labels.as_ref().unwrap(),
+            &BTreeMap::from([("component".to_string(), "singleuser-server".to_string())])
+        );
+        let expressions = selector.match_expressions.as_ref().expect("expressions");
+        assert_eq!(expressions.len(), 1);
+        assert_eq!(expressions[0].key, "stardelt.io/group.visitors");
+        assert_eq!(expressions[0].operator, "DoesNotExist");
+        assert_eq!(
+            ingress[0].ports.as_ref().unwrap(),
+            &vec![port(SPARK_CONNECT_PORT)]
+        );
+        // Rule 2: the server's own driver and executor pods on any port.
+        let own = ingress[1].from.as_ref().unwrap();
+        assert_eq!(
+            own[0]
+                .pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "spark-connect".to_string()
+            )])
+        );
+        assert!(ingress[1].ports.is_none());
     }
 
     #[test]
