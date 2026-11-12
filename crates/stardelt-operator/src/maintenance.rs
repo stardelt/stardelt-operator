@@ -397,7 +397,7 @@ fn catalog_owner(catalog: &Catalog) -> OwnerReference {
 
 /// `token_url` for this platform: the contract's `tokenEndpoint` (#611) when it is there, else
 /// the pre-#611 derivation (external issuer, or the in-cluster Keycloak).
-fn token_endpoint(identity: Option<&ConfigMap>) -> String {
+pub(crate) fn token_endpoint(identity: Option<&ConfigMap>) -> String {
     let data = identity.and_then(|c| c.data.as_ref());
     if let Some(endpoint) = data.and_then(|d| d.get("tokenEndpoint")) {
         return endpoint.clone();

@@ -194,6 +194,7 @@ pub fn spark_application(
     bootstrap: &str,
     checkpoint: &str,
     owner: &OwnerReference,
+    token_endpoint: &str,
 ) -> Result<DynamicObject, String> {
     let run_as = resolve_run_as(spec)?;
     let sp = format!("sp-{run_as}");
@@ -208,10 +209,6 @@ pub fn spark_application(
         SinkMode::Append => "append",
     };
     let c = &spec.sink.catalog;
-    let token_url = format!(
-        "http://keycloak:8080/realms/{}/protocol/openid-connect/token",
-        crate::identity::PLATFORM_REALM
-    );
     let s3_secret = crate::prerequisites::S3_SECRET;
     let mut spark_conf = json!({
         // The image carries both jars already (`iceberg-spark-runtime.jar` and the Kafka
@@ -245,7 +242,7 @@ pub fn spark_application(
         json!(format!("{sp}:client-id"));
     spark_conf["spark.kubernetes.executor.secretKeyRef.CATALOG_CLIENT_SECRET"] =
         json!(format!("{sp}:client-secret"));
-    spark_conf["spark.executorEnv.CATALOG_TOKEN_URL"] = json!(token_url);
+    spark_conf["spark.executorEnv.CATALOG_TOKEN_URL"] = json!(token_endpoint);
 
     Ok(DynamicObject {
         types: Some(TypeMeta {
@@ -294,7 +291,7 @@ pub fn spark_application(
                     "env": [
                         {"name": "CATALOG_CLIENT_ID", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-id"}}},
                         {"name": "CATALOG_CLIENT_SECRET", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-secret"}}},
-                        {"name": "CATALOG_TOKEN_URL", "value": token_url},
+                        {"name": "CATALOG_TOKEN_URL", "value": token_endpoint},
                         {"name": "AWS_ACCESS_KEY_ID", "valueFrom": {"secretKeyRef": {"name": s3_secret, "key": "access-key"}}},
                         {"name": "AWS_SECRET_ACCESS_KEY", "valueFrom": {"secretKeyRef": {"name": s3_secret, "key": "secret-key"}}},
                         {"name": "AWS_REGION", "valueFrom": {"secretKeyRef": {"name": s3_secret, "key": "region"}}}
@@ -667,6 +664,10 @@ pub async fn reconcile_stream_app(
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
     }
+    let identity: Option<ConfigMap> = Api::<ConfigMap>::namespaced(ctx.client.clone(), &namespace)
+        .get_opt(crate::identity::CONFIGMAP_NAME)
+        .await?;
+    let token_endpoint = crate::maintenance::token_endpoint(identity.as_ref());
     let spark = spark_application(
         &namespace,
         &name,
@@ -674,6 +675,7 @@ pub async fn reconcile_stream_app(
         &bootstrap,
         &checkpoint,
         &owner,
+        &token_endpoint,
     )
     .map_err(|e| kube::Error::Service(Box::new(std::io::Error::other(e))))?;
     objects::apply_dynamic(
@@ -867,6 +869,8 @@ mod tests {
         }
     }
 
+    const TOKEN_URL: &str = "https://id.example.com/realms/stardelt/protocol/openid-connect/token";
+
     fn spec(mode: SinkMode, merge_keys: Vec<&str>) -> StreamAppSpec {
         StreamAppSpec {
             source: StreamSource {
@@ -951,8 +955,16 @@ mod tests {
     #[test]
     fn a_spark_application_carries_the_job_script_annotation() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let app = spark_application("data", "orders", &s, "kafka:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let app = spark_application(
+            "data",
+            "orders",
+            &s,
+            "kafka:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         let annotation = app
             .metadata
             .annotations
@@ -969,8 +981,16 @@ mod tests {
     #[test]
     fn an_application_from_an_older_binary_is_resubmitted() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let app = spark_application("data", "orders", &s, "kafka:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let app = spark_application(
+            "data",
+            "orders",
+            &s,
+            "kafka:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
 
         let mut missing = app.clone();
         missing.metadata.annotations = None;
@@ -1112,8 +1132,16 @@ mod tests {
     #[test]
     fn the_application_is_cluster_mode_and_mounts_the_job() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let app = spark_application("data", "orders", &s, "kafka:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let app = spark_application(
+            "data",
+            "orders",
+            &s,
+            "kafka:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         assert_eq!(app.types.as_ref().unwrap().kind, "SparkApplication");
         assert_eq!(app.data["spec"]["mode"], "cluster");
         assert_eq!(
@@ -1135,13 +1163,29 @@ mod tests {
     #[test]
     fn merge_sink_passes_the_keys_and_append_sink_does_not() {
         let merge = spec(SinkMode::Merge, vec!["a", "b"]);
-        let m = spark_application("data", "orders", &merge, "k:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let m = spark_application(
+            "data",
+            "orders",
+            &merge,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         assert_eq!(arg(&m.data["spec"]["arguments"], "--merge-keys"), "a,b");
 
         let append = spec(SinkMode::Append, vec![]);
-        let a = spark_application("data", "orders", &append, "k:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &append,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         assert_eq!(arg(&a.data["spec"]["arguments"], "--merge-keys"), "");
     }
 
@@ -1149,14 +1193,30 @@ mod tests {
     fn restart_policy_maps_to_the_application() {
         let mut always = spec(SinkMode::Merge, vec!["id"]);
         always.restart_policy = StreamRestartPolicy::Always;
-        let a = spark_application("data", "orders", &always, "k:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &always,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         assert_eq!(a.data["spec"]["restartPolicy"]["type"], "Always");
 
         let mut failure = spec(SinkMode::Merge, vec!["id"]);
         failure.restart_policy = StreamRestartPolicy::OnFailure;
-        let f = spark_application("data", "orders", &failure, "k:9092", "s3a://c/p", &owner())
-            .expect("ok");
+        let f = spark_application(
+            "data",
+            "orders",
+            &failure,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         assert_eq!(f.data["spec"]["restartPolicy"]["type"], "OnFailure");
     }
 
@@ -1264,8 +1324,16 @@ mod tests {
     #[test]
     fn restart_policy_carries_the_v2_retry_fields() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         let rp = &a.data["spec"]["restartPolicy"];
         assert_eq!(rp["type"], "Always");
         assert_eq!(rp["onFailureRetries"], 3);
@@ -1294,8 +1362,16 @@ mod tests {
         let mut s = spec(SinkMode::Merge, vec!["id"]);
         s.run_as = None;
         s.owner_group = Some("analysts".into());
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         let env = a.data["spec"]["driver"]["env"].as_array().expect("env");
         let client_id = env
             .iter()
@@ -1315,16 +1391,32 @@ mod tests {
         );
 
         s.owner_group = None;
-        let err =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).unwrap_err();
+        let err = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .unwrap_err();
         assert!(err.contains("runAs"), "{err}");
     }
 
     #[test]
     fn the_driver_carries_catalog_and_s3_env_with_no_env_from() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         let driver = &a.data["spec"]["driver"];
         assert!(
             driver.get("envFrom").is_none(),
@@ -1348,8 +1440,16 @@ mod tests {
     #[test]
     fn secret_backed_driver_env_uses_secret_key_refs_never_literal_values() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         let env = a.data["spec"]["driver"]["env"].as_array().expect("env");
         let secret_backed = [
             ("CATALOG_CLIENT_ID", "sp-pipeline-analysts", "client-id"),
@@ -1389,10 +1489,7 @@ mod tests {
             .iter()
             .find(|e| e["name"] == "CATALOG_TOKEN_URL")
             .expect("CATALOG_TOKEN_URL");
-        assert_eq!(
-            token["value"],
-            "http://keycloak:8080/realms/stardelt/protocol/openid-connect/token"
-        );
+        assert_eq!(token["value"], TOKEN_URL);
         assert!(token.get("valueFrom").is_none());
 
         // The executor needs the same catalog identity for token refresh (#341).
@@ -1420,8 +1517,7 @@ mod tests {
             );
         }
         assert_eq!(
-            conf["spark.executorEnv.CATALOG_TOKEN_URL"],
-            "http://keycloak:8080/realms/stardelt/protocol/openid-connect/token",
+            conf["spark.executorEnv.CATALOG_TOKEN_URL"], TOKEN_URL,
             "executor needs the catalog token URL"
         );
     }
@@ -1429,8 +1525,16 @@ mod tests {
     #[test]
     fn the_application_uses_the_jars_baked_in_the_image() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         assert_eq!(a.data["spec"]["sparkVersion"], "4.1.4");
         // The image carries the Iceberg runtime and the Kafka connector (platform#601).
         // Resolving either through `spark.jars.packages` would download Scala 2.12 / Spark
@@ -1451,8 +1555,16 @@ mod tests {
     #[test]
     fn the_stream_has_room_above_the_jvm_heap() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         for part in ["driver", "executor"] {
             assert_eq!(a.data["spec"][part]["coreRequest"], "500m", "{part}");
             assert_eq!(a.data["spec"][part]["memory"], "2g", "{part}");
@@ -1463,8 +1575,16 @@ mod tests {
     #[test]
     fn spark_conf_carries_s3a_and_sink_catalog_s3_endpoints() {
         let s = spec(SinkMode::Merge, vec!["id"]);
-        let a =
-            spark_application("data", "orders", &s, "k:9092", "s3a://c/p", &owner()).expect("ok");
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
         let conf = &a.data["spec"]["sparkConf"];
         assert_eq!(
             conf["spark.hadoop.fs.s3a.endpoint"],
@@ -1544,6 +1664,23 @@ mod tests {
                     .lock()
                     .expect("requests poisoned")
                     .push(format!("{method} {path}?{query} {body}"));
+                // The reconciler reads the identity contract to build the catalog token
+                // endpoint; without a `provider` key that is the platform realm (#611).
+                if method == "GET" && path.ends_with(crate::identity::CONFIGMAP_NAME) {
+                    return Ok::<_, std::convert::Infallible>(
+                        http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(kube::client::Body::from(
+                                format!(
+                                    r#"{{"apiVersion":"v1","kind":"ConfigMap","metadata":{{"name":"{}","namespace":"data"}}}}"#,
+                                    crate::identity::CONFIGMAP_NAME
+                                )
+                                .into_bytes(),
+                            ))
+                            .expect("valid mock response"),
+                    );
+                }
                 let (status, document) = handler(&method, &path, &body);
                 Ok::<_, std::convert::Infallible>(
                     http::Response::builder()
