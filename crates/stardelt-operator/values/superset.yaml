@@ -25,7 +25,12 @@ bootstrapScript: |
 configOverrides:
   iframe_embedding: |
     TALISMAN_ENABLED = False
-    HTTP_HEADERS = {}
+    import os
+    # Only Superset itself and Nova may frame Superset (Nova's Dashboards page).
+    _nova_origin = os.environ.get("STARDELT_PUBLIC_URL", "").rstrip("/")
+    HTTP_HEADERS = {"Content-Security-Policy": ("frame-ancestors 'self' " + _nova_origin).strip()}
+    # Secure when the platform is served over HTTPS (a local http:// install keeps working).
+    SESSION_COOKIE_SECURE = _nova_origin.startswith("https://")
     SESSION_COOKIE_SAMESITE = "Lax"
     ENABLE_PROXY_FIX = True
 
