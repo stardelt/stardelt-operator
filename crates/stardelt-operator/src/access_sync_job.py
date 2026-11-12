@@ -24,13 +24,15 @@ before a person has ever signed in), and the Catalog's `grants` become grants on
 warehouse — which Lakekeeper inherits downward to every namespace, table and view,
 existing and future. The verb map (architect decision 2026-10-20 included):
 
-    browse -> describe        select -> select            write -> modify
+    browse -> describe        select -> select            write -> write
     create -> create          manage -> manage_grants     (never `ownership`)
 
 `manage` is `manage_grants` because Lakekeeper's `ownership` includes every data
-right, and managing a catalog must not imply reading it; dropping or renaming needs
-`write`. The owner group gets `manage_grants` and nothing else (§5.3: ownership does
-not imply select).
+right, and managing a catalog must not imply reading it. Our `write` is Lakekeeper
+0.15's `write`: data, schema and snapshot changes. Dropping or renaming a table needs
+Lakekeeper's `modify`, which no verb maps to — in v0.4 that is the platform
+administrator's action (`project_admin`, platform#1130). The owner group gets
+`manage_grants` and nothing else (§5.3: ownership does not imply select).
 
 The sync owns only what it created: roles whose description starts with
 `stardelt group `, nothing else — a role with a foreign description is reported as a
@@ -137,7 +139,7 @@ authorization questions from it, so `SHOW CATALOGS` and every query stop paying
 objects this job writes to Lakekeeper and is an ACCELERATOR only: the bridge
 falls back to Lakekeeper when it is stale, when a catalog is missing from it, or
 when that catalog carries a foreign grant (`drift`). The verb implications are
-applied here, once (Lakekeeper's model: `modify` implies `select` implies
+applied here, once (Lakekeeper's model: `write` implies `select` implies
 `describe`, `create` implies `describe`), and every list holds the exact string
 Trino sends as the user — the Keycloak `sub`, or a bare `STATIC_ASSIGNEES`
 principal (`superset`) without the `oidc~` prefix. A failed push is logged and
@@ -245,15 +247,18 @@ WAREHOUSE_GROUP_PREFIX = "wh-"
 # Our verbs (design §5.2) as Lakekeeper relations on the warehouse object. `manage`
 # is `manage_grants`, never `ownership`: ownership includes all data rights, and
 # managing a catalog must not imply reading it (architect decision 2026-10-20).
+# Our `write` is Lakekeeper 0.15's `write`: data, schema and snapshot changes, not
+# drop or rename (that is `modify`, platform#1130). Drop and rename stay with
+# platform administrators (`project_admin`) in v0.4.
 VERB_RELATIONS = {
     "browse": "describe",
     "select": "select",
-    "write": "modify",
+    "write": "write",
     "create": "create",
     "manage": "manage_grants",
 }
 
-# What each verb implies in Lakekeeper's OpenFGA model (`modify` implies `select`
+# What each verb implies in Lakekeeper's OpenFGA model (`write` implies `select`
 # implies `describe`; `create` implies `describe`). The catalog decision table
 # stores the *effective* verbs, so the bridge's policy needs no second copy of
 # this and cannot drift from it. `manage` is absent on purpose: `manage_grants`
