@@ -284,12 +284,21 @@ pub fn service(namespace: &str) -> Service {
         spec: Some(ServiceSpec {
             type_: Some("ClusterIP".into()),
             selector: Some(name_selector()),
-            ports: Some(vec![ServicePort {
-                name: Some("http".into()),
-                port: 8080,
-                target_port: Some(IntOrString::String("http".into())),
-                ..ServicePort::default()
-            }]),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("http".into()),
+                    port: 8080,
+                    target_port: Some(IntOrString::String("http".into())),
+                    ..ServicePort::default()
+                },
+                // Prometheus text on the management port (#607); the ingress never exposes 9000.
+                ServicePort {
+                    name: Some("metrics".into()),
+                    port: 9000,
+                    target_port: Some(IntOrString::String("management".into())),
+                    ..ServicePort::default()
+                },
+            ]),
             ..ServiceSpec::default()
         }),
         ..Service::default()
@@ -381,6 +390,8 @@ fn container() -> Container {
             value_env("KC_HTTP_ENABLED", "true"),
             value_env("KC_PROXY_HEADERS", "xforwarded"),
             value_env("KC_HEALTH_ENABLED", "true"),
+            // Prometheus text on the management port (#607).
+            value_env("KC_METRICS_ENABLED", "true"),
             value_env("KC_CACHE", "local"),
             value_env(
                 "JAVA_OPTS_KC_HEAP",
@@ -618,12 +629,18 @@ mod tests {
         assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
         assert_eq!(spec.selector.unwrap()["app.kubernetes.io/name"], "keycloak");
         let ports = spec.ports.expect("ports");
-        assert_eq!(ports.len(), 1, "the management port is not exposed");
+        assert_eq!(ports.len(), 2);
         assert_eq!(ports[0].name.as_deref(), Some("http"));
         assert_eq!(ports[0].port, 8080);
         assert_eq!(
             ports[0].target_port,
             Some(IntOrString::String("http".into()))
+        );
+        assert_eq!(ports[1].name.as_deref(), Some("metrics"));
+        assert_eq!(ports[1].port, 9000);
+        assert_eq!(
+            ports[1].target_port,
+            Some(IntOrString::String("management".into()))
         );
     }
 
@@ -782,6 +799,7 @@ mod tests {
                 ("KC_HTTP_ENABLED", Some("true")),
                 ("KC_PROXY_HEADERS", Some("xforwarded")),
                 ("KC_HEALTH_ENABLED", Some("true")),
+                ("KC_METRICS_ENABLED", Some("true")),
                 ("KC_CACHE", Some("local")),
                 (
                     "JAVA_OPTS_KC_HEAP",
