@@ -462,6 +462,22 @@ mod tests {
             Value::String(oidc.into())
         );
 
+        // The snippet is discovery-driven (#611): the provider's document names the
+        // three endpoints, and a provider outage falls back to the realm layout
+        // instead of stopping the hub.
+        assert!(
+            oidc.contains(".well-known/openid-configuration"),
+            "the snippet must fetch the discovery document"
+        );
+        assert!(
+            oidc.contains("authorization_endpoint"),
+            "the snippet must read authorization_endpoint from the document"
+        );
+        assert!(
+            oidc.contains("STARDELT_HUB_OAUTH_CALLBACK_URL"),
+            "the snippet must still derive the public callback"
+        );
+
         // The file is the whole of the curation: everything the operator applies
         // is the file plus the one injected snippet.
         let mut expected = file;

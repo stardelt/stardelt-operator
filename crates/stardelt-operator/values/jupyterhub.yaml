@@ -9,7 +9,7 @@ hub:
       auth_state_groups_key: oauth_user.groups
       auto_login: true
       client_id: jupyterhub
-      login_service: Keycloak
+      login_service: Single sign-on
       manage_groups: true
       scope:
       - openid

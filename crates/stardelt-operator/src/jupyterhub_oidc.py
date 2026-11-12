@@ -1,12 +1,32 @@
+import json
 import os
+import urllib.request
 
-# Keycloak's endpoints are derived from the identity contract's issuer URL
-# (https://id.<baseDomain>/realms/stardelt), never written into this file.
+# The endpoints come from the provider's discovery document
+# (<issuer>/.well-known/openid-configuration), never written into this
+# file. The fallback below is the realm layout, used only while the provider is
+# down — the hub must still start.
 _issuer = os.environ.get("STARDELT_OIDC_ISSUER_URL", "").rstrip("/")
 if _issuer:
-    c.GenericOAuthenticator.authorize_url = _issuer + "/protocol/openid-connect/auth"
-    c.GenericOAuthenticator.token_url = _issuer + "/protocol/openid-connect/token"
-    c.GenericOAuthenticator.userdata_url = _issuer + "/protocol/openid-connect/userinfo"
+    _endpoints = {
+        "authorize_url": _issuer + "/protocol/openid-connect/auth",
+        "token_url": _issuer + "/protocol/openid-connect/token",
+        "userdata_url": _issuer + "/protocol/openid-connect/userinfo",
+    }
+    try:
+        _url = _issuer + "/.well-known/openid-configuration"
+        with urllib.request.urlopen(_url, timeout=10) as _response:
+            _document = json.load(_response)
+        _endpoints = {
+            "authorize_url": _document["authorization_endpoint"],
+            "token_url": _document["token_endpoint"],
+            "userdata_url": _document["userinfo_endpoint"],
+        }
+    except Exception as _error:  # the hub must still start when the provider is down
+        print(f"stardelt: OIDC discovery at {_issuer} failed, keeping the realm-style endpoints: {_error}")
+    c.GenericOAuthenticator.authorize_url = _endpoints["authorize_url"]
+    c.GenericOAuthenticator.token_url = _endpoints["token_url"]
+    c.GenericOAuthenticator.userdata_url = _endpoints["userdata_url"]
 
 # The callback Keycloak must be told is the *public* one. Left to itself the
 # hub advertises http://proxy-public/hub/oauth_callback — its internal service
