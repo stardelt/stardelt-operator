@@ -67,9 +67,11 @@ pub async fn run() -> anyhow::Result<()> {
     // pod (`cargo run`) there is no POD_NAME and every controller starts at once.
     if let Some((pod, namespace)) = crate::leader::identity() {
         crate::leader::acquire(client.clone(), &namespace, &pod).await?;
+        crate::metrics::set_leader(true);
         let renewer = client.clone();
         tokio::spawn(async move {
             let reason = crate::leader::keep(renewer, namespace, pod).await;
+            crate::metrics::set_leader(false);
             tracing::error!(reason = %reason, "lost the leader lease; exiting so another replica leads");
             std::process::exit(1);
         });
@@ -1986,6 +1988,7 @@ async fn reconcile_platform(
 }
 
 pub(crate) fn error_policy<K>(_obj: Arc<K>, err: &kube::Error, _ctx: Arc<Context>) -> Action {
+    crate::metrics::record_reconcile_error();
     tracing::warn!(error = %err, "reconcile failed");
     Action::requeue(Duration::from_secs(30))
 }
