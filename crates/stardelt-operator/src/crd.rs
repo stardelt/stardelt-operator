@@ -223,6 +223,10 @@ pub struct IdentityClient {
         "message": "external mode needs issuerUrl"
     },
     {
+        "rule": "self.mode != 'external' || has(self.tokenEndpoint)",
+        "message": "external mode needs tokenEndpoint"
+    },
+    {
         "rule": "self.mode != 'external' || has(self.apiAudience)",
         "message": "external mode needs apiAudience"
     },
@@ -246,6 +250,17 @@ pub struct IdentitySpec {
     /// from `baseDomain` and must be left out.
     #[serde(default, rename = "issuerUrl", skip_serializing_if = "Option::is_none")]
     pub issuer_url: Option<String>,
+    /// `external` only: the provider's OAuth2 token endpoint — `token_endpoint` in
+    /// `<issuerUrl>/.well-known/openid-configuration`. Required for `external`: neither the
+    /// operator (API-server proxy only) nor Helm can fetch an external discovery document.
+    /// A `platform` instance derives it from the Keycloak it deploys and must leave it out.
+    #[serde(
+        default,
+        rename = "tokenEndpoint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(min = 1, max = 512), regex(pattern = r"^https://\S+$"))]
+    pub token_endpoint: Option<String>,
     /// `external` only: which kind of provider this instance talks to.
     #[serde(default)]
     pub provider: IdentityProvider,
@@ -288,6 +303,7 @@ impl Default for IdentitySpec {
         Self {
             mode: IdentityMode::None,
             issuer_url: None,
+            token_endpoint: None,
             provider: IdentityProvider::Oidc,
             api_audience: None,
             clients: BTreeMap::new(),
@@ -466,6 +482,10 @@ fn group_list_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::S
     {
         "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode != 'platform' || !has(self.identity.issuerUrl)",
         "message": "identity.mode platform derives the issuer from baseDomain; leave identity.issuerUrl out"
+    },
+    {
+        "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode != 'platform' || !has(self.identity.tokenEndpoint)",
+        "message": "identity.mode platform derives the token endpoint from the issuer; leave identity.tokenEndpoint out"
     },
     {
         "rule": "!has(self.identity) || !has(self.identity.mode) || self.identity.mode == 'none' || has(self.baseDomain)",

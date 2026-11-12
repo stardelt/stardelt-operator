@@ -56,6 +56,12 @@ pub fn validate(spec: &PlatformInstanceSpec) -> Result<(), IdentityError> {
                     .into(),
             ));
         }
+        if identity.mode == IdentityMode::Platform && identity.token_endpoint.is_some() {
+            return Err(IdentityError(
+                "identity.mode platform derives the token endpoint from the issuer; leave identity.tokenEndpoint out"
+                    .into(),
+            ));
+        }
         return Ok(());
     }
     let url = identity
@@ -65,6 +71,15 @@ pub fn validate(spec: &PlatformInstanceSpec) -> Result<(), IdentityError> {
     if !url.starts_with("https://") {
         return Err(IdentityError(
             "identity.issuerUrl must be an https:// URL".into(),
+        ));
+    }
+    let endpoint = identity
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| IdentityError("external mode needs tokenEndpoint".into()))?;
+    if !endpoint.starts_with("https://") {
+        return Err(IdentityError(
+            "identity.tokenEndpoint must be an https:// URL".into(),
         ));
     }
     if identity.api_audience.is_none() {
@@ -127,6 +142,26 @@ pub fn issuer_url(spec: &PlatformInstanceSpec) -> Result<Option<String>, Identit
     }
 }
 
+/// The OAuth2 token endpoint components exchange client credentials at: derived for
+/// `platform` (the Keycloak this platform deploys), given for `external`.
+pub fn token_endpoint(spec: &PlatformInstanceSpec) -> Result<Option<String>, IdentityError> {
+    let Some(issuer) = issuer_url(spec)? else {
+        return Ok(None);
+    };
+    let endpoint = match spec.identity.mode {
+        IdentityMode::External => spec
+            .identity
+            .token_endpoint
+            .clone()
+            .ok_or_else(|| IdentityError("external mode needs tokenEndpoint".into()))?,
+        _ => format!(
+            "{}/protocol/openid-connect/token",
+            issuer.trim_end_matches('/')
+        ),
+    };
+    Ok(Some(endpoint))
+}
+
 /// The base domain of the instance, or the reason it cannot be used. `keycloak.rs` renders the
 /// realm hosts and `KC_HOSTNAME` from the same value.
 pub(crate) fn base_domain(spec: &PlatformInstanceSpec) -> Result<&str, IdentityError> {
@@ -180,9 +215,13 @@ pub fn contract(
     let Some(issuer) = issuer_url(spec)? else {
         return Ok(None);
     };
+    let Some(endpoint) = token_endpoint(spec)? else {
+        return Ok(None);
+    };
     let domain = base_domain(spec)?;
     let mut data = BTreeMap::from([
         ("issuerUrl".to_string(), issuer),
+        ("tokenEndpoint".to_string(), endpoint),
         (
             "groupClaim".to_string(),
             spec.identity.effective_group_claim().to_string(),
@@ -286,6 +325,7 @@ mod tests {
         IdentitySpec {
             mode: IdentityMode::External,
             issuer_url: Some(url.into()),
+            token_endpoint: Some(format!("{}/token", url.trim_end_matches('/'))),
             api_audience: Some("api://stardelt".into()),
             clients: BTreeMap::from([(
                 "nova".to_string(),
@@ -530,6 +570,10 @@ mod tests {
             data["issuerUrl"],
             "https://id.alpha.dev.stardelt.io/realms/stardelt"
         );
+        assert_eq!(
+            data["tokenEndpoint"],
+            "https://id.alpha.dev.stardelt.io/realms/stardelt/protocol/openid-connect/token"
+        );
         assert_eq!(data["publicUrl"], "https://alpha.dev.stardelt.io");
         assert_eq!(data["authMode"], "oidc");
         assert_eq!(data["groupClaim"], "groups");
@@ -564,6 +608,10 @@ mod tests {
             data["issuerUrl"],
             "https://login.microsoftonline.com/tenant-id/v2.0"
         );
+        assert_eq!(
+            data["tokenEndpoint"],
+            "https://login.microsoftonline.com/tenant-id/v2.0/token"
+        );
         assert_eq!(data["publicUrl"], "https://data.example.com");
     }
 
@@ -596,6 +644,31 @@ mod tests {
     }
 
     #[test]
+    fn an_external_instance_without_a_token_endpoint_is_refused() {
+        let mut no_endpoint = external("https://idp.example.com");
+        no_endpoint.token_endpoint = None;
+        assert_eq!(
+            err(&spec(no_endpoint, Some("d.example.com"))),
+            "external mode needs tokenEndpoint"
+        );
+    }
+
+    #[test]
+    fn a_platform_instance_must_not_write_the_token_endpoint() {
+        let mut platform = IdentitySpec {
+            mode: IdentityMode::Platform,
+            token_endpoint: Some("https://elsewhere.example.com/token".into()),
+            ..IdentitySpec::default()
+        };
+        assert_eq!(
+            err(&spec(platform.clone(), Some("d.example.com"))),
+            "identity.mode platform derives the token endpoint from the issuer; leave identity.tokenEndpoint out"
+        );
+        platform.token_endpoint = None;
+        assert_eq!(validate(&spec(platform, Some("d.example.com"))), Ok(()));
+    }
+
+    #[test]
     fn the_config_map_is_named_labelled_and_carries_the_contract() {
         let s = spec(
             external("https://idp.example.com"),
@@ -611,7 +684,9 @@ mod tests {
             cm.metadata.owner_references.is_none(),
             "uninstalling keeps the contract"
         );
-        assert_eq!(cm.data.unwrap()["issuerUrl"], "https://idp.example.com");
+        let data = cm.data.unwrap();
+        assert_eq!(data["issuerUrl"], "https://idp.example.com");
+        assert_eq!(data["tokenEndpoint"], "https://idp.example.com/token");
     }
 
     #[test]
