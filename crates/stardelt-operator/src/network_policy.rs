@@ -52,6 +52,19 @@ fn peer(labels: &[(&str, &str)]) -> NetworkPolicyPeer {
     }
 }
 
+/// The same pod labels in **any** namespace: the customer's Prometheus lives in its
+/// own namespace, and a peer without a namespace selector matches only this policy's
+/// namespace (stardelt-operator#607).
+fn peer_any_namespace(labels: &[(&str, &str)]) -> NetworkPolicyPeer {
+    NetworkPolicyPeer {
+        namespace_selector: Some(LabelSelector {
+            match_labels: None,
+            match_expressions: None,
+        }),
+        ..peer(labels)
+    }
+}
+
 /// The same peer, with keys and values the caller builds (a group label key carries the
 /// group's own name).
 fn peer_owned(labels: Vec<(&str, String)>) -> NetworkPolicyPeer {
@@ -199,6 +212,8 @@ fn port(number: i32) -> NetworkPolicyPort {
 
 /// Ingress to the serving Lakekeeper pod only: the chart's db-migration Job carries
 /// `name=lakekeeper` too, and `component=catalog` keeps migrations (Postgres only) out.
+/// Callers are same-namespace; the metrics scraper is the one read-only peer from any
+/// namespace (stardelt-operator#607).
 pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
     NetworkPolicy {
         metadata: meta(LAKEKEEPER_POLICY, namespace),
@@ -243,6 +258,15 @@ pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
                     ]),
                     ports: Some(vec![port(8282)]),
                 },
+                NetworkPolicyIngressRule {
+                    // The metrics endpoint (9000): read-only, so the customer's Prometheus may
+                    // scrape it from its own namespace.
+                    from: Some(vec![peer_any_namespace(&[(
+                        "app.kubernetes.io/name",
+                        "prometheus",
+                    )])]),
+                    ports: Some(vec![port(9000)]),
+                },
             ]),
             egress: None,
         }),
@@ -251,7 +275,8 @@ pub fn lakekeeper_ingress(namespace: &str) -> NetworkPolicy {
 
 /// The permission store's ingress policy: OpenFGA ships without authentication, so the
 /// network is what keeps every other pod from rewriting grants. Mirrors
-/// stardelt-platform/manifests/openfga-network-policy.yaml.
+/// stardelt-platform/manifests/openfga-network-policy.yaml. Lakekeeper is same-namespace;
+/// the metrics scraper is the one read-only peer from any namespace (stardelt-operator#607).
 pub fn openfga_ingress(namespace: &str) -> NetworkPolicy {
     NetworkPolicy {
         metadata: meta(OPENFGA_POLICY, namespace),
@@ -264,19 +289,30 @@ pub fn openfga_ingress(namespace: &str) -> NetworkPolicy {
                 match_expressions: None,
             }),
             policy_types: Some(vec!["Ingress".to_string()]),
-            ingress: Some(vec![NetworkPolicyIngressRule {
-                from: Some(vec![
-                    peer(&[
-                        ("app.kubernetes.io/name", "lakekeeper"),
-                        ("app.kubernetes.io/component", "catalog"),
+            ingress: Some(vec![
+                NetworkPolicyIngressRule {
+                    from: Some(vec![
+                        peer(&[
+                            ("app.kubernetes.io/name", "lakekeeper"),
+                            ("app.kubernetes.io/component", "catalog"),
+                        ]),
+                        peer(&[
+                            ("app.kubernetes.io/name", "lakekeeper"),
+                            ("app.kubernetes.io/component", "db-migration"),
+                        ]),
                     ]),
-                    peer(&[
-                        ("app.kubernetes.io/name", "lakekeeper"),
-                        ("app.kubernetes.io/component", "db-migration"),
-                    ]),
-                ]),
-                ports: Some(vec![port(8080), port(8081)]),
-            }]),
+                    ports: Some(vec![port(8080), port(8081)]),
+                },
+                NetworkPolicyIngressRule {
+                    // The metrics endpoint (2112): read-only, so the customer's Prometheus may
+                    // scrape it from its own namespace.
+                    from: Some(vec![peer_any_namespace(&[(
+                        "app.kubernetes.io/name",
+                        "prometheus",
+                    )])]),
+                    ports: Some(vec![port(2112)]),
+                },
+            ]),
             egress: None,
         }),
     }
@@ -380,7 +416,7 @@ mod tests {
         );
         assert!(spec.egress.is_none());
         let ingress = spec.ingress.as_ref().unwrap();
-        assert_eq!(ingress.len(), 1);
+        assert_eq!(ingress.len(), 2);
         let rule = &ingress[0];
         let peers = rule.from.as_ref().unwrap();
         assert_eq!(peers.len(), 2);
@@ -493,6 +529,44 @@ mod tests {
         assert_eq!(policy.metadata.name.as_deref(), Some(SEAWEEDFS_POLICY));
         assert_eq!(policy.metadata.namespace.as_deref(), Some("data"));
         assert!(policy.metadata.owner_references.is_none());
+    }
+
+    /// A scrape rule's only peer: the Prometheus pod labels in any namespace, and one TCP port.
+    fn assert_scrape_rule(rule: &NetworkPolicyIngressRule, expected_port: i32) {
+        let peers = rule.from.as_ref().expect("peers");
+        assert_eq!(peers.len(), 1, "{peers:?}");
+        let scraper = &peers[0];
+        let ns = scraper
+            .namespace_selector
+            .as_ref()
+            .expect("any-namespace selector");
+        assert!(ns.match_labels.is_none(), "{ns:?}");
+        assert!(ns.match_expressions.is_none(), "{ns:?}");
+        assert!(scraper.ip_block.is_none());
+        assert_eq!(
+            owner_labels(scraper),
+            BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "prometheus".to_string()
+            )])
+        );
+        assert_eq!(rule.ports.as_ref().unwrap(), &vec![port(expected_port)]);
+    }
+
+    #[test]
+    fn openfga_policy_admits_a_prometheus_scraper_on_2112() {
+        let policy = openfga_ingress("data");
+        let ingress = policy.spec.as_ref().unwrap().ingress.as_ref().unwrap();
+        assert_eq!(ingress.len(), 2);
+        assert_scrape_rule(&ingress[1], 2112);
+    }
+
+    #[test]
+    fn lakekeeper_policy_admits_a_prometheus_scraper_on_9000() {
+        let policy = lakekeeper_ingress("data");
+        let ingress = policy.spec.as_ref().unwrap().ingress.as_ref().unwrap();
+        assert_eq!(ingress.len(), 3);
+        assert_scrape_rule(&ingress[2], 9000);
     }
 
     fn owner_labels(peer: &NetworkPolicyPeer) -> BTreeMap<String, String> {
