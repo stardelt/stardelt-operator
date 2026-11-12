@@ -319,6 +319,11 @@ mod tests {
         );
         assert_eq!(o["image"]["tag"], serde_json::json!("v1.22.1"));
         assert_eq!(
+            o["telemetry"]["metrics"]["enabled"],
+            serde_json::json!(true),
+            "the customer's Prometheus scrapes 2112 (#607)"
+        );
+        assert_eq!(
             o["livenessProbe"]["enabled"],
             serde_json::json!(false),
             "a liveness probe turns a node stall into a restart, and a restart into a catalog outage"
@@ -339,6 +344,10 @@ mod tests {
         assert_eq!(
             o["resources"]["requests"]["memory"],
             serde_json::json!("128Mi")
+        );
+        assert_eq!(
+            o["telemetry"]["metrics"]["enabled"],
+            serde_json::json!(true)
         );
     }
 
@@ -983,6 +992,11 @@ mod tests {
             serde_json::json!("lakekeeper-pg-app")
         );
         assert_eq!(l["authz"]["backend"], serde_json::json!("allowall"));
+        assert_eq!(
+            l["catalog"]["prometheus"]["setScrapeAnnotations"],
+            serde_json::json!(true),
+            "the chart adds the metrics port (9000) and the scrape annotations (#607)"
+        );
     }
 
     #[test]

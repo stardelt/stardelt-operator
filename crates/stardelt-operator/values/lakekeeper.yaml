@@ -18,3 +18,8 @@ externalDatabase:
 authz:
   backend: allowall
 internalOpenFGA: false
+catalog:
+  prometheus:
+    # The chart adds a `metrics` port (9000) to the `lakekeeper` Service and the
+    # scrape annotations to the pod; the metrics server itself is always on (#607).
+    setScrapeAnnotations: true

@@ -52,9 +52,11 @@ resources:
 livenessProbe:
   enabled: false
 
-# No tracing, no metrics: nothing scrapes this release yet.
+# No tracing. Metrics are on: the store is load-bearing (a store that cannot answer denies
+# every catalog read), the customer's Prometheus scrapes 2112, so its restarts and 503s are
+# visible before somebody notices through a dashboard (stardelt-operator#607).
 telemetry:
   trace:
     enabled: false
   metrics:
-    enabled: false
+    enabled: true
