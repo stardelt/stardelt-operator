@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-use k8s_openapi::{NamespaceResourceScope, apimachinery::pkg::apis::meta::v1::OwnerReference};
+use k8s_openapi::{
+    ClusterResourceScope, NamespaceResourceScope, apimachinery::pkg::apis::meta::v1::OwnerReference,
+};
 use kube::{
     Api, Client, Resource, ResourceExt,
     api::{DynamicObject, Patch, PatchParams},
@@ -92,6 +94,22 @@ where
         + Debug,
 {
     Api::<K>::namespaced(client.clone(), namespace)
+        .patch(&object.name_any(), &params(dry_run), &Patch::Apply(object))
+        .await
+}
+
+/// Server-side apply of a typed cluster-scoped object (the Spark Connect pod
+/// guard). `apply` above is namespaced only; `apply_dynamic_cluster` covers
+/// objects we have no Rust type for.
+pub async fn apply_cluster<K>(client: &Client, object: &K, dry_run: bool) -> Result<K, kube::Error>
+where
+    K: Resource<Scope = ClusterResourceScope, DynamicType = ()>
+        + Clone
+        + DeserializeOwned
+        + Serialize
+        + Debug,
+{
+    Api::<K>::all(client.clone())
         .patch(&object.name_any(), &params(dry_run), &Patch::Apply(object))
         .await
 }
