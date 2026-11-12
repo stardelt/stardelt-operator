@@ -37,7 +37,7 @@ use crate::helm::{
     CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned, manifest_args,
     rendered_workloads,
 };
-use crate::objects::cnpg_cluster_resource;
+use crate::objects::{cnpg_cluster_resource, platform_owner};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
 use crate::prerequisites::{CATALOG_CLUSTER, NOVA_CLUSTER};
 use crate::principal::reconcile_principal;
@@ -1753,6 +1753,10 @@ async fn reconcile_platform(
     // uninstalled. A paused instance may have applied them; a dry-run one never did, and its
     // delete branch above removes the finalizer without a Helm call.
     ensure_platform_finalizer(&ctx, &instance).await?;
+
+    // The bare workloads carry this reference, so the garbage collector removes them with
+    // the instance (D18). Secrets, PVCs and the CNPG Clusters never get it.
+    let owner = platform_owner(&instance);
     if instance.spec.cluster_operation.reconciliation_paused {
         let phase = "Paused";
         let prev = instance
@@ -1897,7 +1901,7 @@ async fn reconcile_platform(
     }
     // The workload that serves the realm comes next: it reads the database and the
     // identity Secrets, and the contract below advertises its issuer.
-    if let Some(keycloak) = ensure_keycloak(&ctx, &instance.spec).await {
+    if let Some(keycloak) = ensure_keycloak(&ctx, &instance.spec, &owner).await {
         outcome.components.push(keycloak);
     }
     // The identity contract is published after the components it points the others to.
@@ -1932,11 +1936,11 @@ async fn reconcile_platform(
     if let Some(events) = ensure_nova_events(&ctx, &instance.spec).await {
         outcome.components.push(events);
     }
-    if let Some(nova) = ensure_nova(&ctx, &instance.spec).await {
+    if let Some(nova) = ensure_nova(&ctx, &instance.spec, &owner).await {
         outcome.components.push(nova);
     }
     // The Ingress objects come last: they route to the Services above.
-    if let Some(ingress) = ensure_ingress(&ctx, &instance.spec).await {
+    if let Some(ingress) = ensure_ingress(&ctx, &instance.spec, &owner).await {
         outcome.components.push(ingress);
     }
     let phase = phase(instance.spec.dry_run, &outcome);

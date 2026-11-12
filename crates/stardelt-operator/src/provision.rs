@@ -13,6 +13,7 @@ use k8s_openapi::{
         networking::v1::{Ingress, NetworkPolicy},
         rbac::v1::{Role, RoleBinding},
     },
+    apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
     Api, ResourceExt,
@@ -32,7 +33,7 @@ use crate::{
     objects::{
         apply, apply_dynamic, apply_dynamic_cluster, cert_manager_certificate_resource,
         cert_manager_issuer_resource, cnpg_cluster_resource, cnpg_scheduled_backup_resource,
-        kafka_node_pool_resource, kafka_resource, labels, owner_reference,
+        kafka_node_pool_resource, kafka_resource, labels, own, owner_reference,
     },
     pg_dump,
     prerequisites::{
@@ -1252,12 +1253,35 @@ async fn patch_identity_secret(
     Ok(())
 }
 
+/// Apply a namespaced object that belongs to the platform instance: the owner reference is
+/// stamped first, so the garbage collector removes it when the instance is deleted (D18).
+/// Never call this for a Secret, a PVC or a CNPG `Cluster`/`ScheduledBackup`: those are retained.
+async fn apply_owned<K>(
+    client: &kube::Client,
+    namespace: &str,
+    owner: &OwnerReference,
+    object: &K,
+    dry_run: bool,
+) -> Result<K, kube::Error>
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope, DynamicType = ()>
+        + Clone
+        + serde::de::DeserializeOwned
+        + serde::Serialize
+        + std::fmt::Debug,
+{
+    let mut object = object.clone();
+    own(&mut object, owner);
+    apply::<K>(client, namespace, &object, dry_run).await
+}
+
 /// The Keycloak workload (realm and environment ConfigMaps, Service, Deployment) for
 /// `identity.mode: platform`. `None` in the other modes: without Keycloak nothing serves the
 /// realm. Nothing is applied until every Secret the Deployment reads exists.
 pub async fn ensure_keycloak(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "keycloak";
     if spec.identity.mode != IdentityMode::Platform {
@@ -1290,19 +1314,25 @@ pub async fn ensure_keycloak(
     };
     let deployment = keycloak::deployment(namespace);
     for config_map in [&realm, &env] {
-        if let Err(e) = apply::<ConfigMap>(&ctx.client, namespace, config_map, spec.dry_run).await {
+        if let Err(e) =
+            apply_owned::<ConfigMap>(&ctx.client, namespace, owner, config_map, spec.dry_run).await
+        {
             return Some(status(NAME, false, e.to_string()));
         }
     }
     let service = keycloak::service(namespace);
-    if let Err(e) = apply::<Service>(&ctx.client, namespace, &service, spec.dry_run).await {
+    if let Err(e) =
+        apply_owned::<Service>(&ctx.client, namespace, owner, &service, spec.dry_run).await
+    {
         return Some(status(NAME, false, e.to_string()));
     }
-    let applied = match apply::<Deployment>(&ctx.client, namespace, &deployment, spec.dry_run).await
-    {
-        Ok(applied) => applied,
-        Err(e) => return Some(status(NAME, false, e.to_string())),
-    };
+    let applied =
+        match apply_owned::<Deployment>(&ctx.client, namespace, owner, &deployment, spec.dry_run)
+            .await
+        {
+            Ok(applied) => applied,
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        };
     if spec.dry_run {
         return Some(status(
             NAME,
@@ -1962,7 +1992,11 @@ pub const NOVA_SECRETS: [&str; 3] = ["nova-pg-app", S3_SECRET, nova::SESSION_SEC
 /// Deployment. `None` without the `lakehouse` pillar. Nothing is applied until every Secret in
 /// [`NOVA_SECRETS`] exists; the identity contract, the OIDC client and the Trino CA are optional
 /// for Nova, so the workload does not wait for them.
-pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<ComponentStatus> {
+pub async fn ensure_nova(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
+) -> Option<ComponentStatus> {
     const NAME: &str = "nova";
     if !spec.pillars.lakehouse {
         return None;
@@ -1991,9 +2025,10 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
     }
     let dry_run = spec.dry_run;
     let client = &ctx.client;
-    if let Err(e) = apply::<ServiceAccount>(
+    if let Err(e) = apply_owned::<ServiceAccount>(
         client,
         namespace,
+        owner,
         &nova::service_account(namespace),
         dry_run,
     )
@@ -2002,16 +2037,20 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
         return Some(status(NAME, false, e.to_string()));
     }
     for role in nova::roles(namespace) {
-        if let Err(e) = apply::<Role>(client, namespace, &role, dry_run).await {
+        if let Err(e) = apply_owned::<Role>(client, namespace, owner, &role, dry_run).await {
             return Some(status(NAME, false, e.to_string()));
         }
     }
     for binding in nova::role_bindings(namespace) {
-        if let Err(e) = apply::<RoleBinding>(client, namespace, &binding, dry_run).await {
+        if let Err(e) =
+            apply_owned::<RoleBinding>(client, namespace, owner, &binding, dry_run).await
+        {
             return Some(status(NAME, false, e.to_string()));
         }
     }
-    if let Err(e) = apply::<Service>(client, namespace, &nova::service(namespace), dry_run).await {
+    if let Err(e) =
+        apply_owned::<Service>(client, namespace, owner, &nova::service(namespace), dry_run).await
+    {
         return Some(status(NAME, false, e.to_string()));
     }
     let deployment = nova::deployment(
@@ -2020,10 +2059,11 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
         spec.base_domain.as_deref(),
         spec.pillars.pipelines,
     );
-    let applied = match apply::<Deployment>(client, namespace, &deployment, dry_run).await {
-        Ok(applied) => applied,
-        Err(e) => return Some(status(NAME, false, e.to_string())),
-    };
+    let applied =
+        match apply_owned::<Deployment>(client, namespace, owner, &deployment, dry_run).await {
+            Ok(applied) => applied,
+            Err(e) => return Some(status(NAME, false, e.to_string())),
+        };
     if dry_run {
         return Some(status(
             NAME,
@@ -2053,7 +2093,11 @@ pub async fn ensure_nova(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<C
 /// `spec.ingress.enabled`. Nova's Ingress is left out without the `lakehouse` pillar, because
 /// Nova is not installed then. An Ingress has no readiness of its own: it is reported ready once
 /// it is applied.
-pub async fn ensure_ingress(ctx: &Context, spec: &PlatformInstanceSpec) -> Option<ComponentStatus> {
+pub async fn ensure_ingress(
+    ctx: &Context,
+    spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
+) -> Option<ComponentStatus> {
     const NAME: &str = "ingress";
     if !spec.ingress.enabled {
         return None;
@@ -2083,7 +2127,9 @@ pub async fn ensure_ingress(ctx: &Context, spec: &PlatformInstanceSpec) -> Optio
     let namespace = &spec.namespace;
     let mut names = Vec::new();
     for object in &objects {
-        if let Err(e) = apply::<Ingress>(&ctx.client, namespace, object, spec.dry_run).await {
+        if let Err(e) =
+            apply_owned::<Ingress>(&ctx.client, namespace, owner, object, spec.dry_run).await
+        {
             return Some(status(NAME, false, e.to_string()));
         }
         names.push(object.name_any());
@@ -2507,6 +2553,18 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    /// The owner reference the reconcile stamps on the platform's bare workloads.
+    fn owner() -> OwnerReference {
+        OwnerReference {
+            api_version: "stardelt.io/v1alpha1".into(),
+            kind: "PlatformInstance".into(),
+            name: "cluster".into(),
+            uid: "6f1c2e8a-0000-4000-8000-000000000001".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        }
+    }
 
     #[test]
     fn the_catalog_principal_is_a_platform_client_owned_by_admins() {
@@ -2988,7 +3046,7 @@ mod tests {
         for mode in ["none", "external"] {
             let (client, requests) = keycloak_client(&[], None);
             assert!(
-                ensure_keycloak(&context(client), &platform(mode, false))
+                ensure_keycloak(&context(client), &platform(mode, false), &owner())
                     .await
                     .is_none(),
                 "{mode}"
@@ -3004,7 +3062,7 @@ mod tests {
     async fn keycloak_waits_for_the_identity_secrets_and_applies_nothing() {
         let (client, requests) =
             keycloak_client(&["stardelt-realm-admin", "stardelt-oidc-clients"], None);
-        let status = ensure_keycloak(&context(client), &platform("platform", false))
+        let status = ensure_keycloak(&context(client), &platform("platform", false), &owner())
             .await
             .expect("a status");
         assert_eq!(status.name, "keycloak");
@@ -3022,7 +3080,7 @@ mod tests {
     #[tokio::test]
     async fn keycloak_dry_run_plans_the_config_maps_the_service_and_the_deployment() {
         let (client, requests) = keycloak_client(&[], None);
-        let status = ensure_keycloak(&context(client), &platform("platform", true))
+        let status = ensure_keycloak(&context(client), &platform("platform", true), &owner())
             .await
             .expect("a status");
         assert!(!status.ready);
@@ -3057,7 +3115,7 @@ mod tests {
     #[tokio::test]
     async fn keycloak_applies_the_workload_and_reports_it_running() {
         let (client, requests) = keycloak_client(&[], Some(1));
-        let status = ensure_keycloak(&context(client), &platform("platform", false))
+        let status = ensure_keycloak(&context(client), &platform("platform", false), &owner())
             .await
             .expect("a status");
         assert!(status.ready, "{status:?}");
@@ -3072,7 +3130,7 @@ mod tests {
     #[tokio::test]
     async fn keycloak_waits_for_its_deployment_to_become_ready() {
         let (client, _requests) = keycloak_client(&[], None);
-        let status = ensure_keycloak(&context(client), &platform("platform", false))
+        let status = ensure_keycloak(&context(client), &platform("platform", false), &owner())
             .await
             .expect("a status");
         assert!(!status.ready);
@@ -3601,9 +3659,13 @@ mod tests {
     async fn nova_exists_only_with_the_lakehouse_pillar() {
         let (client, requests) = keycloak_client(&[], Some(1));
         assert!(
-            ensure_nova(&context(client), &platform_with_lakehouse(false, false))
-                .await
-                .is_none()
+            ensure_nova(
+                &context(client),
+                &platform_with_lakehouse(false, false),
+                &owner()
+            )
+            .await
+            .is_none()
         );
         assert!(requests.lock().expect("requests poisoned").is_empty());
     }
@@ -3611,9 +3673,13 @@ mod tests {
     #[tokio::test]
     async fn nova_waits_for_its_secrets_and_applies_nothing() {
         let (client, requests) = keycloak_client(&["nova-pg-app", "stardelt-nova-session"], None);
-        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, false))
-            .await
-            .expect("a status");
+        let status = ensure_nova(
+            &context(client),
+            &platform_with_lakehouse(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert_eq!(status.name, "nova");
         assert!(!status.ready);
         assert_eq!(
@@ -3629,9 +3695,13 @@ mod tests {
     #[tokio::test]
     async fn nova_dry_run_plans_every_object_in_order() {
         let (client, requests) = keycloak_client(&[], None);
-        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, true))
-            .await
-            .expect("a status");
+        let status = ensure_nova(
+            &context(client),
+            &platform_with_lakehouse(true, true),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -3655,11 +3725,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_nova_workload_carries_the_platform_instance_owner_reference() {
+        let (client, requests) = keycloak_client(&[], None);
+        ensure_nova(
+            &context(client),
+            &platform_with_lakehouse(true, true),
+            &owner(),
+        )
+        .await
+        .expect("a status");
+        let requests = requests.lock().expect("requests poisoned");
+        let (_, _, body) = requests
+            .iter()
+            .find(|(method, path, _)| method == "PATCH" && path.ends_with("/deployments/nova"))
+            .expect("the Deployment is applied");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+        let reference = &body["metadata"]["ownerReferences"][0];
+        assert_eq!(reference["apiVersion"], json!("stardelt.io/v1alpha1"));
+        assert_eq!(reference["kind"], json!("PlatformInstance"));
+        assert_eq!(reference["name"], json!("cluster"));
+        assert_eq!(
+            reference["uid"],
+            json!("6f1c2e8a-0000-4000-8000-000000000001")
+        );
+        assert_eq!(reference["controller"], json!(true));
+    }
+
+    #[tokio::test]
     async fn nova_runs_the_pinned_image_and_reports_it_running() {
         let (client, requests) = keycloak_client(&[], Some(1));
-        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, false))
-            .await
-            .expect("a status");
+        let status = ensure_nova(
+            &context(client),
+            &platform_with_lakehouse(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(status.ready, "{status:?}");
         assert_eq!(status.message.as_deref(), Some("running"));
         let requests = requests.lock().expect("requests poisoned");
@@ -3682,9 +3783,13 @@ mod tests {
     #[tokio::test]
     async fn nova_waits_for_its_deployment_to_become_ready() {
         let (client, _requests) = keycloak_client(&[], None);
-        let status = ensure_nova(&context(client), &platform_with_lakehouse(true, false))
-            .await
-            .expect("a status");
+        let status = ensure_nova(
+            &context(client),
+            &platform_with_lakehouse(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -3695,7 +3800,7 @@ mod tests {
     #[tokio::test]
     async fn nova_links_to_the_applications_under_the_base_domain() {
         let (client, requests) = keycloak_client(&[], Some(1));
-        ensure_nova(&context(client), &platform("none", false))
+        ensure_nova(&context(client), &platform("none", false), &owner())
             .await
             .expect("a status");
         let requests = requests.lock().expect("requests poisoned");
@@ -3717,7 +3822,7 @@ mod tests {
     #[tokio::test]
     async fn nova_reads_the_jupyterhub_service_token_and_the_same_idle_timeout_as_the_culler() {
         let (client, requests) = keycloak_client(&[], Some(1));
-        ensure_nova(&context(client), &platform("none", false))
+        ensure_nova(&context(client), &platform("none", false), &owner())
             .await
             .expect("a status");
         let requests = requests.lock().expect("requests poisoned");
@@ -3784,7 +3889,7 @@ mod tests {
     async fn ingress_exists_only_when_it_is_enabled() {
         let (client, requests) = keycloak_client(&[], None);
         assert!(
-            ensure_ingress(&context(client), &platform("platform", false))
+            ensure_ingress(&context(client), &platform("platform", false), &owner())
                 .await
                 .is_none()
         );
@@ -3797,6 +3902,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_ingress("platform", true, true),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -3822,6 +3928,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_ingress("platform", true, false),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -3854,6 +3961,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_ingress("platform", false, false),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -3867,6 +3975,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_ingress("none", true, false),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -3880,6 +3989,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_ingress("none", false, false),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -3894,9 +4004,13 @@ mod tests {
     #[tokio::test]
     async fn ingress_publishes_airflow_and_jupyterhub_with_their_pillars() {
         let (client, requests) = keycloak_client(&[], None);
-        let status = ensure_ingress(&context(client), &platform_with_apps(true, true, false))
-            .await
-            .expect("a status");
+        let status = ensure_ingress(
+            &context(client),
+            &platform_with_apps(true, true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert_eq!(
             status.message.as_deref(),
             Some("applied: nova, airflow, jupyterhub")
@@ -3935,6 +4049,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_dashboards_ingress(true, false),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -3947,6 +4062,7 @@ mod tests {
         let status = ensure_ingress(
             &context(client),
             &platform_with_dashboards_ingress(false, false),
+            &owner(),
         )
         .await
         .expect("a status");
@@ -4319,7 +4435,7 @@ mod tests {
         // Everything else exists; only the Airflow password Secret is missing.
         let (client, requests) = keycloak_client(&["airflow-nova-api"], None);
         let with = platform_with_pipelines(true, false);
-        let status = ensure_nova(&context(client), &with)
+        let status = ensure_nova(&context(client), &with, &owner())
             .await
             .expect("a status");
         assert!(!status.ready);
@@ -4331,7 +4447,7 @@ mod tests {
 
         let (client, requests) = keycloak_client(&["airflow-nova-api"], Some(1));
         let without = platform_with_lakehouse(true, false);
-        let status = ensure_nova(&context(client), &without)
+        let status = ensure_nova(&context(client), &without, &owner())
             .await
             .expect("a status");
         assert!(status.ready, "{status:?}");
@@ -4341,9 +4457,13 @@ mod tests {
     #[tokio::test]
     async fn nova_points_at_airflow_when_the_pipelines_pillar_is_on() {
         let (client, requests) = keycloak_client(&[], Some(1));
-        let status = ensure_nova(&context(client), &platform_with_pipelines(true, false))
-            .await
-            .expect("a status");
+        let status = ensure_nova(
+            &context(client),
+            &platform_with_pipelines(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(status.ready, "{status:?}");
         let requests = requests.lock().expect("requests poisoned");
         let deployment = requests
