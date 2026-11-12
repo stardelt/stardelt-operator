@@ -1828,7 +1828,7 @@ async fn reconcile_platform(
     let airflow_secrets = ensure_airflow_secrets(&ctx, &instance.spec).await;
     // Superset's Secrets come before its release.
     let superset_secrets = ensure_superset_secrets(&ctx, &instance.spec).await;
-    let superset_rbac = ensure_superset_rbac(&ctx, &instance.spec).await;
+    let superset_rbac = ensure_superset_rbac(&ctx, &instance.spec, &owner).await;
     // The store's seal key comes before its release: the pod mounts Secret openbao-seal-key and the
     // static seal is what lets it unseal itself after a restart.
     let openbao_seal = ensure_openbao_seal_key(&ctx, &instance.spec).await;
@@ -1873,17 +1873,17 @@ async fn reconcile_platform(
         // Applied before the release (the pods run as its ServiceAccount); reported with the other Superset steps.
         outcome.components.push(rbac);
     }
-    if let Some(rbac) = ensure_airflow_rbac(&ctx, &instance.spec).await {
+    if let Some(rbac) = ensure_airflow_rbac(&ctx, &instance.spec, &owner).await {
         outcome.components.push(rbac);
     }
-    if let Some(job) = ensure_airflow_group_roles(&ctx, &instance.spec).await {
+    if let Some(job) = ensure_airflow_group_roles(&ctx, &instance.spec, &owner).await {
         outcome.components.push(job);
     }
     // The app databases' dumps: they read the releases' Secrets and upload with the Lakehouse keys.
-    if let Some(dumps) = ensure_pg_dumps(&ctx, &instance.spec).await {
+    if let Some(dumps) = ensure_pg_dumps(&ctx, &instance.spec, &owner).await {
         outcome.components.push(dumps);
     }
-    if let Some(job) = ensure_superset_group_roles(&ctx, &instance.spec).await {
+    if let Some(job) = ensure_superset_group_roles(&ctx, &instance.spec, &owner).await {
         outcome.components.push(job);
     }
     // The streaming bus is a CR of the operator the plan installed above (D42).
@@ -1905,7 +1905,7 @@ async fn reconcile_platform(
         outcome.components.push(keycloak);
     }
     // The identity contract is published after the components it points the others to.
-    if let Some(identity) = ensure_identity(&ctx, &instance.spec).await {
+    if let Some(identity) = ensure_identity(&ctx, &instance.spec, &owner).await {
         outcome.components.push(identity);
     }
     // The catalog's own client: created before the Lakehouse bootstrap can ask for it.
@@ -1922,7 +1922,7 @@ async fn reconcile_platform(
     if let Some(auth) = ensure_trino_auth_secrets(&ctx, &instance.spec).await {
         outcome.components.push(auth);
     }
-    if let Some(sync) = ensure_access_sync(&ctx, &instance.spec).await {
+    if let Some(sync) = ensure_access_sync(&ctx, &instance.spec, &owner).await {
         outcome.components.push(sync);
     }
     // Nova comes last: its database and its session key first, then the workload that reads

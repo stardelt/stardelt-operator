@@ -1388,6 +1388,7 @@ pub async fn ensure_superset_secrets(
 pub async fn ensure_pg_dumps(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "pg-dumps";
     if !spec.pillars.lakehouse {
@@ -1396,9 +1397,10 @@ pub async fn ensure_pg_dumps(
     let namespace = &spec.namespace;
     let mut applied = Vec::new();
     if spec.pillars.dashboards {
-        if let Err(e) = apply::<CronJob>(
+        if let Err(e) = apply_owned::<CronJob>(
             &ctx.client,
             namespace,
+            owner,
             &pg_dump::superset_cron_job(namespace),
             spec.dry_run,
         )
@@ -1409,9 +1411,10 @@ pub async fn ensure_pg_dumps(
         applied.push(pg_dump::SUPERSET_JOB);
     }
     if spec.pillars.pipelines {
-        if let Err(e) = apply::<CronJob>(
+        if let Err(e) = apply_owned::<CronJob>(
             &ctx.client,
             namespace,
+            owner,
             &pg_dump::airflow_cron_job(namespace),
             spec.dry_run,
         )
@@ -1445,15 +1448,17 @@ pub async fn ensure_pg_dumps(
 pub async fn ensure_superset_rbac(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "superset-rbac";
     if !spec.pillars.dashboards {
         return None;
     }
     let namespace = &spec.namespace;
-    if let Err(e) = apply::<ServiceAccount>(
+    if let Err(e) = apply_owned::<ServiceAccount>(
         &ctx.client,
         namespace,
+        owner,
         &superset::service_account(namespace),
         spec.dry_run,
     )
@@ -1461,9 +1466,10 @@ pub async fn ensure_superset_rbac(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<Role>(
+    if let Err(e) = apply_owned::<Role>(
         &ctx.client,
         namespace,
+        owner,
         &superset::catalog_reader_role(namespace),
         spec.dry_run,
     )
@@ -1471,9 +1477,10 @@ pub async fn ensure_superset_rbac(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<RoleBinding>(
+    if let Err(e) = apply_owned::<RoleBinding>(
         &ctx.client,
         namespace,
+        owner,
         &superset::catalog_reader_binding(namespace),
         spec.dry_run,
     )
@@ -1498,6 +1505,7 @@ pub async fn ensure_superset_rbac(
 pub async fn ensure_superset_group_roles(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "superset-group-roles";
     if !spec.pillars.dashboards {
@@ -1505,9 +1513,10 @@ pub async fn ensure_superset_group_roles(
     }
     let namespace = &spec.namespace;
     let image = superset::image();
-    if let Err(e) = apply::<ConfigMap>(
+    if let Err(e) = apply_owned::<ConfigMap>(
         &ctx.client,
         namespace,
+        owner,
         &superset::group_roles_config_map(namespace),
         spec.dry_run,
     )
@@ -1515,9 +1524,10 @@ pub async fn ensure_superset_group_roles(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<CronJob>(
+    if let Err(e) = apply_owned::<CronJob>(
         &ctx.client,
         namespace,
+        owner,
         &superset::group_roles_cron_job(namespace, &image),
         spec.dry_run,
     )
@@ -1541,15 +1551,17 @@ pub async fn ensure_superset_group_roles(
 pub async fn ensure_airflow_rbac(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "airflow-rbac";
     if !spec.pillars.pipelines {
         return None;
     }
     let namespace = &spec.namespace;
-    if let Err(e) = apply::<Role>(
+    if let Err(e) = apply_owned::<Role>(
         &ctx.client,
         namespace,
+        owner,
         &airflow::pipeline_reader_role(namespace),
         spec.dry_run,
     )
@@ -1557,9 +1569,10 @@ pub async fn ensure_airflow_rbac(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<RoleBinding>(
+    if let Err(e) = apply_owned::<RoleBinding>(
         &ctx.client,
         namespace,
+        owner,
         &airflow::pipeline_reader_binding(namespace),
         spec.dry_run,
     )
@@ -1582,6 +1595,7 @@ pub async fn ensure_airflow_rbac(
 pub async fn ensure_airflow_group_roles(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "airflow-group-roles";
     if !spec.pillars.pipelines {
@@ -1589,9 +1603,10 @@ pub async fn ensure_airflow_group_roles(
     }
     let namespace = &spec.namespace;
     let image = airflow::image();
-    if let Err(e) = apply::<ServiceAccount>(
+    if let Err(e) = apply_owned::<ServiceAccount>(
         &ctx.client,
         namespace,
+        owner,
         &airflow::group_roles_service_account(namespace),
         spec.dry_run,
     )
@@ -1599,9 +1614,10 @@ pub async fn ensure_airflow_group_roles(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<ConfigMap>(
+    if let Err(e) = apply_owned::<ConfigMap>(
         &ctx.client,
         namespace,
+        owner,
         &airflow::group_roles_config_map(namespace),
         spec.dry_run,
     )
@@ -1609,9 +1625,10 @@ pub async fn ensure_airflow_group_roles(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<RoleBinding>(
+    if let Err(e) = apply_owned::<RoleBinding>(
         &ctx.client,
         namespace,
+        owner,
         &airflow::group_roles_binding(namespace),
         spec.dry_run,
     )
@@ -1619,9 +1636,10 @@ pub async fn ensure_airflow_group_roles(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<CronJob>(
+    if let Err(e) = apply_owned::<CronJob>(
         &ctx.client,
         namespace,
+        owner,
         &airflow::group_roles_cron_job(namespace, &image),
         spec.dry_run,
     )
@@ -1896,6 +1914,7 @@ fn password_db_line(password: &str) -> String {
 pub async fn ensure_access_sync(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "access-sync";
     if spec.identity.mode != IdentityMode::Platform {
@@ -1916,9 +1935,10 @@ pub async fn ensure_access_sync(
             Err(e) => return Some(status(NAME, false, e.to_string())),
         }
     }
-    if let Err(e) = apply::<ServiceAccount>(
+    if let Err(e) = apply_owned::<ServiceAccount>(
         &ctx.client,
         namespace,
+        owner,
         &access_sync::service_account(namespace),
         spec.dry_run,
     )
@@ -1926,9 +1946,10 @@ pub async fn ensure_access_sync(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<ConfigMap>(
+    if let Err(e) = apply_owned::<ConfigMap>(
         &ctx.client,
         namespace,
+        owner,
         &access_sync::script_config_map(namespace),
         spec.dry_run,
     )
@@ -1936,9 +1957,10 @@ pub async fn ensure_access_sync(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<Role>(
+    if let Err(e) = apply_owned::<Role>(
         &ctx.client,
         namespace,
+        owner,
         &access_sync::role(namespace),
         spec.dry_run,
     )
@@ -1946,9 +1968,10 @@ pub async fn ensure_access_sync(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<RoleBinding>(
+    if let Err(e) = apply_owned::<RoleBinding>(
         &ctx.client,
         namespace,
+        owner,
         &access_sync::binding(namespace),
         spec.dry_run,
     )
@@ -1956,9 +1979,10 @@ pub async fn ensure_access_sync(
     {
         return Some(status(NAME, false, e.to_string()));
     }
-    if let Err(e) = apply::<CronJob>(
+    if let Err(e) = apply_owned::<CronJob>(
         &ctx.client,
         namespace,
+        owner,
         &access_sync::cron_job(namespace, &spec.identity.admin_group),
         spec.dry_run,
     )
@@ -2150,6 +2174,7 @@ pub async fn ensure_ingress(
 pub async fn ensure_identity(
     ctx: &Context,
     spec: &PlatformInstanceSpec,
+    owner: &OwnerReference,
 ) -> Option<ComponentStatus> {
     const NAME: &str = "identity";
     if spec.identity.mode == IdentityMode::None {
@@ -2164,7 +2189,9 @@ pub async fn ensure_identity(
         return Some(status(NAME, false, "planned (dry-run)"));
     }
     Some(
-        match apply::<ConfigMap>(&ctx.client, &spec.namespace, &config_map, false).await {
+        match apply_owned::<ConfigMap>(&ctx.client, &spec.namespace, owner, &config_map, false)
+            .await
+        {
             Ok(_) => status(
                 NAME,
                 true,
@@ -4187,8 +4214,12 @@ mod tests {
         let ctx = context(client);
         let spec = platform_with_pipelines(false, false);
         assert!(ensure_airflow_secrets(&ctx, &spec).await.is_none());
-        assert!(ensure_airflow_rbac(&ctx, &spec).await.is_none());
-        assert!(ensure_airflow_group_roles(&ctx, &spec).await.is_none());
+        assert!(ensure_airflow_rbac(&ctx, &spec, &owner()).await.is_none());
+        assert!(
+            ensure_airflow_group_roles(&ctx, &spec, &owner())
+                .await
+                .is_none()
+        );
         assert!(requests.lock().expect("requests poisoned").is_empty());
     }
 
@@ -4234,14 +4265,14 @@ mod tests {
         let (client, _requests) = keycloak_client(&[], None);
         let ctx = context(client);
         assert!(
-            ensure_pg_dumps(&ctx, &platform_with_dashboards(false, false))
+            ensure_pg_dumps(&ctx, &platform_with_dashboards(false, false), &owner())
                 .await
                 .is_none()
         );
         let (client, requests) = keycloak_client(&[], None);
         let mut spec = platform_with_apps(false, false, false);
         spec.pillars.dashboards = true;
-        let status = ensure_pg_dumps(&context(client), &spec)
+        let status = ensure_pg_dumps(&context(client), &spec, &owner())
             .await
             .expect("a status");
         assert_eq!(status.message.as_deref(), Some("applied: superset-pg-dump"));
@@ -4253,7 +4284,7 @@ mod tests {
         let (client, requests) = keycloak_client(&[], None);
         let mut spec = platform_with_apps(true, false, false);
         spec.pillars.dashboards = true;
-        let status = ensure_pg_dumps(&context(client), &spec)
+        let status = ensure_pg_dumps(&context(client), &spec, &owner())
             .await
             .expect("a status");
         assert_eq!(
@@ -4275,7 +4306,7 @@ mod tests {
         let (client, _requests) = keycloak_client(&[], None);
         let mut spec = platform_with_apps(true, false, true);
         spec.pillars.dashboards = true;
-        let status = ensure_pg_dumps(&context(client), &spec)
+        let status = ensure_pg_dumps(&context(client), &spec, &owner())
             .await
             .expect("a status");
         assert!(
@@ -4293,17 +4324,25 @@ mod tests {
         let (client, _store, requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
         let spec = platform_with_dashboards(false, false);
-        assert!(ensure_superset_rbac(&ctx, &spec).await.is_none());
-        assert!(ensure_superset_group_roles(&ctx, &spec).await.is_none());
+        assert!(ensure_superset_rbac(&ctx, &spec, &owner()).await.is_none());
+        assert!(
+            ensure_superset_group_roles(&ctx, &spec, &owner())
+                .await
+                .is_none()
+        );
         assert!(requests.lock().expect("requests poisoned").is_empty());
     }
 
     #[tokio::test]
     async fn superset_rbac_applies_the_service_account_role_and_binding() {
         let (client, requests) = keycloak_client(&[], None);
-        let status = ensure_superset_rbac(&context(client), &platform_with_dashboards(true, false))
-            .await
-            .expect("a status");
+        let status = ensure_superset_rbac(
+            &context(client),
+            &platform_with_dashboards(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(status.ready, "{status:?}");
         assert_eq!(status.name, "superset-rbac");
         assert_eq!(status.message.as_deref(), Some("applied: superset-rbac"));
@@ -4322,10 +4361,13 @@ mod tests {
     #[tokio::test]
     async fn superset_group_roles_applies_the_config_map_and_cron_job() {
         let (client, requests) = keycloak_client(&[], None);
-        let status =
-            ensure_superset_group_roles(&context(client), &platform_with_dashboards(true, false))
-                .await
-                .expect("a status");
+        let status = ensure_superset_group_roles(
+            &context(client),
+            &platform_with_dashboards(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(status.ready, "{status:?}");
         assert_eq!(
             status.message.as_deref(),
@@ -4345,10 +4387,13 @@ mod tests {
     #[tokio::test]
     async fn superset_group_roles_dry_run_says_planned_and_is_not_ready() {
         let (client, _requests) = keycloak_client(&[], None);
-        let status =
-            ensure_superset_group_roles(&context(client), &platform_with_dashboards(true, true))
-                .await
-                .expect("a status");
+        let status = ensure_superset_group_roles(
+            &context(client),
+            &platform_with_dashboards(true, true),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -4359,9 +4404,13 @@ mod tests {
     #[tokio::test]
     async fn airflow_rbac_applies_the_role_then_its_binding() {
         let (client, requests) = keycloak_client(&[], None);
-        let status = ensure_airflow_rbac(&context(client), &platform_with_pipelines(true, false))
-            .await
-            .expect("a status");
+        let status = ensure_airflow_rbac(
+            &context(client),
+            &platform_with_pipelines(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(status.ready, "{status:?}");
         assert_eq!(status.name, "airflow-rbac");
         assert_eq!(
@@ -4381,9 +4430,13 @@ mod tests {
     #[tokio::test]
     async fn airflow_rbac_dry_run_says_planned_and_is_not_ready() {
         let (client, _requests) = keycloak_client(&[], None);
-        let status = ensure_airflow_rbac(&context(client), &platform_with_pipelines(true, true))
-            .await
-            .expect("a status");
+        let status = ensure_airflow_rbac(
+            &context(client),
+            &platform_with_pipelines(true, true),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -4394,10 +4447,13 @@ mod tests {
     #[tokio::test]
     async fn airflow_group_roles_applies_the_service_account_config_map_binding_and_job() {
         let (client, requests) = keycloak_client(&[], None);
-        let status =
-            ensure_airflow_group_roles(&context(client), &platform_with_pipelines(true, false))
-                .await
-                .expect("a status");
+        let status = ensure_airflow_group_roles(
+            &context(client),
+            &platform_with_pipelines(true, false),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(status.ready, "{status:?}");
         assert_eq!(
             status.message.as_deref(),
@@ -4417,10 +4473,13 @@ mod tests {
     #[tokio::test]
     async fn airflow_group_roles_dry_run_says_planned_and_is_not_ready() {
         let (client, _requests) = keycloak_client(&[], None);
-        let status =
-            ensure_airflow_group_roles(&context(client), &platform_with_pipelines(true, true))
-                .await
-                .expect("a status");
+        let status = ensure_airflow_group_roles(
+            &context(client),
+            &platform_with_pipelines(true, true),
+            &owner(),
+        )
+        .await
+        .expect("a status");
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -4723,7 +4782,9 @@ mod tests {
         let (client, _store, _requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
         let spec = platform("platform", false);
-        let status = ensure_access_sync(&ctx, &spec).await.expect("a status");
+        let status = ensure_access_sync(&ctx, &spec, &owner())
+            .await
+            .expect("a status");
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
@@ -4744,7 +4805,9 @@ mod tests {
         }
         let ctx = context(client);
         let spec = platform("platform", false);
-        let status = ensure_access_sync(&ctx, &spec).await.expect("a status");
+        let status = ensure_access_sync(&ctx, &spec, &owner())
+            .await
+            .expect("a status");
         assert!(status.ready);
         let paths = applied_paths(&requests);
         assert!(
@@ -4759,6 +4822,25 @@ mod tests {
                 ])
                 .all(|(p, suffix)| p.ends_with(suffix))
         );
+    }
+
+    #[tokio::test]
+    async fn the_access_sync_cron_job_carries_the_platform_instance_owner_reference() {
+        let (client, requests) = keycloak_client(&[], None);
+        let status = ensure_access_sync(&context(client), &platform("platform", false), &owner())
+            .await
+            .expect("a status");
+        assert_eq!(status.name, "access-sync");
+        let requests = requests.lock().expect("requests poisoned");
+        let (_, _, body) = requests
+            .iter()
+            .find(|(method, path, _)| method == "PATCH" && path.ends_with("/cronjobs/access-sync"))
+            .expect("the CronJob is applied");
+        let body: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+        let reference = &body["metadata"]["ownerReferences"][0];
+        assert_eq!(reference["kind"], json!("PlatformInstance"));
+        assert_eq!(reference["name"], json!("cluster"));
+        assert_eq!(reference["controller"], json!(true));
     }
 
     #[tokio::test]
@@ -4800,7 +4882,7 @@ mod tests {
         let (client, _store, _requests) = identity_client(BTreeMap::new());
         let ctx = context(client);
         let spec = platform("external", false);
-        assert!(ensure_access_sync(&ctx, &spec).await.is_none());
+        assert!(ensure_access_sync(&ctx, &spec, &owner()).await.is_none());
     }
 
     #[tokio::test]
