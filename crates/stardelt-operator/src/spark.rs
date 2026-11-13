@@ -31,6 +31,9 @@ use kube::api::ObjectMeta;
 pub const NAME: &str = "spark-connect";
 pub const CONFIG_MAP: &str = "spark-connect-config";
 
+/// The driver's Prometheus/UI port (stardelt-platform#1158); ClusterIP only.
+pub const METRICS_PORT: i32 = 4040;
+
 /// Executors run user code and never call the Kubernetes API (platform#1096): no Role is
 /// bound to this ServiceAccount and its token is not mounted.
 pub const EXECUTOR: &str = "spark-executor";
@@ -346,12 +349,20 @@ pub fn service(namespace: &str) -> Service {
         spec: Some(ServiceSpec {
             type_: Some("ClusterIP".into()),
             selector: Some(name_selector()),
-            ports: Some(vec![ServicePort {
-                name: Some("connect".into()),
-                port: 15002,
-                target_port: Some(IntOrString::String("connect".into())),
-                ..ServicePort::default()
-            }]),
+            ports: Some(vec![
+                ServicePort {
+                    name: Some("connect".into()),
+                    port: 15002,
+                    target_port: Some(IntOrString::String("connect".into())),
+                    ..ServicePort::default()
+                },
+                ServicePort {
+                    name: Some("metrics".into()),
+                    port: METRICS_PORT,
+                    target_port: Some(IntOrString::Int(METRICS_PORT)),
+                    ..ServicePort::default()
+                },
+            ]),
             ..ServiceSpec::default()
         }),
         ..Service::default()
@@ -535,6 +546,19 @@ mod tests {
     }
 
     #[test]
+    fn the_config_map_turns_the_ui_and_its_metrics_on() {
+        let cm = config_map("stardelt-op");
+        let conf = cm
+            .data
+            .expect("data")
+            .remove("spark-defaults.conf")
+            .expect("defaults");
+        assert!(conf.contains("spark.ui.enabled                                       true"));
+        assert!(conf.contains("spark.ui.prometheus.enabled                            true"));
+        assert!(!conf.contains("spark.ui.enabled                                       false"));
+    }
+
+    #[test]
     fn the_image_is_pinned_by_digest() {
         let g = golden();
         assert!(g.image.starts_with("ghcr.io/stardelt/spark:dev@sha256:"));
@@ -622,12 +646,16 @@ mod tests {
         let spec = svc.spec.as_ref().unwrap();
         assert_eq!(spec.type_.as_ref().unwrap(), "ClusterIP");
         let ports = spec.ports.as_ref().unwrap();
+        assert_eq!(ports.len(), 2);
         assert_eq!(ports[0].port, 15002);
         assert_eq!(ports[0].name.as_ref().unwrap(), "connect");
         assert_eq!(
             ports[0].target_port.as_ref().unwrap(),
             &IntOrString::String("connect".into())
         );
+        assert_eq!(ports[1].name, Some("metrics".to_string()));
+        assert_eq!(ports[1].port, 4040);
+        assert_eq!(ports[1].target_port, Some(IntOrString::Int(4040)));
         assert_eq!(
             spec.selector
                 .as_ref()

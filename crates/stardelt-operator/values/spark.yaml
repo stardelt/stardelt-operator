@@ -48,6 +48,11 @@ defaults: |
   spark.executor.memory                                  2g
   spark.driver.bindAddress                               0.0.0.0
   spark.driver.host                                      ${env:POD_IP}
-  spark.ui.enabled                                       false
+  # Prometheus text rides the UI port: Spark 4.1 serves it at
+  # /metrics/executors/prometheus (plain samples, no # TYPE lines; the first is
+  # `spark_info`). Both properties are needed and 4040 is the default port
+  # (stardelt-platform#1158). The scrape rule below is the gate.
+  spark.ui.enabled                                       true
+  spark.ui.prometheus.enabled                            true
   spark.connect.grpc.binding.host                        0.0.0.0
   spark.connect.grpc.binding.port                         15002
