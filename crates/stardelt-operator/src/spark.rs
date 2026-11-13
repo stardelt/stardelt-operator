@@ -581,6 +581,50 @@ mod tests {
     }
 
     #[test]
+    fn the_config_map_declares_no_static_catalog_or_executor_count() {
+        // The platform's shared server has no static catalog (the client configures its own) and
+        // no static executor count (dynamic allocation owns it). The operator's golden defaults
+        // must not reintroduce either, nor an event-log bucket no install creates.
+        let cm = config_map("stardelt-op");
+        let conf = cm
+            .data
+            .expect("data")
+            .remove("spark-defaults.conf")
+            .expect("defaults");
+        for forbidden in [
+            "spark.sql.catalog.",
+            "spark.sql.defaultCatalog",
+            "hive-metastore",
+            "spark.executor.instances",
+            "spark.eventLog",
+            "spark.history.fs.logDirectory",
+            "spark-events",
+        ] {
+            assert!(
+                !conf.contains(forbidden),
+                "the golden Spark defaults still carry {forbidden}:\n{conf}"
+            );
+        }
+        // What must stay, by key: the Iceberg extensions, dynamic allocation, the Connect
+        // listener, the UI metrics and the executor pod template. Column alignment is not the
+        // contract, so compare the first whitespace-separated token.
+        for key in [
+            "spark.sql.extensions",
+            "spark.dynamicAllocation.enabled",
+            "spark.dynamicAllocation.maxExecutors",
+            "spark.connect.grpc.binding.port",
+            "spark.ui.prometheus.enabled",
+            "spark.kubernetes.executor.podTemplateFile",
+        ] {
+            assert!(
+                conf.lines()
+                    .any(|line| line.split_whitespace().next() == Some(key)),
+                "the golden Spark defaults lost {key}:\n{conf}"
+            );
+        }
+    }
+
+    #[test]
     fn the_config_map_turns_the_ui_and_its_metrics_on() {
         let cm = config_map("stardelt-op");
         let conf = cm
