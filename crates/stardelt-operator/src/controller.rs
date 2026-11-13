@@ -49,8 +49,9 @@ use crate::provision::{
     ensure_keycloak_pg, ensure_lakekeeper_network_policy, ensure_notebooks_bucket, ensure_nova,
     ensure_nova_events, ensure_nova_pg, ensure_nova_session, ensure_openbao_init,
     ensure_openbao_seal_key, ensure_openfga_database, ensure_openfga_network_policy,
-    ensure_pg_dumps, ensure_s3_secrets, ensure_seaweedfs_network_policy, ensure_secrets_mode,
-    ensure_spark, ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
+    ensure_pg_dumps, ensure_pipeline_notebook_egress, ensure_s3_secrets,
+    ensure_seaweedfs_network_policy, ensure_secrets_mode, ensure_spark,
+    ensure_superset_group_roles, ensure_superset_rbac, ensure_superset_secrets,
     ensure_trino_auth_secrets, ensure_trino_config_maps, ensure_trino_tls,
 };
 use crate::stop;
@@ -1572,6 +1573,9 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     let openfga_policy = ensure_openfga_network_policy(&ctx, &lh, &namespace).await;
     // The object store's unsigned ports: only SeaweedFS's own pods may reach them.
     let seaweedfs_policy = ensure_seaweedfs_network_policy(&ctx, &lh, &namespace).await;
+    // Egress from scheduled notebook pods: user code reaches the engine and the S3 gateway,
+    // nothing private (stardelt-platform#1100).
+    let notebook_egress = ensure_pipeline_notebook_egress(&ctx, &lh, &namespace).await;
     // The compute endpoint: after the S3 Secret it reads, before discovery advertises the catalog.
     let spark = ensure_spark(&ctx, &lh, &namespace).await;
     // The discovery ConfigMap is published last: it advertises a working catalog.
@@ -1590,6 +1594,7 @@ async fn reconcile_lakehouse(lh: Arc<Lakehouse>, ctx: Arc<Context>) -> Result<Ac
     components.extend(network_policy);
     components.extend(openfga_policy);
     components.extend(seaweedfs_policy);
+    components.extend(notebook_egress);
     components.push(bootstrap);
     components.extend(spark);
     components.push(discovery);
@@ -2900,11 +2905,16 @@ mod tests {
             .iter()
             .position(|n| *n == "seaweedfs-network-policy")
             .expect("the object store's network policy step");
+        let notebook_egress = names
+            .iter()
+            .position(|n| *n == "pipeline-notebook-egress")
+            .expect("the notebook egress policy step");
         assert!(bucket < archive);
         assert_eq!(archive + 1, policy, "{names:?}");
         assert_eq!(policy + 1, openfga_policy, "{names:?}");
         assert_eq!(openfga_policy + 1, seaweedfs_policy, "{names:?}");
-        assert_eq!(seaweedfs_policy + 1, bootstrap, "{names:?}");
+        assert_eq!(seaweedfs_policy + 1, notebook_egress, "{names:?}");
+        assert_eq!(notebook_egress + 1, bootstrap, "{names:?}");
     }
 
     #[tokio::test]

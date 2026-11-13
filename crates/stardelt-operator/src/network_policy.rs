@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::networking::v1::{
-    IPBlock, NetworkPolicy, NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort,
-    NetworkPolicySpec,
+    IPBlock, NetworkPolicy, NetworkPolicyEgressRule, NetworkPolicyIngressRule, NetworkPolicyPeer,
+    NetworkPolicyPort, NetworkPolicySpec,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, LabelSelectorRequirement};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -237,6 +237,15 @@ fn port(number: i32) -> NetworkPolicyPort {
     }
 }
 
+/// The same port with UDP: DNS answers on both transports.
+fn port_udp(number: i32) -> NetworkPolicyPort {
+    NetworkPolicyPort {
+        port: Some(IntOrString::Int(number)),
+        end_port: None,
+        protocol: Some("UDP".into()),
+    }
+}
+
 /// Ingress to the serving Lakekeeper pod only: the chart's db-migration Job carries
 /// `name=lakekeeper` too, and `component=catalog` keeps migrations (Postgres only) out.
 /// Callers are same-namespace; the metrics scraper is the one read-only peer from any
@@ -420,6 +429,104 @@ pub fn seaweedfs_internal(namespace: &str) -> NetworkPolicy {
                 },
             ]),
             egress: None,
+        }),
+    }
+}
+
+/// Egress from a scheduled notebook pod (stardelt-platform#1100's "Then" item 3): it runs a
+/// person's code, so it reaches the query engine, the S3 gateway, DNS and the public
+/// internet — and no other private address. Mirrors
+/// stardelt-platform/manifests/pipeline-notebook-egress.yaml (measured there before the
+/// ticket was written: without it, a pod with these labels reached nova-pg:5432 and
+/// openfga-pg:5432).
+pub const PIPELINE_NOTEBOOK_POLICY: &str = "pipeline-notebook-egress";
+/// The label the pipeline loader puts on every notebook task pod.
+pub const PIPELINE_NOTEBOOK_LABEL: &str = "pipeline-notebook";
+
+pub fn pipeline_notebook_egress(namespace: &str) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta(PIPELINE_NOTEBOOK_POLICY, namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    PIPELINE_NOTEBOOK_LABEL.to_string(),
+                )])),
+                match_expressions: None,
+            }),
+            policy_types: Some(vec!["Egress".to_string()]),
+            ingress: None,
+            egress: Some(vec![
+                // DNS: the cluster resolver in kube-system, or a private-range resolver IP.
+                NetworkPolicyEgressRule {
+                    to: Some(vec![
+                        NetworkPolicyPeer {
+                            namespace_selector: Some(LabelSelector {
+                                match_labels: Some(BTreeMap::from([(
+                                    "kubernetes.io/metadata.name".to_string(),
+                                    "kube-system".to_string(),
+                                )])),
+                                match_expressions: None,
+                            }),
+                            ..NetworkPolicyPeer::default()
+                        },
+                        NetworkPolicyPeer {
+                            ip_block: Some(IPBlock {
+                                cidr: "10.0.0.0/8".to_string(),
+                                except: None,
+                            }),
+                            ..NetworkPolicyPeer::default()
+                        },
+                        NetworkPolicyPeer {
+                            ip_block: Some(IPBlock {
+                                cidr: "172.16.0.0/12".to_string(),
+                                except: None,
+                            }),
+                            ..NetworkPolicyPeer::default()
+                        },
+                        NetworkPolicyPeer {
+                            ip_block: Some(IPBlock {
+                                cidr: "192.168.0.0/16".to_string(),
+                                except: None,
+                            }),
+                            ..NetworkPolicyPeer::default()
+                        },
+                    ]),
+                    ports: Some(vec![port(53), port_udp(53)]),
+                },
+                // The query engine (PIPELINE_TRINO_URL is the in-cluster https endpoint).
+                NetworkPolicyEgressRule {
+                    to: Some(vec![peer(&[
+                        ("app.kubernetes.io/name", "trino"),
+                        ("app.kubernetes.io/component", "coordinator"),
+                    ])]),
+                    ports: Some(vec![port(8443)]),
+                },
+                // The S3 gateway: the presigned GET and PUT of the notebook.
+                NetworkPolicyEgressRule {
+                    to: Some(vec![peer(&[
+                        ("app.kubernetes.io/name", "seaweedfs"),
+                        ("app.kubernetes.io/component", "s3"),
+                    ])]),
+                    ports: Some(vec![port(8333)]),
+                },
+                // The public internet, never a private range and never the metadata address.
+                NetworkPolicyEgressRule {
+                    to: Some(vec![NetworkPolicyPeer {
+                        ip_block: Some(IPBlock {
+                            cidr: "0.0.0.0/0".to_string(),
+                            except: Some(vec![
+                                "10.0.0.0/8".to_string(),
+                                "172.16.0.0/12".to_string(),
+                                "192.168.0.0/16".to_string(),
+                                "169.254.169.254/32".to_string(),
+                            ]),
+                        }),
+                        ..NetworkPolicyPeer::default()
+                    }]),
+                    ports: None,
+                },
+            ]),
         }),
     }
 }
@@ -880,5 +987,127 @@ mod tests {
             user: None,
         };
         assert!(spark_connect_ingress("trial", "data", &long).is_err());
+    }
+
+    #[test]
+    fn pipeline_notebook_egress_selects_the_task_pods() {
+        let policy = pipeline_notebook_egress("data");
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some(PIPELINE_NOTEBOOK_POLICY)
+        );
+        let spec = policy.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.policy_types.as_ref().unwrap(),
+            &vec!["Egress".to_string()]
+        );
+        assert!(spec.ingress.is_none());
+        let labels = spec
+            .pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(
+            labels.get("app.kubernetes.io/name").unwrap(),
+            "pipeline-notebook"
+        );
+    }
+
+    #[test]
+    fn pipeline_notebook_egress_allows_trino_s3_dns_and_public_only() {
+        let policy = pipeline_notebook_egress("data");
+        let spec = policy.spec.as_ref().unwrap();
+        let rules = spec.egress.as_ref().unwrap();
+        assert_eq!(rules.len(), 4);
+
+        // Rule 1: DNS on TCP and UDP 53.
+        let dns = rules[0].ports.as_ref().unwrap();
+        let mut dns_ports: Vec<(i32, String)> = dns
+            .iter()
+            .map(|p| {
+                let number = match &p.port {
+                    Some(IntOrString::Int(n)) => *n,
+                    other => panic!("expected an int port, got {other:?}"),
+                };
+                (number, p.protocol.clone().unwrap())
+            })
+            .collect();
+        dns_ports.sort();
+        assert_eq!(
+            dns_ports,
+            vec![(53, "TCP".to_string()), (53, "UDP".to_string())]
+        );
+
+        // Rule 2: the query engine on 8443.
+        let trino_peers = rules[1].to.as_ref().unwrap();
+        assert_eq!(trino_peers.len(), 1);
+        let trino = trino_peers[0]
+            .pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(trino.get("app.kubernetes.io/name").unwrap(), "trino");
+        assert_eq!(
+            trino.get("app.kubernetes.io/component").unwrap(),
+            "coordinator"
+        );
+        assert_eq!(
+            rules[1].ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(8443))
+        );
+
+        // Rule 3: the S3 gateway on 8333.
+        let s3_peers = rules[2].to.as_ref().unwrap();
+        assert_eq!(s3_peers.len(), 1);
+        let s3 = s3_peers[0]
+            .pod_selector
+            .as_ref()
+            .unwrap()
+            .match_labels
+            .as_ref()
+            .unwrap();
+        assert_eq!(s3.get("app.kubernetes.io/name").unwrap(), "seaweedfs");
+        assert_eq!(s3.get("app.kubernetes.io/component").unwrap(), "s3");
+        assert_eq!(
+            rules[2].ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(8333))
+        );
+
+        // Rule 4: the public internet, every private range and the metadata address excepted.
+        let public = rules[3].to.as_ref().unwrap();
+        assert_eq!(public.len(), 1);
+        let block = public[0].ip_block.as_ref().unwrap();
+        assert_eq!(block.cidr, "0.0.0.0/0");
+        assert_eq!(
+            block.except.as_ref().unwrap(),
+            &vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+                "169.254.169.254/32".to_string(),
+            ]
+        );
+        assert!(rules[3].ports.is_none());
+    }
+
+    #[test]
+    fn no_pipeline_notebook_peer_opens_every_namespace() {
+        let policy = pipeline_notebook_egress("data");
+        let spec = policy.spec.as_ref().unwrap();
+        for rule in spec.egress.as_ref().unwrap() {
+            for peer in rule.to.as_ref().unwrap() {
+                if let Some(selector) = &peer.namespace_selector {
+                    assert!(
+                        selector.match_labels.is_some(),
+                        "an empty namespaceSelector admits every namespace"
+                    );
+                }
+            }
+        }
     }
 }
