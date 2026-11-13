@@ -34,8 +34,8 @@ use crate::crd::{
     SparkCluster, StorageImpl, StreamApp, ValuesSource,
 };
 use crate::helm::{
-    CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned, manifest_args,
-    rendered_workloads,
+    CommandHelmRunner, HelmRelease, HelmRunner, is_deployed, is_owned, last_deployed_revision,
+    manifest_args, rendered_workloads, stuck_pending,
 };
 use crate::objects::{cnpg_cluster_resource, platform_owner};
 use crate::planner::{ComponentPlan, chart_repo, chart_version, plan_lakehouse, plan_platform};
@@ -628,6 +628,56 @@ async fn apply_plan(
             continue;
         }
 
+        // A release left `pending-*` by a killed Helm run (operator#613): every later upgrade is
+        // refused with "another operation (install/upgrade/rollback) is in progress", so the
+        // component never converges until a person runs `helm rollback`. Roll back to the last
+        // revision that deployed; a release that never deployed is uninstalled instead (D18 keeps
+        // its PVCs, the data). Only the leader runs this loop, and a dry run changes nothing.
+        let mut recovered: Option<String> = None;
+        if !dry_run
+            && let Ok(status) = ctx.helm.run(release.status_args(), None).await
+            && stuck_pending(&status)
+        {
+            let revision = match ctx.helm.run(release.history_args(), None).await {
+                Ok(history) => last_deployed_revision(&history),
+                Err(e) => {
+                    tracing::warn!(
+                        release = %release.name,
+                        error = %e,
+                        "could not read the history of a pending release"
+                    );
+                    None
+                }
+            };
+            let recovery = match revision {
+                Some(revision) => ctx
+                    .helm
+                    .run(release.rollback_args(revision), None)
+                    .await
+                    .map(|_| format!("rolled back to revision {revision}")),
+                None => ctx
+                    .helm
+                    .run(release.uninstall_args(), None)
+                    .await
+                    .map(|_| "uninstalled a release that never deployed".to_string()),
+            };
+            match recovery {
+                Ok(what) => {
+                    tracing::warn!(
+                        release = %release.name,
+                        what = %what,
+                        "recovered a release left pending by a killed helm run"
+                    );
+                    recovered = Some(what);
+                }
+                Err(e) => tracing::warn!(
+                    release = %release.name,
+                    error = %e,
+                    "could not recover a release left pending"
+                ),
+            }
+        }
+
         match ctx.helm.run(release.args(), release.values_yaml()).await {
             Ok(_) if dry_run => outcome.components.push(ComponentStatus {
                 name: component.name.to_string(),
@@ -639,6 +689,10 @@ async fn apply_plan(
                 applied_hash: None,
             }),
             Ok(_) => {
+                let note = recovered
+                    .as_deref()
+                    .map(|what| format!("{what}; "))
+                    .unwrap_or_default();
                 // The apply exited 0; the status tells the truth about the
                 // workloads it left behind, not about Helm's exit code.
                 let component_status =
@@ -646,13 +700,13 @@ async fn apply_plan(
                         Ok((ready, total)) => ComponentStatus {
                             name: component.name.to_string(),
                             ready: ready_from_counts(ready, total),
-                            message: Some(format!("{ready}/{total} workloads ready")),
+                            message: Some(format!("{note}{ready}/{total} workloads ready")),
                             applied_hash: Some(fingerprint),
                         },
                         Err(e) => ComponentStatus {
                             name: component.name.to_string(),
                             ready: false,
-                            message: Some(e.to_string()),
+                            message: Some(format!("{note}{e}")),
                             applied_hash: None,
                         },
                     };
@@ -2080,6 +2134,16 @@ mod tests {
             .count()
     }
 
+    /// The verbs of the recorded helm calls, in order.
+    fn verbs(helm: &RecordingRunner) -> Vec<String> {
+        helm.calls
+            .lock()
+            .expect("calls poisoned")
+            .iter()
+            .map(|call| call.args.first().cloned().unwrap_or_default())
+            .collect()
+    }
+
     /// `DeploymentList` items with `ready` of `desired` replicas ready.
     fn deployment_list(ready: i32, desired: i32) -> String {
         format!(
@@ -2267,6 +2331,123 @@ mod tests {
             1,
             "an unchanged component must not be re-upgraded"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pending_upgrade_is_rolled_back_before_the_upgrade() {
+        let helm = helm_stub();
+        helm.reply("status", r#"{"info":{"status":"pending-upgrade"}}"#);
+        helm.reply(
+            "history",
+            r#"[{"revision":1,"status":"superseded","description":"managed by stardelt-operator"},
+                {"revision":2,"status":"deployed","description":"managed by stardelt-operator"},
+                {"revision":3,"status":"pending-upgrade","description":"managed by stardelt-operator"}]"#,
+        );
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let overrides = overrides_context(&values);
+
+        let outcome = apply_plan(&ctx, "stardelt", &plan(), &overrides, false, false, &[]).await;
+
+        let order = verbs(&helm);
+        let rollback = order
+            .iter()
+            .position(|verb| verb == "rollback")
+            .expect("a rollback");
+        let upgrade = order
+            .iter()
+            .position(|verb| verb == "upgrade")
+            .expect("an upgrade");
+        assert!(rollback < upgrade, "rollback must come first: {order:?}");
+        assert_eq!(
+            helm.calls
+                .lock()
+                .expect("calls poisoned")
+                .iter()
+                .find(|call| call.args.first().map(String::as_str) == Some("rollback"))
+                .expect("a rollback")
+                .args,
+            vec![
+                "rollback".to_string(),
+                "trino".to_string(),
+                "2".to_string(),
+                "--namespace".to_string(),
+                "stardelt".to_string(),
+                "--wait".to_string(),
+                "--timeout".to_string(),
+                "10m".to_string(),
+            ]
+        );
+        assert!(
+            outcome.components[0]
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("rolled back to revision 2"),
+            "the status says what happened: {:?}",
+            outcome.components[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_install_with_nothing_deployed_is_uninstalled() {
+        let helm = helm_stub();
+        helm.reply("status", r#"{"info":{"status":"pending-install"}}"#);
+        helm.reply(
+            "history",
+            r#"[{"revision":1,"status":"pending-install","description":"managed by stardelt-operator"}]"#,
+        );
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let overrides = overrides_context(&values);
+
+        apply_plan(&ctx, "stardelt", &plan(), &overrides, false, false, &[]).await;
+
+        let order = verbs(&helm);
+        assert!(order.iter().any(|verb| verb == "uninstall"), "{order:?}");
+        assert!(!order.iter().any(|verb| verb == "rollback"), "{order:?}");
+    }
+
+    #[tokio::test]
+    async fn a_deployed_release_is_never_rolled_back() {
+        let helm = helm_stub();
+        helm.reply("status", r#"{"info":{"status":"deployed"}}"#);
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let overrides = overrides_context(&values);
+
+        apply_plan(&ctx, "stardelt", &plan(), &overrides, false, false, &[]).await;
+        assert!(!verbs(&helm).iter().any(|verb| verb == "rollback"));
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_does_not_recover_a_pending_release() {
+        let helm = helm_stub();
+        helm.reply("status", r#"{"info":{"status":"pending-upgrade"}}"#);
+        let (client, _requests) = mock_client(&deployment_list(2, 2), "[]");
+        let ctx = Context {
+            client,
+            helm: helm.clone(),
+        };
+        let values = ComponentValues::default();
+        let overrides = overrides_context(&values);
+
+        apply_plan(&ctx, "stardelt", &plan(), &overrides, true, false, &[]).await;
+        let order = verbs(&helm);
+        assert!(!order.iter().any(|verb| verb == "rollback"), "{order:?}");
+        assert!(!order.iter().any(|verb| verb == "uninstall"), "{order:?}");
     }
 
     #[tokio::test]

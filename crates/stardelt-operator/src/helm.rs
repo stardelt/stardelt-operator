@@ -136,6 +136,22 @@ impl HelmRelease {
         ]
     }
 
+    /// `helm rollback <release> <revision>` back to the last revision that deployed, so the next
+    /// upgrade is not refused with "another operation (install/upgrade/rollback) is in progress"
+    /// (operator#613). Waits like an upgrade: a rollback recreates the same workloads.
+    pub fn rollback_args(&self, revision: u32) -> Vec<String> {
+        vec![
+            "rollback".into(),
+            self.name.clone(),
+            revision.to_string(),
+            "--namespace".into(),
+            self.namespace.clone(),
+            "--wait".into(),
+            "--timeout".into(),
+            "10m".into(),
+        ]
+    }
+
     /// `helm status -o json` — tells whether the release currently is `deployed`
     /// (as opposed to `failed`, `pending`, …).
     pub fn status_args(&self) -> Vec<String> {
@@ -176,6 +192,34 @@ pub fn is_deployed(status_json: &str) -> bool {
 /// True when any revision in `helm history -o json` output carries [`OWNER_MARKER`].
 pub fn is_owned(history_json: &str) -> bool {
     history_json.contains(OWNER_MARKER)
+}
+
+/// True when `helm status -o json` reports one of the three `pending-*` states a killed Helm run
+/// leaves behind. Every later `helm upgrade` is refused with "another operation is in progress"
+/// until the release is rolled back (operator#613).
+pub fn stuck_pending(status_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(status_json)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value["info"]["status"].as_str(),
+                Some("pending-install" | "pending-upgrade" | "pending-rollback")
+            )
+        })
+}
+
+/// The newest revision `helm history -o json` reports as `deployed`: what a rollback targets.
+/// `None` when the release never deployed — a first install killed mid-way leaves
+/// `pending-install` and nothing to roll back to.
+pub fn last_deployed_revision(history_json: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(history_json)
+        .ok()?
+        .as_array()?
+        .iter()
+        .filter(|revision| revision["status"] == "deployed")
+        .filter_map(|revision| revision["revision"].as_u64())
+        .max()
+        .map(|revision| revision as u32)
 }
 
 /// One workload a Helm release rendered: enough to scale it and to find it again.
@@ -506,6 +550,60 @@ mod tests {
                 "stardelt",
                 "-o",
                 "json"
+            ]
+        );
+    }
+
+    #[test]
+    fn stuck_pending_reads_the_three_pending_states() {
+        for status in ["pending-install", "pending-upgrade", "pending-rollback"] {
+            assert!(
+                stuck_pending(&format!(r#"{{"info":{{"status":"{status}"}}}}"#)),
+                "{status} must be recovered"
+            );
+        }
+        for status in ["deployed", "failed", "superseded", "uninstalled"] {
+            assert!(
+                !stuck_pending(&format!(r#"{{"info":{{"status":"{status}"}}}}"#)),
+                "{status} must be left alone"
+            );
+        }
+        assert!(!stuck_pending("not json at all"));
+    }
+
+    #[test]
+    fn last_deployed_revision_is_the_newest_deployed_one() {
+        assert_eq!(
+            last_deployed_revision(
+                r#"[{"revision":1,"status":"superseded"},{"revision":2,"status":"deployed"},
+                    {"revision":3,"status":"pending-upgrade"}]"#
+            ),
+            Some(2)
+        );
+        // A release that never deployed has nothing to roll back to.
+        assert_eq!(
+            last_deployed_revision(r#"[{"revision":1,"status":"pending-install"}]"#),
+            None
+        );
+        assert_eq!(last_deployed_revision("[]"), None);
+        assert_eq!(last_deployed_revision("not json at all"), None);
+    }
+
+    #[test]
+    fn rollback_args_name_the_release_revision_and_namespace() {
+        // `release(false)` (line 339) builds `seaweedfs` in `stardelt`.
+        let args = release(false).rollback_args(7);
+        assert_eq!(
+            args,
+            vec![
+                "rollback",
+                "seaweedfs",
+                "7",
+                "--namespace",
+                "stardelt",
+                "--wait",
+                "--timeout",
+                "10m"
             ]
         );
     }
