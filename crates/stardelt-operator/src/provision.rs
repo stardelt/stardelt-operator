@@ -1392,6 +1392,18 @@ pub async fn ensure_keycloak(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    // The IdP's ingress policy (stardelt-platform#1161): applied on every reconcile; it
+    // selects pods by label, so it is inert until the Deployment exists.
+    if let Err(e) = apply::<NetworkPolicy>(
+        &ctx.client,
+        namespace,
+        &network_policy::keycloak_ingress(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     let applied =
         match apply_owned::<Deployment>(&ctx.client, namespace, owner, &deployment, spec.dry_run)
             .await
@@ -3187,6 +3199,7 @@ mod tests {
                 "/api/v1/namespaces/stardelt/configmaps/keycloak-realm",
                 "/api/v1/namespaces/stardelt/configmaps/keycloak-env",
                 "/api/v1/namespaces/stardelt/services/keycloak",
+                "/apis/networking.k8s.io/v1/namespaces/stardelt/networkpolicies/keycloak-ingress",
                 "/apis/apps/v1/namespaces/stardelt/deployments/keycloak",
             ]
             .map(str::to_string)
@@ -3215,8 +3228,8 @@ mod tests {
         assert_eq!(status.message.as_deref(), Some("running"));
         assert_eq!(
             applied_paths(&requests).len(),
-            4,
-            "two ConfigMaps, the Service, then the Deployment"
+            5,
+            "two ConfigMaps, the Service, the NetworkPolicy, then the Deployment"
         );
     }
 

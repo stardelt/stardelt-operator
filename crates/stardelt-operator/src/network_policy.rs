@@ -29,6 +29,15 @@ pub const OPENFGA_POLICY: &str = "openfga-ingress";
 /// stardelt-platform/manifests/seaweedfs-network-policy.yaml.
 pub const SEAWEEDFS_POLICY: &str = "seaweedfs-internal";
 
+/// The IdP's ingress policy: sign-in stays open in-cluster, metrics is gated
+/// (stardelt-platform#1161).
+pub const KEYCLOAK_POLICY: &str = "keycloak-ingress";
+/// The sign-in, discovery and token port. Deliberately open to every source:
+/// every platform component and the ingress controller authenticate here.
+pub const KEYCLOAK_HTTP_PORT: i32 = 8080;
+/// The management port that serves Prometheus text (stardelt-operator#630).
+pub const KEYCLOAK_MANAGEMENT_PORT: i32 = 9000;
+
 fn meta(name: &str, namespace: &str) -> ObjectMeta {
     ObjectMeta {
         name: Some(name.to_string()),
@@ -336,6 +345,41 @@ pub fn openfga_ingress(namespace: &str) -> NetworkPolicy {
     }
 }
 
+/// Ingress to the platform IdP (stardelt-platform#1161): 8080 stays open to every
+/// source because every component signs in and the ingress controller is a pod;
+/// 9000 answers only a scraper-labelled pod in any namespace (stardelt-operator#607).
+/// Kubelet probes come from the node and are unaffected, as with `lakekeeper_ingress`.
+pub fn keycloak_ingress(namespace: &str) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta(KEYCLOAK_POLICY, namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/name".to_string(),
+                    "keycloak".to_string(),
+                )])),
+                match_expressions: None,
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(vec![
+                // Sign-in: no `from`, so every source; the port is the restriction.
+                NetworkPolicyIngressRule {
+                    from: None,
+                    ports: Some(vec![port(KEYCLOAK_HTTP_PORT)]),
+                },
+                NetworkPolicyIngressRule {
+                    from: Some(vec![peer_any_namespace(&[(
+                        "app.kubernetes.io/name",
+                        "prometheus",
+                    )])]),
+                    ports: Some(vec![port(KEYCLOAK_MANAGEMENT_PORT)]),
+                },
+            ]),
+            egress: None,
+        }),
+    }
+}
+
 /// SeaweedFS's own pods reach the filer, master and volume servers on every port; a pod
 /// labelled `app.kubernetes.io/name: prometheus` in any namespace reads 9327 only.
 /// The S3 gateway (8333) stays open: it checks an access key.
@@ -503,6 +547,50 @@ mod tests {
         for p in ports {
             assert_eq!(p.protocol.as_ref().unwrap(), "TCP");
         }
+    }
+
+    #[test]
+    fn keycloak_ingress_keeps_sign_in_open_and_gates_the_management_port() {
+        let policy = keycloak_ingress("data");
+        assert_eq!(policy.metadata.name.as_deref(), Some("keycloak-ingress"));
+        let spec = policy.spec.as_ref().expect("spec");
+        assert_eq!(
+            spec.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([("app.kubernetes.io/name".to_string(), "keycloak".to_string())])
+        );
+        let ingress = spec.ingress.as_ref().expect("rules");
+        assert_eq!(ingress.len(), 2);
+        // Rule 1: every source (no `from`) on the sign-in port only.
+        assert!(ingress[0].from.is_none());
+        assert_eq!(
+            ingress[0].ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(8080))
+        );
+        // Rule 2: the scraper label from any namespace, on the management port only.
+        let peer = &ingress[1].from.as_ref().unwrap()[0];
+        assert_eq!(
+            peer.pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "prometheus".to_string()
+            )])
+        );
+        assert!(peer.namespace_selector.is_some());
+        assert_eq!(
+            ingress[1].ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(9000))
+        );
+        assert_eq!(ingress[1].ports.as_ref().unwrap().len(), 1);
     }
 
     #[test]
