@@ -57,6 +57,10 @@ hub:
       description: Nova reads workspace state and starts or stops servers for the signed-in person
       services: [nova]
       scopes: ["read:servers", "servers", "read:users:activity", "read:users:name"]
+  # Prometheus text on /hub/metrics (#607): JupyterHub requires the read:metrics
+  # scope unless this is false; the NetworkPolicy rule below is then the gate.
+  # Same as stardelt-platform/helm-values/jupyterhub.yaml.
+  authenticatePrometheus: false
   # The chart's own hub NetworkPolicy is on by default and admits only pods
   # labelled hub.jupyter.org/network-access-hub: "true". Nova is a service, not a
   # spawner-connected pod, so it needs the API port by its own pod label.
@@ -66,6 +70,16 @@ hub:
           - podSelector:
               matchLabels:
                 app.kubernetes.io/name: nova
+        ports:
+          - port: 8081
+            protocol: TCP
+      # The customer's Prometheus in any namespace may read /hub/metrics, and
+      # nothing else: 8081 only, same gate label as the other endpoints (#607).
+      - from:
+          - namespaceSelector: {}
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: prometheus
         ports:
           - port: 8081
             protocol: TCP
