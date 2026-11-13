@@ -27,6 +27,8 @@ pub const S3_SECRET: &str = "stardelt-s3-creds";
 pub const S3_CONFIG_SECRET: &str = "seaweedfs-s3-config";
 /// CloudNative-PG Cluster that stores the catalog.
 pub const CATALOG_CLUSTER: &str = "lakekeeper-pg";
+/// The CloudNativePG plugin that owns `ObjectStore` (barman-cloud).
+const BARMAN_PLUGIN: &str = "barman-cloud.cloudnative-pg.io";
 /// Default bucket when `spec.storage.bucket` is unset.
 pub const DEFAULT_BUCKET: &str = "lakehouse";
 /// Bootstrap script (accept terms, create the warehouse, refresh its credential).
@@ -153,7 +155,7 @@ pub fn catalog_cluster(lakehouse: &str, namespace: &str, profile: Profile) -> Dy
             "instances": 1,
             "imageName": "ghcr.io/cloudnative-pg/postgresql:17.7-system-trixie",
             "storage": {"size": size},
-            "backup": continuous_backup(namespace),
+            "plugins": continuous_backup(CATALOG_CLUSTER),
             "bootstrap": {"initdb": {"database": "lakekeeper", "owner": "lakekeeper"}},
             "resources": {
                 "requests": {"cpu": "50m", "memory": "256Mi"},
@@ -165,24 +167,18 @@ pub fn catalog_cluster(lakehouse: &str, namespace: &str, profile: Profile) -> Dy
     }
 }
 
-/// The continuous backup of a platform database: WAL and base backups go to the `backups`
-/// bucket of the object store, 14 days kept. CloudNative-PG writes under `<bucket>/<cluster>/`,
-/// so every platform database shares the bucket without colliding.
-fn continuous_backup(namespace: &str) -> serde_json::Value {
-    json!({
-        "retentionPolicy": "14d",
-        "barmanObjectStore": {
-            "destinationPath": "s3://backups/",
-            "endpointURL": s3_endpoint(namespace),
-            "s3Credentials": {
-                "accessKeyId": {"name": S3_SECRET, "key": "access-key"},
-                "secretAccessKey": {"name": S3_SECRET, "key": "secret-key"},
-                "region": {"name": S3_SECRET, "key": "region"},
-            },
-            "wal": {"compression": "gzip", "maxParallel": 2},
-            "data": {"compression": "gzip"},
-        },
-    })
+/// The continuous backup of a platform database. The form is the barman-cloud plugin
+/// (CloudNativePG 1.32.0 removes `spec.backup.barmanObjectStore`); the plugin reads the
+/// `ObjectStore` named here, rendered by [`barman_cloud_object_stores`] in the same namespace.
+/// No `retentionPolicy` here: CloudNativePG warns that it is inert under a plugin, and the
+/// store carries the same 14 days.
+fn continuous_backup(cluster: &str) -> serde_json::Value {
+    json!([{
+        "name": BARMAN_PLUGIN,
+        "enabled": true,
+        "isWALArchiver": true,
+        "parameters": {"barmanObjectName": format!("{cluster}-backups")},
+    }])
 }
 
 /// The CloudNative-PG `Cluster` that stores Keycloak's state (realms, users, sessions),
@@ -198,7 +194,7 @@ pub fn keycloak_pg_cluster(namespace: &str) -> DynamicObject {
             "instances": 1,
             "imageName": "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
             "storage": {"size": "1Gi"},
-            "backup": continuous_backup(namespace),
+            "plugins": continuous_backup("keycloak-pg"),
             "bootstrap": {"initdb": {"database": "keycloak", "owner": "keycloak"}},
             "resources": {
                 "requests": {"cpu": "50m", "memory": "128Mi"},
@@ -222,7 +218,8 @@ pub fn keycloak_pg_backup(namespace: &str) -> DynamicObject {
             "schedule": "0 45 2 * * *",
             "immediate": true,
             "backupOwnerReference": "self",
-            "method": "barmanObjectStore",
+            "method": "plugin",
+            "pluginConfiguration": {"name": BARMAN_PLUGIN},
             "cluster": {"name": "keycloak-pg"},
         }}),
     }
@@ -241,7 +238,7 @@ pub fn openfga_pg_cluster(namespace: &str) -> DynamicObject {
             "instances": 1,
             "imageName": "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
             "storage": {"size": "1Gi"},
-            "backup": continuous_backup(namespace),
+            "plugins": continuous_backup("openfga-pg"),
             "bootstrap": {"initdb": {"database": "openfga", "owner": "openfga"}},
             "resources": {
                 "requests": {"cpu": "50m", "memory": "256Mi"},
@@ -265,7 +262,8 @@ pub fn openfga_pg_backup(namespace: &str) -> DynamicObject {
             "schedule": "0 30 2 * * *",
             "immediate": true,
             "backupOwnerReference": "self",
-            "method": "barmanObjectStore",
+            "method": "plugin",
+            "pluginConfiguration": {"name": BARMAN_PLUGIN},
             "cluster": {"name": "openfga-pg"},
         }}),
     }
@@ -283,7 +281,8 @@ pub fn catalog_pg_backup(lakehouse: &str, namespace: &str) -> DynamicObject {
             "schedule": "0 30 2 * * *",
             "immediate": true,
             "backupOwnerReference": "self",
-            "method": "barmanObjectStore",
+            "method": "plugin",
+            "pluginConfiguration": {"name": BARMAN_PLUGIN},
             "cluster": {"name": CATALOG_CLUSTER},
         }}),
     }
@@ -292,9 +291,9 @@ pub fn catalog_pg_backup(lakehouse: &str, namespace: &str) -> DynamicObject {
 /// The barman-cloud `ObjectStore`s, one per platform database (platform#1234, the operator twin):
 /// the plugin form of each `Cluster`'s backup configuration. The destination path, the credentials
 /// Secret, the gzip settings and the 14-day retention are the same values the native
-/// `barmanObjectStore` blocks carry ([`continuous_backup`]); the plugin writes under
-/// `s3://backups/<cluster>/` as well, so both forms continue the same archive chain. No `Cluster`
-/// names one yet — that is platform#1236, one cluster at a time.
+/// `barmanObjectStore` blocks carried ([`continuous_backup`]); the plugin writes under
+/// `s3://backups/<cluster>/` as well, so both forms continue the same archive chain. Every platform
+/// `Cluster` names one, through [`continuous_backup`].
 pub fn barman_cloud_object_stores(namespace: &str) -> Vec<DynamicObject> {
     ["nova-pg", "lakekeeper-pg", "openfga-pg", "keycloak-pg"]
         .iter()
@@ -347,7 +346,7 @@ pub fn nova_pg_cluster(namespace: &str) -> DynamicObject {
             "instances": 1,
             "imageName": "ghcr.io/cloudnative-pg/postgresql:18.3-system-trixie",
             "storage": {"size": "1Gi"},
-            "backup": continuous_backup(namespace),
+            "plugins": continuous_backup(NOVA_CLUSTER),
             "bootstrap": {"initdb": {"database": "nova", "owner": "nova"}},
             "resources": {
                 "requests": {"cpu": "50m", "memory": "256Mi"},
@@ -372,7 +371,8 @@ pub fn nova_pg_backup(namespace: &str) -> DynamicObject {
             "schedule": "0 0 3 * * *",
             "immediate": true,
             "backupOwnerReference": "self",
-            "method": "barmanObjectStore",
+            "method": "plugin",
+            "pluginConfiguration": {"name": BARMAN_PLUGIN},
             "cluster": {"name": NOVA_CLUSTER},
         }}),
     }
@@ -915,27 +915,18 @@ mod tests {
         assert_eq!(spec["resources"]["requests"]["memory"], "128Mi");
         assert_eq!(spec["resources"]["limits"]["cpu"], "500m");
         assert_eq!(spec["resources"]["limits"]["memory"], "256Mi");
-        assert_eq!(spec["backup"]["retentionPolicy"], "14d");
-        let store = &spec["backup"]["barmanObjectStore"];
-        assert_eq!(store["destinationPath"], "s3://backups/");
+        let plugin = &spec["plugins"][0];
+        assert_eq!(plugin["name"], BARMAN_PLUGIN);
+        assert_eq!(plugin["enabled"], true);
+        assert_eq!(plugin["isWALArchiver"], true);
         assert_eq!(
-            store["endpointURL"],
-            "http://seaweedfs-s3.stardelt.svc.cluster.local:8333"
+            plugin["parameters"]["barmanObjectName"],
+            "keycloak-pg-backups"
         );
-        for (slot, key) in [
-            ("accessKeyId", "access-key"),
-            ("secretAccessKey", "secret-key"),
-            ("region", "region"),
-        ] {
-            assert_eq!(store["s3Credentials"][slot]["name"], "stardelt-s3-creds");
-            assert_eq!(store["s3Credentials"][slot]["key"], key);
-        }
-        assert_eq!(store["wal"]["compression"], "gzip");
-        assert_eq!(store["wal"]["maxParallel"], 2);
-        assert_eq!(store["data"]["compression"], "gzip");
-        // The endpoint follows the platform namespace, like the chart's templated values.
+        assert!(spec["backup"].get("barmanObjectStore").is_none());
+        // The endpoint still follows the namespace — on the ObjectStore now.
         assert_eq!(
-            keycloak_pg_cluster("lab").data["spec"]["backup"]["barmanObjectStore"]["endpointURL"],
+            barman_cloud_object_store("lab", "keycloak-pg").data["spec"]["configuration"]["endpointURL"],
             "http://seaweedfs-s3.lab.svc.cluster.local:8333"
         );
     }
@@ -956,7 +947,8 @@ mod tests {
         assert_eq!(spec["schedule"], "0 45 2 * * *");
         assert_eq!(spec["immediate"], true);
         assert_eq!(spec["backupOwnerReference"], "self");
-        assert_eq!(spec["method"], "barmanObjectStore");
+        assert_eq!(spec["method"], "plugin");
+        assert_eq!(spec["pluginConfiguration"]["name"], BARMAN_PLUGIN);
         assert_eq!(spec["cluster"]["name"], "keycloak-pg");
     }
 
@@ -969,12 +961,17 @@ mod tests {
         );
         assert_eq!(cluster.data["spec"]["storage"]["size"], "1Gi");
         assert_eq!(
-            cluster.data["spec"]["backup"]["barmanObjectStore"]["destinationPath"],
-            "s3://backups/"
+            cluster.data["spec"]["plugins"][0]["parameters"]["barmanObjectName"],
+            "openfga-pg-backups"
         );
         let backup = openfga_pg_backup("data");
         assert_eq!(backup.data["spec"]["cluster"]["name"], "openfga-pg");
         assert_eq!(backup.data["spec"]["schedule"], "0 30 2 * * *");
+        assert_eq!(backup.data["spec"]["method"], "plugin");
+        assert_eq!(
+            backup.data["spec"]["pluginConfiguration"]["name"],
+            BARMAN_PLUGIN
+        );
     }
 
     #[test]
@@ -1022,27 +1019,15 @@ mod tests {
         assert_eq!(spec["resources"]["limits"]["memory"], "2Gi");
         assert_eq!(spec["postgresql"]["parameters"]["max_connections"], "150");
         assert_eq!(spec["probes"]["startup"]["failureThreshold"], 120);
-        assert_eq!(spec["backup"]["retentionPolicy"], "14d");
-        let store = &spec["backup"]["barmanObjectStore"];
-        assert_eq!(store["destinationPath"], "s3://backups/");
+        let plugin = &spec["plugins"][0];
+        assert_eq!(plugin["name"], BARMAN_PLUGIN);
+        assert_eq!(plugin["enabled"], true);
+        assert_eq!(plugin["isWALArchiver"], true);
+        assert_eq!(plugin["parameters"]["barmanObjectName"], "nova-pg-backups");
+        assert!(spec["backup"].get("barmanObjectStore").is_none());
+        // The endpoint still follows the namespace — on the ObjectStore now.
         assert_eq!(
-            store["endpointURL"],
-            "http://seaweedfs-s3.stardelt.svc.cluster.local:8333"
-        );
-        for (slot, key) in [
-            ("accessKeyId", "access-key"),
-            ("secretAccessKey", "secret-key"),
-            ("region", "region"),
-        ] {
-            assert_eq!(store["s3Credentials"][slot]["name"], "stardelt-s3-creds");
-            assert_eq!(store["s3Credentials"][slot]["key"], key);
-        }
-        assert_eq!(store["wal"]["compression"], "gzip");
-        assert_eq!(store["wal"]["maxParallel"], 2);
-        assert_eq!(store["data"]["compression"], "gzip");
-        // The endpoint follows the platform namespace.
-        assert_eq!(
-            nova_pg_cluster("lab").data["spec"]["backup"]["barmanObjectStore"]["endpointURL"],
+            barman_cloud_object_store("lab", "nova-pg").data["spec"]["configuration"]["endpointURL"],
             "http://seaweedfs-s3.lab.svc.cluster.local:8333"
         );
     }
@@ -1063,7 +1048,8 @@ mod tests {
         assert_eq!(spec["schedule"], "0 0 3 * * *");
         assert_eq!(spec["immediate"], true);
         assert_eq!(spec["backupOwnerReference"], "self");
-        assert_eq!(spec["method"], "barmanObjectStore");
+        assert_eq!(spec["method"], "plugin");
+        assert_eq!(spec["pluginConfiguration"]["name"], BARMAN_PLUGIN);
         assert_eq!(spec["cluster"]["name"], "nova-pg");
     }
 
@@ -1085,16 +1071,66 @@ mod tests {
     }
 
     #[test]
-    fn keycloak_and_nova_databases_share_one_backup_block() {
-        // The keycloak builder shares the backup block with nova-pg: one definition.
+    fn keycloak_and_nova_databases_share_one_backup_form_with_different_stores() {
         assert_eq!(
             keycloak_pg_cluster("stardelt").data["spec"]["backup"],
             nova_pg_cluster("stardelt").data["spec"]["backup"]
         );
-        assert_ne!(
-            keycloak_pg_backup("stardelt").data["spec"]["schedule"],
-            nova_pg_backup("stardelt").data["spec"]["schedule"]
+        assert_eq!(
+            keycloak_pg_cluster("stardelt").data["spec"]["plugins"][0]["parameters"]["barmanObjectName"],
+            "keycloak-pg-backups"
         );
+        assert_eq!(
+            nova_pg_cluster("stardelt").data["spec"]["plugins"][0]["parameters"]["barmanObjectName"],
+            "nova-pg-backups"
+        );
+    }
+
+    #[test]
+    fn every_cluster_names_an_object_store_the_operator_creates() {
+        let namespace = "stardelt";
+        let clusters = [
+            catalog_cluster("lakehouse", namespace, Profile::Full),
+            keycloak_pg_cluster(namespace),
+            openfga_pg_cluster(namespace),
+            nova_pg_cluster(namespace),
+        ];
+        let stores: Vec<String> = barman_cloud_object_stores(namespace)
+            .iter()
+            .map(|store| store.metadata.name.clone().expect("ObjectStore name"))
+            .collect();
+        for cluster in clusters {
+            let name = cluster.metadata.name.clone().expect("Cluster name");
+            let store = cluster.data["spec"]["plugins"][0]["parameters"]["barmanObjectName"]
+                .as_str()
+                .expect("barmanObjectName");
+            assert!(
+                stores.iter().any(|candidate| candidate == store),
+                "{name} names {store}, which is not one of {stores:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_scheduled_backup_uses_the_plugin() {
+        for backup in [
+            catalog_pg_backup("lakehouse", "stardelt"),
+            keycloak_pg_backup("stardelt"),
+            openfga_pg_backup("stardelt"),
+            nova_pg_backup("stardelt"),
+        ] {
+            let spec = &backup.data["spec"];
+            assert_eq!(
+                spec["method"],
+                "plugin",
+                "{}",
+                backup.metadata.name.as_deref().unwrap()
+            );
+            assert_eq!(
+                spec["pluginConfiguration"]["name"], BARMAN_PLUGIN,
+                "method: plugin without pluginConfiguration creates no Backup (measured on platform#1236)"
+            );
+        }
     }
 
     #[test]
@@ -1480,7 +1516,8 @@ mod tests {
         assert_eq!(spec["schedule"], "0 30 2 * * *");
         assert_eq!(spec["immediate"], true);
         assert_eq!(spec["backupOwnerReference"], "self");
-        assert_eq!(spec["method"], "barmanObjectStore");
+        assert_eq!(spec["method"], "plugin");
+        assert_eq!(spec["pluginConfiguration"]["name"], BARMAN_PLUGIN);
         assert_eq!(spec["cluster"]["name"], "lakekeeper-pg");
     }
 
@@ -1491,9 +1528,16 @@ mod tests {
             cluster.data["spec"]["imageName"],
             "ghcr.io/cloudnative-pg/postgresql:17.7-system-trixie"
         );
-        assert_eq!(cluster.data["spec"]["backup"]["retentionPolicy"], "14d");
-        let store = &cluster.data["spec"]["backup"]["barmanObjectStore"];
-        assert_eq!(store["destinationPath"], "s3://backups/");
+        assert_eq!(
+            cluster.data["spec"]["plugins"][0]["parameters"]["barmanObjectName"],
+            "lakekeeper-pg-backups"
+        );
+        assert!(
+            cluster.data["spec"]["backup"]
+                .get("barmanObjectStore")
+                .is_none(),
+            "the native barmanObjectStore form is gone"
+        );
         assert_eq!(
             cluster.data["spec"]["postgresql"]["parameters"]["max_connections"],
             "150"
