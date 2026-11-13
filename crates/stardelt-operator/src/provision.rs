@@ -643,6 +643,36 @@ pub async fn ensure_spark(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply::<ServiceAccount>(
+        client,
+        namespace,
+        &spark::batch_driver_service_account(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Role>(
+        client,
+        namespace,
+        &spark::batch_driver_role(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        client,
+        namespace,
+        &spark::batch_driver_role_binding(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if let Err(e) = apply::<Role>(client, namespace, &spark::role(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
@@ -1687,14 +1717,40 @@ pub async fn ensure_airflow_rbac(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply_owned::<Role>(
+        &ctx.client,
+        namespace,
+        owner,
+        &airflow::spark_submitter_role(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply_owned::<RoleBinding>(
+        &ctx.client,
+        namespace,
+        owner,
+        &airflow::spark_submitter_binding(namespace),
+        spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if spec.dry_run {
         return Some(status(
             NAME,
             false,
-            "planned (dry-run): Role and RoleBinding airflow-pipeline-reader",
+            "planned (dry-run): Role and RoleBinding airflow-pipeline-reader, Role and RoleBinding airflow-spark-submitter",
         ));
     }
-    Some(status(NAME, true, "applied: airflow-pipeline-reader"))
+    Some(status(
+        NAME,
+        true,
+        "applied: airflow-pipeline-reader, airflow-spark-submitter",
+    ))
 }
 
 /// The CronJob that creates `stardelt-group-<ownerGroup>` FAB roles for the owner groups of
@@ -4523,7 +4579,7 @@ mod tests {
         assert_eq!(status.name, "airflow-rbac");
         assert_eq!(
             status.message.as_deref(),
-            Some("applied: airflow-pipeline-reader")
+            Some("applied: airflow-pipeline-reader, airflow-spark-submitter")
         );
         let rbac = "/apis/rbac.authorization.k8s.io/v1/namespaces/stardelt";
         assert_eq!(
@@ -4531,6 +4587,8 @@ mod tests {
             [
                 format!("{rbac}/roles/airflow-pipeline-reader"),
                 format!("{rbac}/rolebindings/airflow-pipeline-reader"),
+                format!("{rbac}/roles/airflow-spark-submitter"),
+                format!("{rbac}/rolebindings/airflow-spark-submitter"),
             ]
         );
     }
@@ -4548,7 +4606,9 @@ mod tests {
         assert!(!status.ready);
         assert_eq!(
             status.message.as_deref(),
-            Some("planned (dry-run): Role and RoleBinding airflow-pipeline-reader")
+            Some(
+                "planned (dry-run): Role and RoleBinding airflow-pipeline-reader, Role and RoleBinding airflow-spark-submitter"
+            )
         );
     }
 
@@ -5246,6 +5306,9 @@ mod tests {
         let expected = [
             "/api/v1/namespaces/data/serviceaccounts/spark-connect",
             "/api/v1/namespaces/data/serviceaccounts/spark-executor",
+            "/api/v1/namespaces/data/serviceaccounts/spark-batch-driver",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-batch-driver",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-batch-driver",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-connect",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-connect",
             "/api/v1/namespaces/data/configmaps/spark-connect-config",
