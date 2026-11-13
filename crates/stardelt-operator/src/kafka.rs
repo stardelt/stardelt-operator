@@ -49,6 +49,22 @@ pub fn node_pool(namespace: &str, profile: Profile) -> DynamicObject {
                 "limits": {"cpu": "1", "memory": "1536Mi"},
             },
             "jvmOptions": {"-Xms": "1g", "-Xmx": "1g"},
+            // Pod Security `restricted` (platform#1096 question 5, twin of platform#1197).
+            // Node pools are enabled, so the broker pod is rendered from THIS template — a
+            // `Kafka.spec.kafka.template` would be ignored. `fsGroup: 0` is what Strimzi sets
+            // today; keep it so the topic volume's group ownership does not change.
+            "template": {
+                "pod": {"securityContext": {
+                    "fsGroup": 0,
+                    "runAsNonRoot": true,
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                }},
+                "kafkaContainer": {"securityContext": {
+                    "allowPrivilegeEscalation": false,
+                    "capabilities": {"drop": ["ALL"]},
+                    "seccompProfile": {"type": "RuntimeDefault"},
+                }},
+            },
         }}),
     }
 }
@@ -79,7 +95,29 @@ pub fn broker(namespace: &str) -> DynamicObject {
                         "min.insync.replicas": 1,
                     },
                 },
-                "entityOperator": {"topicOperator": {}, "userOperator": {}},
+                // Pod Security `restricted` (platform#1096 question 5). The entity operator is a
+                // `Kafka` workload (not a node pool), so its template is here; both operator
+                // containers need the same block.
+                "entityOperator": {
+                    "topicOperator": {},
+                    "userOperator": {},
+                    "template": {
+                        "pod": {"securityContext": {
+                            "runAsNonRoot": true,
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        }},
+                        "topicOperatorContainer": {"securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {"drop": ["ALL"]},
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        }},
+                        "userOperatorContainer": {"securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": {"drop": ["ALL"]},
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        }},
+                    },
+                },
             },
         }),
     }
@@ -144,5 +182,41 @@ mod tests {
                 .and_then(|a| a.get("strimzi.io/node-pools")),
             Some(&"enabled".to_string())
         );
+    }
+
+    #[test]
+    fn node_pool_template_declares_the_restricted_fields() {
+        // Node pools are enabled: the broker pod comes from KafkaNodePool.spec.template.
+        let pool = node_pool("data", Profile::Demo);
+        assert_eq!(
+            pool.data["spec"]["template"]["pod"]["securityContext"],
+            json!({"fsGroup": 0, "runAsNonRoot": true,
+                   "seccompProfile": {"type": "RuntimeDefault"}})
+        );
+        assert_eq!(
+            pool.data["spec"]["template"]["kafkaContainer"]["securityContext"],
+            json!({"allowPrivilegeEscalation": false,
+                   "capabilities": {"drop": ["ALL"]},
+                   "seccompProfile": {"type": "RuntimeDefault"}})
+        );
+    }
+
+    #[test]
+    fn entity_operator_template_declares_the_restricted_fields() {
+        let broker = broker("data");
+        let template = &broker.data["spec"]["entityOperator"]["template"];
+        assert_eq!(
+            template["pod"]["securityContext"],
+            json!({"runAsNonRoot": true, "seccompProfile": {"type": "RuntimeDefault"}})
+        );
+        for name in ["topicOperatorContainer", "userOperatorContainer"] {
+            assert_eq!(
+                template[name]["securityContext"],
+                json!({"allowPrivilegeEscalation": false,
+                       "capabilities": {"drop": ["ALL"]},
+                       "seccompProfile": {"type": "RuntimeDefault"}}),
+                "{name} would keep the restricted violation"
+            );
+        }
     }
 }
