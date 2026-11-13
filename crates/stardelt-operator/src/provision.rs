@@ -868,6 +868,35 @@ pub async fn ensure_seaweedfs_network_policy(
     Some(status(NAME, true, "applied: seaweedfs-internal"))
 }
 
+/// Egress from scheduled notebook pods (stardelt-platform#1100, twin of the platform's
+/// manifest). Applied on every reconcile: it selects pods by label, so it is inert until a
+/// pipeline runs a notebook task.
+pub async fn ensure_pipeline_notebook_egress(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "pipeline-notebook-egress";
+    if let Err(e) = apply::<NetworkPolicy>(
+        &ctx.client,
+        namespace,
+        &network_policy::pipeline_notebook_egress(namespace),
+        lh.spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if lh.spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): NetworkPolicy pipeline-notebook-egress",
+        ));
+    }
+    Some(status(NAME, true, "applied: pipeline-notebook-egress"))
+}
+
 /// `<lakehouse>-discovery`: the ConfigMap that tells consumers where the catalog, the
 /// object store and Trino are. Published once the warehouse is bootstrapped, with
 /// server-side apply on every reconcile, and owned by the Lakehouse (it is derived
