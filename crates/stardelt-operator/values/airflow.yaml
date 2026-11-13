@@ -11,6 +11,31 @@
 # KubernetesExecutor: no Celery, no Redis, no standing workers; one replica of each component.
 executor: KubernetesExecutor
 
+# Pod Security `restricted` (platform#1096 question 5, twin of platform#1187). The pod block
+# REPLACES the chart's `uid`/`gid` fallback (templates/_helpers.yaml: "values are not
+# accumulated"), so it carries the current ids explicitly. Statsd reads its own block.
+securityContexts:
+  pod:
+    runAsUser: 50000
+    fsGroup: 0
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    allowPrivilegeEscalation: false
+    capabilities: {drop: ["ALL"]}
+    seccompProfile: {type: RuntimeDefault}
+
+statsd:
+  securityContexts:
+    pod:
+      runAsUser: 65534
+      runAsNonRoot: true
+      seccompProfile: {type: RuntimeDefault}
+    container:
+      allowPrivilegeEscalation: false
+      capabilities: {drop: ["ALL"]}
+      seccompProfile: {type: RuntimeDefault}
+
 # D42 phase 2a: the demo DAG publishes to the bus only when this is set. The operator fills it
 # from `streaming_values` when `spec.pillars.streaming` is on (platform#595 parity).
 kafka:

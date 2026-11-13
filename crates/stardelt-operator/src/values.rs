@@ -1212,6 +1212,45 @@ mod tests {
     }
 
     #[test]
+    fn airflow_golden_values_declare_the_restricted_pod_fields() {
+        let values = effective_values("airflow", Profile::Full, None, None);
+        assert_eq!(
+            values["securityContexts"]["pod"],
+            serde_json::json!({
+                "runAsUser": 50000,
+                "fsGroup": 0,
+                "runAsNonRoot": true,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert_eq!(
+            values["securityContexts"]["containers"],
+            serde_json::json!({
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        // The chart reads statsd.securityContexts, not the global pod block.
+        assert_eq!(
+            values["statsd"]["securityContexts"]["pod"],
+            serde_json::json!({
+                "runAsUser": 65534,
+                "runAsNonRoot": true,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert_eq!(
+            values["statsd"]["securityContexts"]["container"],
+            serde_json::json!({
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+    }
+
+    #[test]
     fn superset_only_nova_may_frame_it() {
         let values = golden_values("superset");
         let snippet = values["configOverrides"]["iframe_embedding"]
