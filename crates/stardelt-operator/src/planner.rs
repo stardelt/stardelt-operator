@@ -189,7 +189,7 @@ pub fn plan_pipeline(spec: &PipelineSpec) -> Vec<ComponentPlan> {
 /// platform Makefile. Bumped by Renovate in the platform repo today.
 pub fn chart_version(chart: &str) -> Option<&'static str> {
     match chart {
-        "cnpg/cloudnative-pg" => Some("0.28.2"),
+        "cnpg/cloudnative-pg" => Some("0.29.1"),
         "seaweedfs/seaweedfs" => Some("4.25.1"),
         "lakekeeper/lakekeeper" => Some("0.14.0"),
         "trino/trino" => Some("1.45.0"),
