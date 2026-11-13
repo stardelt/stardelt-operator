@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, LocalObjectReference, Pod, PodSpec,
-    PodTemplateSpec, ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource,
-    SecurityContext, Volume, VolumeMount,
+    Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, LocalObjectReference, Pod,
+    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
+    SecretKeySelector, SecretVolumeSource, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -198,6 +198,15 @@ pub fn cron_job(
         image_pull_secrets: Some(vec![LocalObjectReference {
             name: "ghcr-creds".to_string(),
         }]),
+        // Pod Security `restricted` (platform#1096 question 5): the CLI image already
+        // runs as UID 65532 (stardelt-python/image/Dockerfile), so this asserts what is
+        // true and lets a kubelet on a `restricted` namespace start the pod. The
+        // container-level fields (allowPrivilegeEscalation, capabilities, seccomp) are
+        // set above and stay where they are.
+        security_context: Some(PodSecurityContext {
+            run_as_non_root: Some(true),
+            ..PodSecurityContext::default()
+        }),
         containers: vec![container],
         volumes: Some(vec![Volume {
             name: "trino-ca".to_string(),
@@ -1041,6 +1050,45 @@ mod tests {
         assert_eq!(
             job.metadata.owner_references.as_ref().unwrap()[0].name,
             "mobility"
+        );
+    }
+
+    #[test]
+    fn the_maintenance_pod_declares_run_as_non_root() {
+        let job = cron_job(
+            "stardelt",
+            "mobility",
+            "analytics",
+            &MaintenanceSpec::default(),
+            &token_url(None),
+            &owner(),
+        );
+        let pod = job.spec.job_template.spec.unwrap().template.spec.unwrap();
+        let pod_security = pod.security_context.expect("a pod-level securityContext");
+        assert_eq!(
+            pod_security.run_as_non_root,
+            Some(true),
+            "Pod Security restricted requires runAsNonRoot on the pod or the container"
+        );
+        // The container keeps its own three fields.
+        let container_security = pod.containers[0]
+            .security_context
+            .as_ref()
+            .expect("the container securityContext stays");
+        assert_eq!(container_security.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            container_security
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .drop
+                .as_ref()
+                .unwrap(),
+            &vec!["ALL".to_string()]
+        );
+        assert_eq!(
+            container_security.seccomp_profile.as_ref().unwrap().type_,
+            "RuntimeDefault"
         );
     }
 
