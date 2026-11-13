@@ -9,9 +9,9 @@ use k8s_openapi::{
     api::{
         batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec},
         core::v1::{
-            Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, PodSpec, PodTemplateSpec,
-            SeccompProfile, Secret, SecretKeySelector, SecretVolumeSource, SecurityContext, Volume,
-            VolumeMount,
+            Capabilities, ConfigMap, Container, EnvVar, EnvVarSource, PodSecurityContext, PodSpec,
+            PodTemplateSpec, SeccompProfile, Secret, SecretKeySelector, SecretVolumeSource,
+            SecurityContext, Volume, VolumeMount,
         },
     },
     apimachinery::pkg::apis::meta::v1::OwnerReference,
@@ -521,6 +521,22 @@ pub fn archive_bucket_job_name(endpoint: &str) -> String {
     format!("archive-bucket-{:08x}", hasher.finish() as u32)
 }
 
+/// Pod Security `restricted` for the two aws-cli Jobs (platform#1096 question 5): the
+/// image runs as root by default. 65534 with HOME=/tmp is measured for `aws s3 sync`
+/// against the platform's store (2026-11-13); HOME is set on the containers below.
+fn archive_pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_non_root: Some(true),
+        run_as_user: Some(65534),
+        run_as_group: Some(65534),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".into(),
+            localhost_profile: None,
+        }),
+        ..Default::default()
+    }
+}
+
 /// The Job that creates the archive destination bucket.
 pub fn archive_bucket_job(
     lakehouse: &str,
@@ -539,6 +555,7 @@ pub fn archive_bucket_job(
                 spec: Some(PodSpec {
                     restart_policy: Some("OnFailure".into()),
                     automount_service_account_token: Some(false),
+                    security_context: Some(archive_pod_security_context()),
                     containers: vec![Container {
                         name: "bucket".into(),
                         image: Some("amazon/aws-cli:2.17.0".into()),
@@ -554,6 +571,11 @@ pub fn archive_bucket_job(
                             secret_env("AWS_SECRET_ACCESS_KEY", "secret-key"),
                             secret_env("AWS_ENDPOINT_URL", "endpoint"),
                             secret_env("AWS_DEFAULT_REGION", "region"),
+                            EnvVar {
+                                name: "HOME".into(),
+                                value: Some("/tmp".into()),
+                                ..Default::default()
+                            },
                         ]),
                         security_context: Some(SecurityContext {
                             allow_privilege_escalation: Some(false),
@@ -601,6 +623,7 @@ pub fn archive_cron_job(namespace: &str, lakehouse: &str) -> CronJob {
                         spec: Some(PodSpec {
                             restart_policy: Some("Never".into()),
                             automount_service_account_token: Some(false),
+                            security_context: Some(archive_pod_security_context()),
                             containers: vec![Container {
                                 name: "s3-sync".into(),
                                 image: Some("amazon/aws-cli:2.17.0".into()),
@@ -615,6 +638,11 @@ pub fn archive_cron_job(namespace: &str, lakehouse: &str) -> CronJob {
                                     EnvVar {
                                         name: "DEST_BUCKET".into(),
                                         value: Some(ARCHIVE_BUCKET.into()),
+                                        ..Default::default()
+                                    },
+                                    EnvVar {
+                                        name: "HOME".into(),
+                                        value: Some("/tmp".into()),
                                         ..Default::default()
                                     },
                                 ]),
@@ -1241,11 +1269,16 @@ mod tests {
                 ("AWS_SECRET_ACCESS_KEY", Some("secret-key")),
                 ("AWS_ENDPOINT_URL", Some("endpoint")),
                 ("AWS_DEFAULT_REGION", Some("region")),
+                ("HOME", None),
             ]
         );
         assert_eq!(
             c.env.as_ref().expect("env")[0].value.as_deref(),
             Some("lakehouse-backup")
+        );
+        assert_eq!(
+            c.env.as_ref().expect("env")[5].value.as_deref(),
+            Some("/tmp")
         );
         let script = &c.args.as_ref().expect("args")[0];
         assert!(script.contains("create-bucket"));
@@ -1289,15 +1322,50 @@ mod tests {
                 ("AWS_DEFAULT_REGION", Some("region")),
                 ("SOURCE_BUCKET", Some("bucket")),
                 ("DEST_BUCKET", None),
+                ("HOME", None),
             ]
         );
         assert_eq!(
             c.env.as_ref().expect("env")[5].value.as_deref(),
             Some("lakehouse-backup")
         );
+        assert_eq!(
+            c.env.as_ref().expect("env")[6].value.as_deref(),
+            Some("/tmp")
+        );
         let script = &c.args.as_ref().expect("args")[0];
         assert!(script.contains("aws s3 sync"));
         assert!(!script.contains("--delete"));
+    }
+
+    #[test]
+    fn the_archive_jobs_declare_the_restricted_pod_fields() {
+        let pod = |spec: k8s_openapi::api::core::v1::PodSpec| {
+            let sc = spec.security_context.clone().expect("pod securityContext");
+            assert_eq!(sc.run_as_non_root, Some(true));
+            assert_eq!(sc.run_as_user, Some(65534));
+            assert_eq!(sc.run_as_group, Some(65534));
+            assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "RuntimeDefault");
+            spec
+        };
+        let cj = archive_cron_job("data", "main");
+        let cron = cj
+            .spec
+            .job_template
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .clone()
+            .unwrap();
+        pod(cron);
+        let owner = OwnerReference {
+            name: "main".into(),
+            ..Default::default()
+        };
+        let job = archive_bucket_job("main", "data", "archive-bucket-1", owner);
+        pod(job.spec.expect("spec").template.spec.expect("pod"));
     }
 
     #[test]
