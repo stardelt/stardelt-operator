@@ -37,10 +37,23 @@ server:
         tls_disable = 1
         address = "[::]:8200"
         cluster_address = "[::]:8201"
+        # The scrape source (#607): a Prometheus may read /v1/sys/metrics without a
+        # token. Nothing here is secret — process, request and storage counters — and
+        # the route stays on the Service port, never an Ingress.
+        telemetry {
+          unauthenticated_metrics_access = true
+        }
       }
 
       storage "pebbledb" {
         path = "/openbao/data/pebbledb"
+      }
+
+      # Without a retention window the /v1/sys/metrics route refuses the prometheus
+      # format (`prometheus_retention_time` defaults to 0 = off, #607).
+      telemetry {
+        prometheus_retention_time = "30s"
+        disable_hostname          = true
       }
 
       seal "static" {

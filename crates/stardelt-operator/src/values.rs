@@ -1622,4 +1622,17 @@ mod tests {
         assert_eq!(values["server"]["extraVolumes"][0]["path"], "/openbao/seal");
         assert_eq!(values["injector"]["enabled"], false);
     }
+
+    #[test]
+    fn openbao_values_enable_prometheus_metrics() {
+        // The platform's listener settings (#607): /v1/sys/metrics answers without
+        // a token only with both blocks, and the operator path must not diverge.
+        let values = golden_values("openbao");
+        let config = values["server"]["standalone"]["config"]
+            .as_str()
+            .expect("server.standalone.config is a string");
+        assert!(config.contains("unauthenticated_metrics_access = true"));
+        assert!(config.contains("prometheus_retention_time = \"30s\""));
+        assert_eq!(config.matches("telemetry {").count(), 2);
+    }
 }
