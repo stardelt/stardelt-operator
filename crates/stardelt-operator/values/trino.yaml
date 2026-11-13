@@ -13,6 +13,19 @@ additionalConfigProperties:
 # this into the coordinator AND worker config.properties; the file it names is the
 # `additionalConfigFiles` entry on both roles below.
 - cache-manager.config-files=etc/cache-manager-alluxio.properties
+# Pod Security `restricted` (platform#1096 question 5, twin of platform#1190). Both keys are the
+# chart's own and each REPLACES the chart's block, so the pod repeats the ids the image runs with
+# (`uid=1000(trino)`, measured on the platform path) and the container repeats the two fields the
+# chart already declared. `restricted` then needs only runAsNonRoot and seccomp.
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  runAsNonRoot: true
+  seccompProfile: {type: RuntimeDefault}
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities: {drop: ["ALL"]}
+  seccompProfile: {type: RuntimeDefault}
 env:
 - name: S3_ACCESS_KEY
   valueFrom:
