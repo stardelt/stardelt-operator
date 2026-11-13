@@ -288,6 +288,20 @@ pub fn spark_application(
                     "memory": "2g",
                     "memoryOverhead": "1g",
                     "serviceAccount": "spark-connect",
+                    // Pod Security `restricted` (platform#1096 question 5). The image's own uid
+                    // is 185, so this declares what already happens; the four fields are what an
+                    // enforcing namespace checks.
+                    "podSecurityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 185,
+                        "fsGroup": 185,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
                     "env": [
                         {"name": "CATALOG_CLIENT_ID", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-id"}}},
                         {"name": "CATALOG_CLIENT_SECRET", "valueFrom": {"secretKeyRef": {"name": sp, "key": "client-secret"}}},
@@ -302,6 +316,24 @@ pub fn spark_application(
                     "cores": 1,
                     "coreRequest": "500m",
                     "instances": 1,
+                    // The admission policy `spark-connect-executor-pods` (platform#1096
+                    // question 2) admits only executor pods that run as the token-less
+                    // `spark-executor` ServiceAccount. Without this line Spark submits the
+                    // executor as `default` and the policy refuses every pod: the stream runs
+                    // with no executor at all (measured on `pegelonline`, 2026-11-13T10:0xZ).
+                    "serviceAccount": spark::EXECUTOR,
+                    // Pod Security `restricted` (platform#1096 question 5); same image, same uid.
+                    "podSecurityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 185,
+                        "fsGroup": 185,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "securityContext": {
+                        "allowPrivilegeEscalation": false,
+                        "capabilities": {"drop": ["ALL"]},
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
                     "memory": "2g",
                     "memoryOverhead": "1g",
                     "volumeMounts": [{"name": "job", "mountPath": JOB_MOUNT}],
@@ -2112,5 +2144,61 @@ mod tests {
 
         let pending = ready_condition("Pending", "Pending", Some(3), None, now);
         assert_eq!(pending.status, "False");
+    }
+
+    #[test]
+    fn both_roles_declare_the_restricted_fields() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
+        for role in ["driver", "executor"] {
+            assert_eq!(
+                a.data["spec"][role]["podSecurityContext"],
+                json!({"runAsNonRoot": true, "runAsUser": 185, "fsGroup": 185,
+                       "seccompProfile": {"type": "RuntimeDefault"}}),
+                "{role} would keep the restricted violation"
+            );
+            assert_eq!(
+                a.data["spec"][role]["securityContext"],
+                json!({"allowPrivilegeEscalation": false,
+                       "capabilities": {"drop": ["ALL"]},
+                       "seccompProfile": {"type": "RuntimeDefault"}}),
+                "{role} would keep the restricted violation"
+            );
+        }
+    }
+
+    #[test]
+    fn the_executor_runs_as_the_token_less_spark_executor_service_account() {
+        let s = spec(SinkMode::Merge, vec!["id"]);
+        let a = spark_application(
+            "data",
+            "orders",
+            &s,
+            "k:9092",
+            "s3a://c/p",
+            &owner(),
+            TOKEN_URL,
+        )
+        .expect("ok");
+        // The driver keeps the ServiceAccount that may create executor pods; it is also what
+        // the executor admission policy matches on.
+        assert_eq!(a.data["spec"]["driver"]["serviceAccount"], "spark-connect");
+        assert_eq!(
+            a.data["spec"]["executor"]["serviceAccount"],
+            crate::spark::EXECUTOR
+        );
+        assert_eq!(
+            a.data["spec"]["executor"]["serviceAccount"],
+            "spark-executor"
+        );
     }
 }
