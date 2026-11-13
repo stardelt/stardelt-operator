@@ -163,6 +163,9 @@ singleuser:
           - -c
           - 'cp -n /opt/stardelt/notebooks/*.ipynb "$HOME/" || true'
   networkPolicy:
+    egressAllowRules:
+      # Public egress comes from the NetworkPolicy notebook-public-egress, members only (platform#1101).
+      nonPrivateIPs: false
     egress:
       - to:
           - podSelector:
