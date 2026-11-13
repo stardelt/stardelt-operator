@@ -427,6 +427,21 @@ pub fn seaweedfs_internal(namespace: &str) -> NetworkPolicy {
                     )])]),
                     ports: Some(vec![port(9327)]),
                 },
+                // The chart's bucket hook (stardelt-platform#1244): `helm upgrade` runs it as a
+                // post-upgrade hook — after this policy is live — and the operator installs the
+                // chart with `s3.createBuckets` (`values/seaweedfs.yaml`), so every upgrade
+                // creates the `lakehouse` and `backups` buckets through it. It waits on the
+                // master's `/cluster/status` (9333) and the filer (8888), then `weed shell`
+                // dials the master's gRPC port (19333) and the filer's (18888).
+                // The Job controller labels the pod `job-name: <job>` and the chart's Job name is
+                // the fixed `seaweedfs-bucket-hook` (`helm template … --version 4.25.1` renders
+                // exactly that name). `job-name` is the pod's own label, so this admits any pod in
+                // the namespace that claims it — still far narrower than
+                // `app.kubernetes.io/instance: seaweedfs`, which would also admit the S3 gateway.
+                NetworkPolicyIngressRule {
+                    from: Some(vec![peer(&[("job-name", "seaweedfs-bucket-hook")])]),
+                    ports: Some(vec![port(9333), port(8888), port(19333), port(18888)]),
+                },
             ]),
             egress: None,
         }),
@@ -781,7 +796,7 @@ mod tests {
         );
         assert!(spec.egress.is_none());
         let ingress = spec.ingress.as_ref().expect("ingress");
-        assert_eq!(ingress.len(), 2);
+        assert_eq!(ingress.len(), 3);
         assert!(ingress[0].ports.is_none(), "every port, not a list");
         let from = ingress[0].from.as_ref().expect("from");
         assert_eq!(from.len(), 1);
@@ -798,8 +813,48 @@ mod tests {
     fn seaweedfs_policy_admits_a_prometheus_scraper_on_9327() {
         let policy = seaweedfs_internal("data");
         let ingress = policy.spec.as_ref().unwrap().ingress.as_ref().unwrap();
-        assert_eq!(ingress.len(), 2);
+        assert_eq!(ingress.len(), 3);
         assert_scrape_rule(&ingress[1], 9327);
+    }
+
+    #[test]
+    fn seaweedfs_policy_admits_the_bucket_hook_on_the_data_and_grpc_ports() {
+        let policy = seaweedfs_internal("data");
+        let ingress = policy.spec.as_ref().unwrap().ingress.as_ref().unwrap();
+        assert_eq!(ingress.len(), 3);
+        let rule = &ingress[2];
+        let peers = rule.from.as_ref().expect("peers");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            owner_labels(&peers[0]),
+            BTreeMap::from([("job-name".to_string(), "seaweedfs-bucket-hook".to_string())])
+        );
+        assert!(peers[0].namespace_selector.is_none());
+        assert!(peers[0].ip_block.is_none());
+        let ports: Vec<_> = rule
+            .ports
+            .as_ref()
+            .expect("ports")
+            .iter()
+            .map(|entry| entry.port.clone().expect("a port number"))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                IntOrString::Int(9333),
+                IntOrString::Int(8888),
+                IntOrString::Int(19333),
+                IntOrString::Int(18888)
+            ],
+            "master HTTP, filer HTTP, master gRPC, filer gRPC — in the platform manifest's order"
+        );
+        assert!(
+            rule.ports
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.protocol.as_deref() == Some("TCP"))
+        );
     }
 
     #[test]
