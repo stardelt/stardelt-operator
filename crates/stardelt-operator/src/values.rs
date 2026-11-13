@@ -1057,6 +1057,28 @@ mod tests {
     }
 
     #[test]
+    fn lakekeeper_golden_values_declare_the_restricted_pod_fields() {
+        // Both keys replace the chart's block (platform#1196); dropping either one re-opens the
+        // profile violation on the catalog pod and the migration Job.
+        let l = golden_values("lakekeeper");
+        assert_eq!(
+            l["catalog"]["podSecurityContext"],
+            serde_json::json!({
+                "runAsNonRoot": true,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert_eq!(
+            l["catalog"]["containerSecurityContext"],
+            serde_json::json!({
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+    }
+
+    #[test]
     fn seaweedfs_golden_values_read_identities_from_the_generated_secret() {
         let s = golden_values("seaweedfs");
         assert_eq!(
