@@ -75,6 +75,15 @@ pub fn plan_platform(spec: &PlatformInstanceSpec) -> Vec<ComponentPlan> {
             chart: Some("spark-operator/spark-operator"),
         });
     }
+    // The barman-cloud plugin (platform#1234, the operator twin): CloudNativePG 1.32.0 removes
+    // `spec.backup.barmanObjectStore`, and this plugin's `ObjectStore` CRD is what replaces it.
+    // It is planned last because nothing else in the plan depends on it: the four ObjectStores
+    // are applied after the whole plan (`provision::ensure_barman_cloud`), so its CRD exists by
+    // then. `stop_platform` scales its Deployment to zero like any other component.
+    plan.push(ComponentPlan {
+        name: "barman-cloud",
+        chart: Some("cnpg/plugin-barman-cloud"),
+    });
     plan
 }
 
@@ -190,6 +199,7 @@ pub fn plan_pipeline(spec: &PipelineSpec) -> Vec<ComponentPlan> {
 pub fn chart_version(chart: &str) -> Option<&'static str> {
     match chart {
         "cnpg/cloudnative-pg" => Some("0.29.1"),
+        "cnpg/plugin-barman-cloud" => Some("0.9.0"),
         "seaweedfs/seaweedfs" => Some("4.25.1"),
         "lakekeeper/lakekeeper" => Some("0.14.0"),
         "trino/trino" => Some("1.45.0"),
@@ -210,6 +220,7 @@ pub fn chart_version(chart: &str) -> Option<&'static str> {
 pub fn chart_repo(chart: &str) -> Option<&'static str> {
     match chart {
         "cnpg/cloudnative-pg" => Some("https://cloudnative-pg.github.io/charts"),
+        "cnpg/plugin-barman-cloud" => Some("https://cloudnative-pg.github.io/charts"),
         "seaweedfs/seaweedfs" => Some("https://seaweedfs.github.io/seaweedfs/helm"),
         "lakekeeper/lakekeeper" => Some("https://lakekeeper.github.io/lakekeeper-charts/"),
         "trino/trino" => Some("https://trinodb.github.io/charts"),
@@ -324,7 +335,10 @@ mod tests {
             monitoring: Default::default(),
         };
         assert!(!without.pillars.notebooks, "notebooks stay opt-in");
-        assert_eq!(names(&plan_platform(&without)), vec!["cnpg"]);
+        assert_eq!(
+            names(&plan_platform(&without)),
+            vec!["cnpg", "barman-cloud"]
+        );
 
         let with = PlatformInstanceSpec {
             pillars: Pillars {
@@ -333,7 +347,10 @@ mod tests {
             },
             ..without
         };
-        assert_eq!(names(&plan_platform(&with)), vec!["cnpg", "jupyterhub"]);
+        assert_eq!(
+            names(&plan_platform(&with)),
+            vec!["cnpg", "jupyterhub", "barman-cloud"]
+        );
     }
 
     #[test]
@@ -351,7 +368,7 @@ mod tests {
             ingress: Default::default(),
             monitoring: Default::default(),
         };
-        assert_eq!(names(&plan_platform(&base)), vec!["cnpg"]);
+        assert_eq!(names(&plan_platform(&base)), vec!["cnpg", "barman-cloud"]);
     }
 
     #[test]
@@ -383,7 +400,7 @@ mod tests {
         });
         assert_eq!(
             names(&plan_external),
-            vec!["cnpg", "external-secrets", "jupyterhub"]
+            vec!["cnpg", "external-secrets", "jupyterhub", "barman-cloud"]
         );
         let plan_platform_mode = plan_platform(&PlatformInstanceSpec {
             secrets: SecretsSpec {
@@ -399,7 +416,13 @@ mod tests {
         });
         assert_eq!(
             names(&plan_platform_mode),
-            vec!["cnpg", "external-secrets", "openbao", "jupyterhub"]
+            vec![
+                "cnpg",
+                "external-secrets",
+                "openbao",
+                "jupyterhub",
+                "barman-cloud"
+            ]
         );
     }
 
@@ -410,6 +433,16 @@ mod tests {
         assert_eq!(
             chart_repo(chart),
             Some("https://charts.external-secrets.io")
+        );
+    }
+
+    #[test]
+    fn barman_cloud_is_pinned_at_the_version_and_repo_of_the_platform() {
+        let chart = "cnpg/plugin-barman-cloud";
+        assert_eq!(chart_version(chart), Some("0.9.0"));
+        assert_eq!(
+            chart_repo(chart),
+            Some("https://cloudnative-pg.github.io/charts")
         );
     }
 
@@ -434,7 +467,7 @@ mod tests {
         };
         assert_eq!(
             names(&plan_platform(&base)),
-            vec!["cnpg", "external-secrets", "openbao"]
+            vec!["cnpg", "external-secrets", "openbao", "barman-cloud"]
         );
     }
 
@@ -459,7 +492,7 @@ mod tests {
         };
         assert_eq!(
             names(&plan_platform(&base)),
-            vec!["cnpg", "external-secrets"]
+            vec!["cnpg", "external-secrets", "barman-cloud"]
         );
     }
 
@@ -495,7 +528,7 @@ mod tests {
             },
             ..base.clone()
         });
-        assert_eq!(names(&plan), vec!["cnpg", "airflow"]);
+        assert_eq!(names(&plan), vec!["cnpg", "airflow", "barman-cloud"]);
         assert_eq!(plan[1].chart, Some("apache-airflow/airflow"));
         let both = plan_platform(&PlatformInstanceSpec {
             pillars: Pillars {
@@ -505,7 +538,10 @@ mod tests {
             },
             ..base
         });
-        assert_eq!(names(&both), vec!["cnpg", "jupyterhub", "airflow"]);
+        assert_eq!(
+            names(&both),
+            vec!["cnpg", "jupyterhub", "airflow", "barman-cloud"]
+        );
     }
 
     #[test]
@@ -540,7 +576,7 @@ mod tests {
             },
             ..base.clone()
         });
-        assert_eq!(names(&plan), vec!["cnpg", "superset"]);
+        assert_eq!(names(&plan), vec!["cnpg", "superset", "barman-cloud"]);
         assert_eq!(plan[1].chart, Some("superset/superset"));
         let both = plan_platform(&PlatformInstanceSpec {
             pillars: Pillars {
@@ -550,7 +586,10 @@ mod tests {
             },
             ..base
         });
-        assert_eq!(names(&both), vec!["cnpg", "airflow", "superset"]);
+        assert_eq!(
+            names(&both),
+            vec!["cnpg", "airflow", "superset", "barman-cloud"]
+        );
     }
 
     #[test]
@@ -591,7 +630,10 @@ mod tests {
             chart_version("strimzi/strimzi-kafka-operator"),
             Some("1.3.1")
         );
-        assert_eq!(names(&plan), vec!["cnpg", "kafka", "spark-operator"]);
+        assert_eq!(
+            names(&plan),
+            vec!["cnpg", "kafka", "spark-operator", "barman-cloud"]
+        );
         assert_eq!(
             chart_version("spark-operator/spark-operator"),
             Some("2.5.2")
@@ -617,7 +659,7 @@ mod tests {
             ingress: Default::default(),
             monitoring: Default::default(),
         };
-        assert_eq!(names(&plan_platform(&pi)), vec!["cnpg"]);
+        assert_eq!(names(&plan_platform(&pi)), vec!["cnpg", "barman-cloud"]);
         // It must not leak into a per-Lakehouse plan.
         let lh = plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs));
         assert!(!names(&lh).contains(&"cnpg"));

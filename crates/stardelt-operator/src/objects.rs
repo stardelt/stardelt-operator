@@ -196,6 +196,14 @@ pub fn cnpg_scheduled_backup_resource() -> ApiResource {
     )
 }
 
+/// The barman-cloud plugin's `ObjectStore` (`objectstores.barmancloud.cnpg.io/v1`).
+pub fn barman_object_store_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("barmancloud.cnpg.io", "v1", "ObjectStore"),
+        "objectstores",
+    )
+}
+
 /// A cert-manager `Issuer` (`issuers.cert-manager.io/v1`).
 pub fn cert_manager_issuer_resource() -> ApiResource {
     ApiResource::from_gvk_with_plural(

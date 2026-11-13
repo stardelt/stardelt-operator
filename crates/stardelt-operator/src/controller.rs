@@ -47,9 +47,9 @@ use crate::prerequisites::{CATALOG_CLUSTER, NOVA_CLUSTER};
 use crate::principal::reconcile_principal;
 use crate::provision::{
     ensure_access_sync, ensure_airflow_group_roles, ensure_airflow_rbac, ensure_airflow_secrets,
-    ensure_archive, ensure_bootstrap, ensure_catalog_database, ensure_catalog_principals,
-    ensure_discovery, ensure_external_store, ensure_group_stores, ensure_identity,
-    ensure_identity_secrets, ensure_ingress, ensure_kafka_broker, ensure_keycloak,
+    ensure_archive, ensure_barman_cloud, ensure_bootstrap, ensure_catalog_database,
+    ensure_catalog_principals, ensure_discovery, ensure_external_store, ensure_group_stores,
+    ensure_identity, ensure_identity_secrets, ensure_ingress, ensure_kafka_broker, ensure_keycloak,
     ensure_keycloak_pg, ensure_lakekeeper_network_policy, ensure_notebook_public_egress,
     ensure_notebooks_bucket, ensure_nova, ensure_nova_events, ensure_nova_pg, ensure_nova_session,
     ensure_openbao_init, ensure_openbao_seal_key, ensure_openfga_database,
@@ -797,10 +797,12 @@ const LAKEHOUSE_FINALIZER: &str = "stardelt.io/lakehouse-deletion";
 /// uninstalled (D18, epic#55 definition of done 3).
 const PLATFORM_FINALIZER: &str = "stardelt.io/platform-instance-deletion";
 
-/// Cluster-scoped controllers every instance shares. A delete never uninstalls them: the
-/// CNPG operator manages the databases whose data is retained, and External Secrets owns
-/// the ClusterSecretStores and synced Secrets that outlive the instance.
-const PLATFORM_SHARED_RELEASES: [&str; 2] = ["cnpg", "external-secrets"];
+/// Controllers every instance shares, and whose objects must outlive it. A delete never
+/// uninstalls them: the CNPG operator manages the databases whose data is retained, External
+/// Secrets owns the ClusterSecretStores and synced Secrets that outlive the instance, and the
+/// barman-cloud plugin owns the `ObjectStore` CRD and the four stores a retained `Cluster` names
+/// (D18; uninstalling it would silently stop the backups of data that is kept).
+const PLATFORM_SHARED_RELEASES: [&str; 3] = ["cnpg", "external-secrets", "barman-cloud"];
 
 /// Label the SeaweedFS chart puts on its three data PVCs. Only volumes carrying
 /// it are ever deleted; another release's volumes in the same namespace are
@@ -1995,6 +1997,11 @@ async fn reconcile_platform(
     if let Some(bus) = ensure_kafka_broker(&ctx, &instance.spec).await {
         outcome.components.push(bus);
     }
+    // The backup stores precede any Cluster that names one (platform#1234); the plugin release
+    // is in the plan applied above, so its CRD exists by now.
+    outcome
+        .components
+        .push(ensure_barman_cloud(&ctx, &instance.spec).await);
     // The identity database comes before the contract that points the components at it.
     if let Some(database) = ensure_keycloak_pg(&ctx, &instance.spec).await {
         outcome.components.push(database);
