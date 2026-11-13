@@ -528,6 +528,21 @@ mod tests {
     }
 
     #[test]
+    fn notebook_pods_carry_no_privileged_metadata_block() {
+        let values = golden_values("jupyterhub");
+        assert_eq!(
+            values["singleuser"]["cloudMetadata"]["blockWithIptables"],
+            serde_json::json!(false),
+            "z2jh appends a privileged block-cloud-metadata init container when this is true"
+        );
+        assert_ne!(
+            values["singleuser"]["networkPolicy"]["egressAllowRules"]["cloudMetadataServer"],
+            serde_json::json!(true),
+            "the metadata endpoint must stay excluded from the single-user egress policy"
+        );
+    }
+
+    #[test]
     fn notebook_task_image_matches_the_single_user_image() {
         let airflow: Value = serde_yaml::from_str(include_str!("../values/airflow.yaml"))
             .expect("values/airflow.yaml is valid YAML");
