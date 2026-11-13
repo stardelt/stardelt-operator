@@ -1,5 +1,6 @@
-//! The customer's Prometheus (operator#607): the ServiceMonitors for the components that
-//! expose metrics, and the condition that says why none were rendered.
+//! The customer's Prometheus (operator#607): the ServiceMonitors and PodMonitors for the
+//! components that expose metrics, the starter alerts, and the condition that says why none
+//! were rendered.
 
 use std::collections::BTreeMap;
 
@@ -17,8 +18,13 @@ use crate::objects;
 /// The CRD that must exist before a `ServiceMonitor` can be applied.
 pub const SERVICE_MONITOR_CRD: &str = "servicemonitors.monitoring.coreos.com";
 
-/// How often Prometheus scrapes the object store.
+/// How often Prometheus scrapes the platform's endpoints.
 pub const SCRAPE_INTERVAL: &str = "30s";
+
+/// The four CloudNative-PG clusters the platform installs. They are applied by two
+/// controllers, so this list is deliberately static: a PodMonitor for a cluster that is not
+/// installed selects no pod and costs nothing.
+pub const CNPG_CLUSTERS: [&str; 4] = ["lakekeeper-pg", "openfga-pg", "keycloak-pg", "nova-pg"];
 
 /// The `ServiceMonitor` resource (`monitoring.coreos.com/v1`).
 pub fn service_monitor_resource() -> ApiResource {
@@ -28,6 +34,33 @@ pub fn service_monitor_resource() -> ApiResource {
     )
 }
 
+/// The `PodMonitor` resource (`monitoring.coreos.com/v1`).
+pub fn pod_monitor_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("monitoring.coreos.com", "v1", "PodMonitor"),
+        "podmonitors",
+    )
+}
+
+/// The `PrometheusRule` resource (`monitoring.coreos.com/v1`).
+pub fn prometheus_rule_resource() -> ApiResource {
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("monitoring.coreos.com", "v1", "PrometheusRule"),
+        "prometheusrules",
+    )
+}
+
+/// The labels every rendered object carries: `app.kubernetes.io/part-of: stardelt` first,
+/// then the customer's labels, which win.
+fn object_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut labels = labels.clone();
+    labels.insert(
+        "app.kubernetes.io/part-of".to_string(),
+        "stardelt".to_string(),
+    );
+    labels
+}
+
 /// One `ServiceMonitor` per object-store component that publishes a `metrics` port
 /// (measured 2026-11-12: `master`, `filer`, `volume` and `s3` answer on 9327).
 ///
@@ -35,12 +68,7 @@ pub fn service_monitor_resource() -> ApiResource {
 /// the stepwise install label the Services differently, while `name` and `component` agree
 /// in both paths.
 pub fn servicemonitors(namespace: &str, labels: &BTreeMap<String, String>) -> Vec<DynamicObject> {
-    let mut object_labels = BTreeMap::from([(
-        "app.kubernetes.io/part-of".to_string(),
-        "stardelt".to_string(),
-    )]);
-    object_labels.extend(labels.iter().map(|(k, v)| (k.clone(), v.clone())));
-
+    let labels = object_labels(labels);
     ["master", "filer", "volume", "s3"]
         .iter()
         .map(|component| DynamicObject {
@@ -51,7 +79,7 @@ pub fn servicemonitors(namespace: &str, labels: &BTreeMap<String, String>) -> Ve
             metadata: ObjectMeta {
                 name: Some(format!("seaweedfs-{component}")),
                 namespace: Some(namespace.into()),
-                labels: Some(object_labels.clone()),
+                labels: Some(labels.clone()),
                 ..ObjectMeta::default()
             },
             data: json!({"spec": {
@@ -63,6 +91,140 @@ pub fn servicemonitors(namespace: &str, labels: &BTreeMap<String, String>) -> Ve
             }}),
         })
         .collect()
+}
+
+/// One `PodMonitor` per CloudNative-PG cluster: the instance manager serves Prometheus text
+/// on the pod's `metrics` port (9187, measured 2026-11-12) and its pod carries
+/// `cnpg.io/cluster: <name>`. CNPG has no Service for that port, so a ServiceMonitor cannot
+/// select it.
+pub fn podmonitors(namespace: &str, labels: &BTreeMap<String, String>) -> Vec<DynamicObject> {
+    let labels = object_labels(labels);
+    CNPG_CLUSTERS
+        .iter()
+        .map(|cluster| DynamicObject {
+            types: Some(TypeMeta {
+                api_version: "monitoring.coreos.com/v1".into(),
+                kind: "PodMonitor".into(),
+            }),
+            metadata: ObjectMeta {
+                name: Some(format!("cnpg-{cluster}")),
+                namespace: Some(namespace.into()),
+                labels: Some(labels.clone()),
+                ..ObjectMeta::default()
+            },
+            data: json!({"spec": {
+                "selector": {"matchLabels": {"cnpg.io/cluster": cluster}},
+                "podMetricsEndpoints": [{
+                    "port": "metrics",
+                    "path": "/metrics",
+                    "interval": SCRAPE_INTERVAL,
+                }],
+            }}),
+        })
+        .collect()
+}
+
+/// The starter alerts (#607 item 5). Every expression uses a series measured on the lab on
+/// 2026-11-12; an alert whose series does not exist stays inactive instead of failing.
+/// `runbook_url` points at the operations page that documents the endpoints.
+pub fn prometheus_rule(namespace: &str, labels: &BTreeMap<String, String>) -> DynamicObject {
+    let labels = object_labels(labels);
+    let annotation = |summary: &str, description: &str| {
+        json!({
+            "summary": summary,
+            "description": description,
+            "runbook_url": "https://stardelt.io/docs/operations/monitoring/",
+        })
+    };
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "monitoring.coreos.com/v1".into(),
+            kind: "PrometheusRule".into(),
+        }),
+        metadata: ObjectMeta {
+            name: Some("stardelt-alerts".into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels),
+            ..ObjectMeta::default()
+        },
+        data: json!({"spec": {"groups": [{
+            "name": "stardelt",
+            "rules": [
+                {
+                    "alert": "StardeltMetricsTargetDown",
+                    "expr": format!(
+                        "up{{namespace=\"{namespace}\"}} == 0"
+                    ),
+                    "for": "10m",
+                    "labels": {"severity": "warning"},
+                    "annotations": annotation(
+                        "A platform metrics endpoint is not answering",
+                        "Prometheus has failed to scrape a stardelt target for 10 minutes."
+                    ),
+                },
+                {
+                    "alert": "StardeltOperatorNoLeader",
+                    "expr": format!(
+                        "max by (namespace) (stardelt_operator_leader{{namespace=\"{namespace}\"}}) == 0"
+                    ),
+                    "for": "10m",
+                    "labels": {"severity": "critical"},
+                    "annotations": annotation(
+                        "The operator has no leader",
+                        "Every operator replica reports stardelt_operator_leader 0, so nothing reconciles."
+                    ),
+                },
+                {
+                    "alert": "StardeltOperatorReconcileErrors",
+                    "expr": format!(
+                        "increase(stardelt_operator_reconcile_errors_total{{namespace=\"{namespace}\"}}[15m]) > 3"
+                    ),
+                    "for": "5m",
+                    "labels": {"severity": "warning"},
+                    "annotations": annotation(
+                        "The operator is failing reconciles",
+                        "More than three reconciles failed in the last 15 minutes; read the operator log."
+                    ),
+                },
+                {
+                    "alert": "StardeltSeaweedFSMasterNotLeader",
+                    "expr": format!(
+                        "SeaweedFS_master_is_leader{{namespace=\"{namespace}\"}} == 0"
+                    ),
+                    "for": "5m",
+                    "labels": {"severity": "critical"},
+                    "annotations": annotation(
+                        "The object store has no master",
+                        "No SeaweedFS master reports leadership; writes and reads will fail."
+                    ),
+                },
+                {
+                    "alert": "StardeltCnpgCollectorDown",
+                    "expr": format!(
+                        "cnpg_collector_up{{namespace=\"{namespace}\"}} == 0"
+                    ),
+                    "for": "5m",
+                    "labels": {"severity": "critical"},
+                    "annotations": annotation(
+                        "A platform database stopped exporting metrics",
+                        "The CloudNative-PG instance manager of a cluster is down, so its database health is unknown."
+                    ),
+                },
+                {
+                    "alert": "StardeltCnpgClientsWaiting",
+                    "expr": format!(
+                        "cnpg_backends_waiting_total{{namespace=\"{namespace}\"}} > 5"
+                    ),
+                    "for": "10m",
+                    "labels": {"severity": "warning"},
+                    "annotations": annotation(
+                        "A platform database has clients waiting",
+                        "More than five backends have waited for a lock or a connection for 10 minutes."
+                    ),
+                },
+            ],
+        }]}}),
+    }
 }
 
 /// Whether the cluster has the `ServiceMonitor` CRD. A missing CRD is a 404, which
@@ -136,8 +298,8 @@ fn status(name: &str, ready: bool, message: impl Into<String>) -> ComponentStatu
     }
 }
 
-/// Renders the object store's ServiceMonitors, or reports why it did not.
-/// `None` when `spec.monitoring.enabled` is false: no object, no status row.
+/// Renders the metrics objects, or reports why it did not. `None` when
+/// `spec.monitoring.enabled` is false: no object, no status row.
 pub async fn ensure(
     ctx: &Context,
     instance: &PlatformInstance,
@@ -154,15 +316,27 @@ pub async fn ensure(
             format!("MonitoringCRDsMissing: {SERVICE_MONITOR_CRD} is not installed"),
         ));
     }
-    let objects_to_apply =
-        servicemonitors(&instance.spec.namespace, &instance.spec.monitoring.labels);
-    for mut object in objects_to_apply {
+    let namespace = &instance.spec.namespace;
+    let labels = &instance.spec.monitoring.labels;
+    let mut rendered: Vec<(ApiResource, DynamicObject)> = Vec::new();
+    for object in servicemonitors(namespace, labels) {
+        rendered.push((service_monitor_resource(), object));
+    }
+    for object in podmonitors(namespace, labels) {
+        rendered.push((pod_monitor_resource(), object));
+    }
+    rendered.push((
+        prometheus_rule_resource(),
+        prometheus_rule(namespace, labels),
+    ));
+
+    for (resource, mut object) in rendered {
         own(&mut object, owner);
         let name = object.name_any();
         if let Err(e) = objects::apply_dynamic(
             &ctx.client,
-            &instance.spec.namespace,
-            &service_monitor_resource(),
+            namespace,
+            &resource,
             &object,
             instance.spec.dry_run,
         )
@@ -175,10 +349,14 @@ pub async fn ensure(
         Some(status(
             "monitoring",
             false,
-            "planned (dry-run): 4 ServiceMonitors",
+            "planned (dry-run): 4 ServiceMonitors, 4 PodMonitors, 1 PrometheusRule",
         ))
     } else {
-        Some(status("monitoring", true, "applied: 4 ServiceMonitors"))
+        Some(status(
+            "monitoring",
+            true,
+            "applied: 4 ServiceMonitors, 4 PodMonitors, 1 PrometheusRule",
+        ))
     }
 }
 
@@ -223,6 +401,66 @@ mod tests {
                 json!([{"port": "metrics", "path": "/metrics", "interval": "30s"}])
             );
             assert!(monitor.data["spec"].get("namespaceSelector").is_none());
+        }
+    }
+
+    #[test]
+    fn the_four_cnpg_clusters_get_a_pod_monitor() {
+        let monitors = podmonitors("stardelt", &BTreeMap::new());
+        assert_eq!(monitors.len(), 4);
+        for (monitor, cluster) in monitors.iter().zip(CNPG_CLUSTERS) {
+            assert_eq!(
+                monitor.metadata.name.as_deref(),
+                Some(format!("cnpg-{cluster}").as_str())
+            );
+            assert_eq!(monitor.metadata.namespace.as_deref(), Some("stardelt"));
+            assert_eq!(
+                monitor.data["spec"]["selector"]["matchLabels"],
+                json!({"cnpg.io/cluster": cluster})
+            );
+            assert_eq!(
+                monitor.data["spec"]["podMetricsEndpoints"],
+                json!([{"port": "metrics", "path": "/metrics", "interval": "30s"}])
+            );
+            assert!(monitor.data["spec"].get("namespaceSelector").is_none());
+        }
+    }
+
+    #[test]
+    fn the_starter_rule_names_every_alert_and_its_namespace() {
+        let rule = prometheus_rule("stardelt", &BTreeMap::new());
+        assert_eq!(rule.metadata.name.as_deref(), Some("stardelt-alerts"));
+        assert_eq!(rule.metadata.namespace.as_deref(), Some("stardelt"));
+        assert_eq!(rule.data["spec"]["groups"][0]["name"], "stardelt");
+        let rules = rule.data["spec"]["groups"][0]["rules"]
+            .as_array()
+            .expect("rules");
+        assert_eq!(rules.len(), 6);
+        let alerts: Vec<&str> = rules
+            .iter()
+            .filter_map(|rule| rule["alert"].as_str())
+            .collect();
+        for expected in [
+            "StardeltMetricsTargetDown",
+            "StardeltOperatorNoLeader",
+            "StardeltOperatorReconcileErrors",
+            "StardeltSeaweedFSMasterNotLeader",
+            "StardeltCnpgCollectorDown",
+            "StardeltCnpgClientsWaiting",
+        ] {
+            assert!(alerts.contains(&expected), "missing {expected}");
+        }
+        for rule in rules {
+            let expr = rule["expr"].as_str().expect("expr");
+            assert!(
+                expr.contains("namespace=\"stardelt\""),
+                "expression names its namespace: {expr}"
+            );
+            assert!(rule["for"].is_string());
+            assert_eq!(
+                rule["annotations"]["runbook_url"],
+                "https://stardelt.io/docs/operations/monitoring/"
+            );
         }
     }
 
