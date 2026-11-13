@@ -97,6 +97,9 @@ fn label_segment(value: &str) -> bool {
 /// Port the Spark Connect server serves gRPC on.
 pub const SPARK_CONNECT_PORT: i32 = 15002;
 
+/// Port the shared Spark Connect driver serves Prometheus text on (its UI port).
+pub const SPARK_CONNECT_METRICS_PORT: i32 = 4040;
+
 /// Ingress to one `SparkConnect` server (internal#161 slice 4d): the server authenticates
 /// nobody, so the network admits only the owner's pods, Nova and Airflow. The caller sets
 /// the owner reference; the policy is created before the server exists.
@@ -161,6 +164,10 @@ pub const CONNECT_POD_LABEL: &str = "sparkoperator.k8s.io/connect-name";
 /// pod labelled `stardelt.io/group.visitors`) and the server's own driver and executor
 /// pods on any port. Both carry `app.kubernetes.io/name: spark-connect`
 /// (values/spark.yaml), so one peer covers the driver-executor traffic both ways.
+/// The customer's Prometheus reads the driver's metrics on the UI port 4040 from any
+/// namespace; a NetworkPolicy selects ports, not paths, so that rule admits the whole UI
+/// (jobs, stages, the redacted environment page) as well — the exposure
+/// stardelt-platform#1158 measured and accepted.
 pub fn shared_spark_connect_ingress(namespace: &str) -> NetworkPolicy {
     NetworkPolicy {
         metadata: meta("spark-connect-ingress", namespace),
@@ -195,6 +202,17 @@ pub fn shared_spark_connect_ingress(namespace: &str) -> NetworkPolicy {
                 NetworkPolicyIngressRule {
                     from: Some(vec![peer(&[("app.kubernetes.io/name", "spark-connect")])]),
                     ports: None,
+                },
+                // The customer's Prometheus (stardelt-operator#607): read-only, on the
+                // UI port. A NetworkPolicy selects ports, not paths, so this admits the
+                // driver's UI too (jobs, stages, the redacted environment page) — the
+                // exposure stardelt-platform#1158 measured and accepted.
+                NetworkPolicyIngressRule {
+                    from: Some(vec![peer_any_namespace(&[(
+                        "app.kubernetes.io/name",
+                        "prometheus",
+                    )])]),
+                    ports: Some(vec![port(SPARK_CONNECT_METRICS_PORT)]),
                 },
             ]),
             egress: None,
@@ -700,7 +718,7 @@ mod tests {
             &vec!["Ingress".to_string()]
         );
         let ingress = spec.ingress.as_ref().expect("rules");
-        assert_eq!(ingress.len(), 2);
+        assert_eq!(ingress.len(), 3);
         // Rule 1: members' notebook pods only, on the Connect port.
         let members = ingress[0].from.as_ref().unwrap();
         assert_eq!(members.len(), 1);
@@ -733,6 +751,31 @@ mod tests {
             )])
         );
         assert!(ingress[1].ports.is_none());
+        // Rule 3: the customer's Prometheus, any namespace, on the metrics port.
+        let scrape = ingress[2].from.as_ref().unwrap();
+        assert_eq!(scrape.len(), 1);
+        assert_eq!(
+            scrape[0]
+                .pod_selector
+                .as_ref()
+                .unwrap()
+                .match_labels
+                .as_ref()
+                .unwrap(),
+            &BTreeMap::from([(
+                "app.kubernetes.io/name".to_string(),
+                "prometheus".to_string()
+            )])
+        );
+        assert!(
+            scrape[0].namespace_selector.is_some(),
+            "the scraper lives in another namespace"
+        );
+        assert_eq!(
+            ingress[2].ports.as_ref().unwrap()[0].port,
+            Some(IntOrString::Int(4040))
+        );
+        assert_eq!(ingress[2].ports.as_ref().unwrap().len(), 1);
     }
 
     #[test]
