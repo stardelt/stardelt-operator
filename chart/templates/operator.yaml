@@ -106,6 +106,15 @@ spec:
         prometheus.io/path: /metrics
     spec:
       serviceAccountName: stardelt-operator
+      # Pod Security `restricted` (platform#1096 question 5): the image's Dockerfile
+      # ends in `USER 65532:65532`; these four fields are what the level requires and
+      # what the pod asserts. `readOnlyRootFilesystem` is deliberately not set: Helm
+      # needs its cache/config/data directories under /home/operator.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -131,6 +140,10 @@ spec:
                   fieldPath: metadata.namespace
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
 ---
 # The operator's Prometheus endpoint (stardelt-operator#607): a stable name to select,
 # ClusterIP only — no ingress exposes it.
