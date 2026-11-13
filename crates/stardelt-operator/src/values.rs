@@ -43,6 +43,12 @@ pub fn golden_values(component: &str) -> Value {
                 .expect("values/jupyterhub.yaml is not valid YAML");
             values["hub"]["extraConfig"]["10-oidc"] =
                 Value::String(include_str!("jupyterhub_oidc.py").into());
+            // PodSecurity "restricted" for the spawned notebook (platform#1237): the chart has no
+            // value for the container's securityContext, so the hub's KubeSpawner gets it through
+            // `extra_container_config`. Same snippet as stardelt-platform/helm-values/jupyterhub.yaml,
+            // `hub.extraConfig["22-restricted"]`.
+            values["hub"]["extraConfig"]["22-restricted"] =
+                Value::String(include_str!("jupyterhub_restricted.py").into());
             values
         }
         "seaweedfs" => serde_yaml::from_str(include_str!("../values/seaweedfs.yaml"))
@@ -521,10 +527,32 @@ mod tests {
         );
 
         // The file is the whole of the curation: everything the operator applies
-        // is the file plus the one injected snippet.
+        // is the file plus the two injected snippets.
         let mut expected = file;
         expected["hub"]["extraConfig"]["10-oidc"] = Value::String(oidc.into());
+        expected["hub"]["extraConfig"]["22-restricted"] =
+            Value::String(include_str!("jupyterhub_restricted.py").into());
         assert_eq!(golden, expected);
+    }
+
+    #[test]
+    fn jupyterhub_golden_values_declare_the_restricted_notebook_container() {
+        let golden = golden_values("jupyterhub");
+        let snippet = golden["hub"]["extraConfig"]["22-restricted"]
+            .as_str()
+            .expect("the 22-restricted extraConfig is a string");
+        assert_eq!(snippet, include_str!("jupyterhub_restricted.py"));
+        // The five fields the restricted profile checks, and the two traits the replacement
+        // would otherwise drop.
+        for needle in [
+            "\"capabilities\": {\"drop\": [\"ALL\"]}",
+            "\"runAsNonRoot\": True",
+            "\"seccompProfile\": {\"type\": \"RuntimeDefault\"}",
+            "\"runAsUser\": c.KubeSpawner.uid",
+            "\"allowPrivilegeEscalation\": False",
+        ] {
+            assert!(snippet.contains(needle), "missing {needle}");
+        }
     }
 
     #[test]
