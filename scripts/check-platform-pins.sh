@@ -25,6 +25,7 @@ fi
 # planner chart reference -> Makefile variable prefix
 declare -A PREFIX_OF=(
   [cnpg/cloudnative-pg]=CNPG
+  [cnpg/plugin-barman-cloud]=PLUGIN_BARMAN_CLOUD
   [seaweedfs/seaweedfs]=SEAWEEDFS
   [lakekeeper/lakekeeper]=LAKEKEEPER
   [trino/trino]=TRINO
