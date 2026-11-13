@@ -14,6 +14,7 @@ use k8s_openapi::api::{
         ValidatingAdmissionPolicySpec, Validation,
     },
     apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy},
+    batch::v1::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec},
     core::v1::{
         Capabilities, ConfigMap, ConfigMapVolumeSource, Container, ContainerPort,
         EmptyDirVolumeSource, EnvVar, EnvVarSource, LocalObjectReference, ObjectFieldSelector,
@@ -61,6 +62,18 @@ spec:
 
 /// The driver's Prometheus/UI port (stardelt-platform#1158); ClusterIP only.
 pub const METRICS_PORT: i32 = 4040;
+
+/// The ConfigMap janitor (platform#1173 option A, operator twin of platform#1258): every Spark
+/// Connect session leaves its `spark-exec-<16 hex>-conf-map` behind, and the driver's Role may
+/// not collect them (`config_map_guard_policy`). This CronJob deletes them with its own identity.
+pub const CONFMAP_JANITOR: &str = "spark-confmap-janitor";
+
+/// The janitor script, byte for byte from stardelt-platform's
+/// `scripts/spark-confmap-janitor.sh`.
+pub const CONFMAP_JANITOR_SCRIPT: &str = include_str!("spark_confmap_janitor.sh");
+
+/// The kubectl image the platform manifest runs the janitor in.
+pub const CONFMAP_JANITOR_IMAGE: &str = "alpine/k8s:1.37.1";
 
 /// Executors run user code and never call the Kubernetes API (platform#1096): no Role is
 /// bound to this ServiceAccount and its token is not mounted.
@@ -434,6 +447,180 @@ pub fn deployment(namespace: &str) -> Deployment {
             ..DeploymentSpec::default()
         },
         ..Deployment::default()
+    }
+}
+
+/// The janitor's identity. It keeps the default `automountServiceAccountToken`: the pod calls
+/// the Kubernetes API and holds `delete` on ConfigMaps by name only.
+pub fn confmap_janitor_service_account(namespace: &str) -> ServiceAccount {
+    ServiceAccount {
+        metadata: meta_part_of_only(CONFMAP_JANITOR, namespace),
+        automount_service_account_token: Some(true),
+        ..ServiceAccount::default()
+    }
+}
+
+/// Get, list and delete ConfigMaps — no `create`, no `update`, and no `deletecollection`
+/// (platform#1121): a collection delete would take every ConfigMap in the namespace, and this
+/// identity exists to remove one shape of them.
+pub fn confmap_janitor_role(namespace: &str) -> Role {
+    Role {
+        metadata: meta_part_of_only(CONFMAP_JANITOR, namespace),
+        rules: Some(vec![PolicyRule {
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec!["configmaps".into()]),
+            verbs: vec!["get".into(), "list".into(), "delete".into()],
+            ..PolicyRule::default()
+        }]),
+    }
+}
+
+pub fn confmap_janitor_role_binding(namespace: &str) -> RoleBinding {
+    RoleBinding {
+        metadata: meta_part_of_only(CONFMAP_JANITOR, namespace),
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".into(),
+            name: CONFMAP_JANITOR.into(),
+            namespace: Some(namespace.into()),
+            ..Subject::default()
+        }]),
+        role_ref: RoleRef {
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            kind: "Role".into(),
+            name: CONFMAP_JANITOR.into(),
+        },
+    }
+}
+
+/// The script the CronJob mounts (key `spark-confmap-janitor.sh`, the platform's
+/// `--from-file=spark-confmap-janitor.sh=`).
+pub fn confmap_janitor_config_map(namespace: &str) -> ConfigMap {
+    ConfigMap {
+        metadata: meta_part_of_only(CONFMAP_JANITOR, namespace),
+        data: Some(BTreeMap::from([(
+            "spark-confmap-janitor.sh".to_string(),
+            CONFMAP_JANITOR_SCRIPT.to_string(),
+        )])),
+        ..ConfigMap::default()
+    }
+}
+
+/// Every 15 minutes, one run at a time, under the restricted profile: the image is the
+/// platform's kubectl base and the script deletes only maps older than an hour.
+pub fn confmap_janitor_cron_job(namespace: &str) -> CronJob {
+    let mut labels = part_of();
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        CONFMAP_JANITOR.to_string(),
+    );
+    let container = Container {
+        name: "janitor".to_string(),
+        image: Some(CONFMAP_JANITOR_IMAGE.to_string()),
+        command: Some(vec![
+            "bash".to_string(),
+            "/opt/scripts/spark-confmap-janitor.sh".to_string(),
+        ]),
+        env: Some(vec![
+            EnvVar {
+                name: "NAMESPACE".into(),
+                value_from: Some(EnvVarSource {
+                    field_ref: Some(ObjectFieldSelector {
+                        field_path: "metadata.namespace".into(),
+                        ..ObjectFieldSelector::default()
+                    }),
+                    ..EnvVarSource::default()
+                }),
+                ..EnvVar::default()
+            },
+            EnvVar {
+                name: "HOME".into(),
+                value: Some("/tmp".into()),
+                ..EnvVar::default()
+            },
+        ]),
+        resources: Some(ResourceRequirements {
+            requests: Some(BTreeMap::from([
+                ("cpu".to_string(), Quantity("50m".into())),
+                ("memory".to_string(), Quantity("64Mi".into())),
+            ])),
+            limits: Some(BTreeMap::from([
+                ("cpu".to_string(), Quantity("500m".into())),
+                ("memory".to_string(), Quantity("256Mi".into())),
+            ])),
+            ..ResourceRequirements::default()
+        }),
+        security_context: Some(SecurityContext {
+            allow_privilege_escalation: Some(false),
+            capabilities: Some(Capabilities {
+                drop: Some(vec!["ALL".into()]),
+                ..Capabilities::default()
+            }),
+            ..SecurityContext::default()
+        }),
+        volume_mounts: Some(vec![VolumeMount {
+            name: "janitor-script".into(),
+            mount_path: "/opt/scripts".into(),
+            read_only: Some(true),
+            ..VolumeMount::default()
+        }]),
+        ..Container::default()
+    };
+
+    CronJob {
+        metadata: ObjectMeta {
+            name: Some(CONFMAP_JANITOR.into()),
+            namespace: Some(namespace.into()),
+            labels: Some(labels.clone()),
+            ..ObjectMeta::default()
+        },
+        spec: CronJobSpec {
+            schedule: "*/15 * * * *".to_string(),
+            concurrency_policy: Some("Forbid".to_string()),
+            successful_jobs_history_limit: Some(1),
+            failed_jobs_history_limit: Some(3),
+            job_template: JobTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels.clone()),
+                    ..ObjectMeta::default()
+                }),
+                spec: Some(JobSpec {
+                    backoff_limit: Some(1),
+                    template: PodTemplateSpec {
+                        metadata: Some(ObjectMeta {
+                            labels: Some(labels),
+                            ..ObjectMeta::default()
+                        }),
+                        spec: Some(PodSpec {
+                            restart_policy: Some("Never".into()),
+                            service_account_name: Some(CONFMAP_JANITOR.into()),
+                            security_context: Some(PodSecurityContext {
+                                run_as_non_root: Some(true),
+                                run_as_user: Some(65534),
+                                seccomp_profile: Some(SeccompProfile {
+                                    type_: "RuntimeDefault".into(),
+                                    ..SeccompProfile::default()
+                                }),
+                                ..PodSecurityContext::default()
+                            }),
+                            containers: vec![container],
+                            volumes: Some(vec![Volume {
+                                name: "janitor-script".into(),
+                                config_map: Some(ConfigMapVolumeSource {
+                                    name: CONFMAP_JANITOR.into(),
+                                    default_mode: Some(0o555),
+                                    ..ConfigMapVolumeSource::default()
+                                }),
+                                ..Volume::default()
+                            }]),
+                            ..PodSpec::default()
+                        }),
+                    },
+                    ..JobSpec::default()
+                }),
+            },
+            ..CronJobSpec::default()
+        },
+        status: None,
     }
 }
 
@@ -1165,5 +1352,103 @@ mod tests {
                 .map(String::as_str),
             Some("data")
         );
+    }
+
+    #[test]
+    fn the_confmap_janitor_may_only_delete_configmaps_by_name() {
+        let janitor = confmap_janitor_role("stardelt");
+        assert_eq!(
+            janitor.metadata.name.as_deref(),
+            Some("spark-confmap-janitor")
+        );
+        let rules = janitor.rules.as_ref().expect("rules");
+        assert_eq!(rules.len(), 1, "the janitor holds exactly one rule");
+        let rule = &rules[0];
+        assert_eq!(rule.api_groups, Some(vec![String::new()]));
+        assert_eq!(
+            rule.resources.as_ref().unwrap(),
+            &vec!["configmaps".to_string()]
+        );
+        assert_eq!(
+            rule.verbs,
+            vec!["get".to_string(), "list".to_string(), "delete".to_string()]
+        );
+        assert!(
+            !rule.verbs.contains(&"deletecollection".to_string()),
+            "a collection delete would take every ConfigMap in the namespace (platform#1121)"
+        );
+        assert!(rule.resource_names.is_none(), "the script filters by name");
+    }
+
+    #[test]
+    fn the_confmap_janitor_runs_restricted() {
+        let cron = confmap_janitor_cron_job("stardelt");
+        assert_eq!(cron.metadata.name.as_deref(), Some("spark-confmap-janitor"));
+        let spec = &cron.spec;
+        assert_eq!(spec.schedule, "*/15 * * * *");
+        assert_eq!(spec.concurrency_policy.as_deref(), Some("Forbid"));
+        assert_eq!(spec.successful_jobs_history_limit, Some(1));
+        assert_eq!(spec.failed_jobs_history_limit, Some(3));
+        let job_spec = spec.job_template.spec.as_ref().expect("job spec");
+        assert_eq!(job_spec.backoff_limit, Some(1));
+        let pod = job_spec.template.spec.as_ref().expect("pod spec");
+        assert_eq!(
+            pod.service_account_name.as_deref(),
+            Some("spark-confmap-janitor")
+        );
+        let pod_sc = pod.security_context.as_ref().expect("pod securityContext");
+        assert_eq!(pod_sc.run_as_non_root, Some(true));
+        assert_eq!(pod_sc.run_as_user, Some(65534));
+        assert_eq!(
+            pod_sc.seccomp_profile.as_ref().unwrap().type_,
+            "RuntimeDefault"
+        );
+
+        assert_eq!(pod.containers.len(), 1);
+        let c = &pod.containers[0];
+        assert_eq!(c.name, "janitor");
+        assert_eq!(c.image.as_deref(), Some(CONFMAP_JANITOR_IMAGE));
+        assert_eq!(
+            c.command,
+            Some(vec![
+                "bash".to_string(),
+                "/opt/scripts/spark-confmap-janitor.sh".to_string()
+            ])
+        );
+        let c_sc = c
+            .security_context
+            .as_ref()
+            .expect("container securityContext");
+        assert_eq!(c_sc.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            c_sc.capabilities.as_ref().unwrap().drop.as_ref().unwrap(),
+            &vec!["ALL".to_string()]
+        );
+
+        let mount = c
+            .volume_mounts
+            .as_ref()
+            .expect("volume_mounts")
+            .iter()
+            .find(|m| m.mount_path == "/opt/scripts")
+            .expect("the script is mounted at /opt/scripts");
+        assert_eq!(mount.read_only, Some(true));
+        let volume = pod
+            .volumes
+            .as_ref()
+            .expect("volumes")
+            .iter()
+            .find(|v| v.name == mount.name)
+            .expect("the script volume");
+        let source = volume.config_map.as_ref().expect("configMap volume");
+        assert_eq!(source.name, "spark-confmap-janitor");
+        assert_eq!(source.default_mode, Some(0o555));
+
+        let data = confmap_janitor_config_map("stardelt").data.expect("data");
+        let script = data
+            .get("spark-confmap-janitor.sh")
+            .expect("the ConfigMap key is spark-confmap-janitor.sh");
+        assert!(!script.is_empty());
+        assert!(script.starts_with("#!/usr/bin/env bash"));
     }
 }

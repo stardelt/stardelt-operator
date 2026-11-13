@@ -687,6 +687,56 @@ pub async fn ensure_spark(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply::<ServiceAccount>(
+        client,
+        namespace,
+        &spark::confmap_janitor_service_account(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Role>(
+        client,
+        namespace,
+        &spark::confmap_janitor_role(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        client,
+        namespace,
+        &spark::confmap_janitor_role_binding(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<ConfigMap>(
+        client,
+        namespace,
+        &spark::confmap_janitor_config_map(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<CronJob>(
+        client,
+        namespace,
+        &spark::confmap_janitor_cron_job(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if let Err(e) = apply::<Service>(client, namespace, &spark::service(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
@@ -5402,6 +5452,11 @@ mod tests {
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-connect",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-connect",
             "/api/v1/namespaces/data/configmaps/spark-connect-config",
+            "/api/v1/namespaces/data/serviceaccounts/spark-confmap-janitor",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-confmap-janitor",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-confmap-janitor",
+            "/api/v1/namespaces/data/configmaps/spark-confmap-janitor",
+            "/apis/batch/v1/namespaces/data/cronjobs/spark-confmap-janitor",
             "/api/v1/namespaces/data/services/spark-connect",
             "/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/spark-connect-ingress",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-connect-executor-pods",
