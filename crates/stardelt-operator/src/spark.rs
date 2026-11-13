@@ -109,19 +109,16 @@ fn meta_with_name_labels(name: &str, namespace: &str) -> ObjectMeta {
     }
 }
 
-/// The metadata of the objects that carry their own name in `app.kubernetes.io/name`, like
-/// [`executor_service_account`]: the batch driver is not the `spark-connect` Deployment.
-fn meta_named_after_itself(name: &str, namespace: &str) -> ObjectMeta {
+/// The metadata of an object that belongs to the platform but is not itself a selector target:
+/// `app.kubernetes.io/part-of: stardelt` only, the same shape as
+/// `stardelt-platform/manifests/spark-batch-rbac.yaml` and `airflow::meta()` (D44,
+/// stardelt-operator#687: the batch driver is not the `spark-connect` Deployment, and a name
+/// label no selector reads is a difference the two install paths do not need).
+fn meta_part_of_only(name: &str, namespace: &str) -> ObjectMeta {
     ObjectMeta {
         name: Some(name.into()),
         namespace: Some(namespace.into()),
-        labels: Some(BTreeMap::from([
-            ("app.kubernetes.io/name".to_string(), name.to_string()),
-            (
-                "app.kubernetes.io/part-of".to_string(),
-                "stardelt".to_string(),
-            ),
-        ])),
+        labels: Some(part_of()),
         ..ObjectMeta::default()
     }
 }
@@ -219,7 +216,7 @@ pub fn role_binding(namespace: &str) -> RoleBinding {
 /// `automountServiceAccountToken`: unlike [`executor_service_account`], the driver creates pods.
 pub fn batch_driver_service_account(namespace: &str) -> ServiceAccount {
     ServiceAccount {
-        metadata: meta_named_after_itself(BATCH_DRIVER, namespace),
+        metadata: meta_part_of_only(BATCH_DRIVER, namespace),
         ..ServiceAccount::default()
     }
 }
@@ -227,14 +224,14 @@ pub fn batch_driver_service_account(namespace: &str) -> ServiceAccount {
 /// The batch driver's Role: the Connect driver's rules, not a copy, so the two cannot drift.
 pub fn batch_driver_role(namespace: &str) -> Role {
     Role {
-        metadata: meta_named_after_itself(BATCH_DRIVER, namespace),
+        metadata: meta_part_of_only(BATCH_DRIVER, namespace),
         rules: Some(pod_and_config_map_rules()),
     }
 }
 
 pub fn batch_driver_role_binding(namespace: &str) -> RoleBinding {
     RoleBinding {
-        metadata: meta_named_after_itself(BATCH_DRIVER, namespace),
+        metadata: meta_part_of_only(BATCH_DRIVER, namespace),
         subjects: Some(vec![Subject {
             kind: "ServiceAccount".into(),
             name: BATCH_DRIVER.into(),
@@ -957,7 +954,11 @@ mod tests {
         assert_eq!(sa.metadata.name.as_deref(), Some("spark-batch-driver"));
         assert_eq!(sa.metadata.namespace.as_deref(), Some("stardelt"));
         let labels = sa.metadata.labels.as_ref().expect("labels");
-        assert_eq!(labels["app.kubernetes.io/name"], "spark-batch-driver");
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            None,
+            "D44 (stardelt-operator#687): the platform twin carries no name label"
+        );
         assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
         assert_eq!(
             sa.automount_service_account_token, None,
