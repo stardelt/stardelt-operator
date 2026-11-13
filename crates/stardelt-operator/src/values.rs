@@ -49,6 +49,11 @@ pub fn golden_values(component: &str) -> Value {
             // `hub.extraConfig["22-restricted"]`.
             values["hub"]["extraConfig"]["22-restricted"] =
                 Value::String(include_str!("jupyterhub_restricted.py").into());
+            // Who a notebook pod belongs to (internal#161 slice 4c, platform#809): the
+            // platform's `hub.extraConfig["26-spark-labels"]`, so a per-SparkCluster
+            // policy admits exactly the owner's pods in both install paths (D44).
+            values["hub"]["extraConfig"]["26-spark-labels"] =
+                Value::String(include_str!("jupyterhub_labels.py").into());
             values
         }
         "seaweedfs" => serde_yaml::from_str(include_str!("../values/seaweedfs.yaml"))
@@ -532,6 +537,8 @@ mod tests {
         expected["hub"]["extraConfig"]["10-oidc"] = Value::String(oidc.into());
         expected["hub"]["extraConfig"]["22-restricted"] =
             Value::String(include_str!("jupyterhub_restricted.py").into());
+        expected["hub"]["extraConfig"]["26-spark-labels"] =
+            Value::String(include_str!("jupyterhub_labels.py").into());
         assert_eq!(golden, expected);
     }
 
@@ -550,6 +557,23 @@ mod tests {
             "\"seccompProfile\": {\"type\": \"RuntimeDefault\"}",
             "\"runAsUser\": c.KubeSpawner.uid",
             "\"allowPrivilegeEscalation\": False",
+        ] {
+            assert!(snippet.contains(needle), "missing {needle}");
+        }
+    }
+
+    #[test]
+    fn jupyterhub_golden_values_label_notebook_pods_with_the_person_and_their_groups() {
+        let golden = golden_values("jupyterhub");
+        let snippet = golden["hub"]["extraConfig"]["26-spark-labels"]
+            .as_str()
+            .expect("the 26-spark-labels extraConfig is a string");
+        assert_eq!(snippet, include_str!("jupyterhub_labels.py"));
+        for needle in [
+            "c.KubeSpawner.modify_pod_hook = _stardelt_labels",
+            "labels[\"stardelt.io/user\"] = user",
+            "labels[\"stardelt.io/group.\" + name] = \"true\"",
+            "len(value) <= 63",
         ] {
             assert!(snippet.contains(needle), "missing {needle}");
         }
