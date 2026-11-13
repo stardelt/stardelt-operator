@@ -1174,6 +1174,44 @@ mod tests {
     }
 
     #[test]
+    fn superset_golden_values_declare_the_restricted_pod_fields() {
+        let values = effective_values("superset", Profile::Full, None, None);
+        assert_eq!(values["runAsUser"], serde_json::json!(1000));
+        let pod = serde_json::json!({
+            "runAsNonRoot": true,
+            "seccompProfile": {"type": "RuntimeDefault"}
+        });
+        let container = serde_json::json!({
+            "allowPrivilegeEscalation": false,
+            "capabilities": {"drop": ["ALL"]},
+            "seccompProfile": {"type": "RuntimeDefault"}
+        });
+        for workload in ["supersetNode", "supersetWorker", "init"] {
+            assert_eq!(values[workload]["podSecurityContext"], pod, "{workload}");
+            assert_eq!(
+                values[workload]["containerSecurityContext"], container,
+                "{workload}"
+            );
+            let init = values[workload]["initContainers"].as_array().unwrap();
+            assert_eq!(init.len(), 1, "{workload}: the chart default has one");
+            assert_eq!(init[0]["securityContext"], container, "{workload}");
+            assert_eq!(init[0]["envFrom"][0]["secretRef"]["name"], "superset-env");
+        }
+        assert_eq!(
+            values["redis"]["master"]["podSecurityContext"]["fsGroup"],
+            serde_json::json!(1001)
+        );
+        assert_eq!(
+            values["redis"]["master"]["containerSecurityContext"]["runAsUser"],
+            serde_json::json!(1001)
+        );
+        assert_eq!(
+            values["redis"]["master"]["containerSecurityContext"]["allowPrivilegeEscalation"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
     fn superset_only_nova_may_frame_it() {
         let values = golden_values("superset");
         let snippet = values["configOverrides"]["iframe_embedding"]

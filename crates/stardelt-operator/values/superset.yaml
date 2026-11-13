@@ -18,6 +18,12 @@ imagePullSecrets:
 # 0.15.5 does not create a ServiceAccount of its own.
 serviceAccountName: superset
 
+# Pod Security `restricted` (platform#1096 question 5, twin of platform#1183). The chart
+# defaults `runAsUser` to 0 and writes it into every pod template; the image's own user is
+# 1000 and /app/superset_home is writable for it (measured 2026-11-13). The pod and container
+# fields are under supersetNode, supersetWorker, init and redis below.
+runAsUser: 1000
+
 bootstrapScript: |
   #!/bin/bash
   if [ ! -f ~/bootstrap ]; then echo "Running Superset" > ~/bootstrap; fi
@@ -95,6 +101,31 @@ extraConfigs:
       tables: []
 
 init:
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities: {drop: ["ALL"]}
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+    - name: wait-for-postgres
+      image: apache/superset:dockerize
+      imagePullPolicy: IfNotPresent
+      envFrom:
+        - secretRef:
+            name: superset-env
+      command:
+        - /bin/sh
+        - -c
+        - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -timeout 120s
+      resources:
+        limits: {memory: "256Mi"}
+        requests: {cpu: "250m", memory: "128Mi"}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+        seccompProfile: {type: RuntimeDefault}
   adminUser:
     username: admin
     firstname: stardelt
@@ -133,6 +164,31 @@ init:
   loadExamples: false
 
 supersetNode:
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities: {drop: ["ALL"]}
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+    - name: wait-for-postgres
+      image: apache/superset:dockerize
+      imagePullPolicy: IfNotPresent
+      envFrom:
+        - secretRef:
+            name: superset-env
+      command:
+        - /bin/sh
+        - -c
+        - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -timeout 120s
+      resources:
+        limits: {memory: "256Mi"}
+        requests: {cpu: "250m", memory: "128Mi"}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+        seccompProfile: {type: RuntimeDefault}
   replicas:
     enabled: true
     replicaCount: 1
@@ -141,6 +197,31 @@ supersetNode:
     limits:   { cpu: "2",    memory: "1Gi"  }
 
 supersetWorker:
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities: {drop: ["ALL"]}
+    seccompProfile: {type: RuntimeDefault}
+  initContainers:
+    - name: wait-for-postgres-redis
+      image: apache/superset:dockerize
+      imagePullPolicy: IfNotPresent
+      envFrom:
+        - secretRef:
+            name: superset-env
+      command:
+        - /bin/sh
+        - -c
+        - dockerize -wait "tcp://$DB_HOST:$DB_PORT" -wait "tcp://$REDIS_HOST:$REDIS_PORT" -timeout 120s
+      resources:
+        limits: {memory: "256Mi"}
+        requests: {cpu: "250m", memory: "128Mi"}
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+        seccompProfile: {type: RuntimeDefault}
   replicas:
     enabled: true
     replicaCount: 1
@@ -170,6 +251,15 @@ postgresql:
 redis:
   enabled: true
   master:
+    podSecurityContext:
+      fsGroup: 1001
+      runAsNonRoot: true
+      seccompProfile: {type: RuntimeDefault}
+    containerSecurityContext:
+      runAsUser: 1001
+      allowPrivilegeEscalation: false
+      capabilities: {drop: ["ALL"]}
+      seccompProfile: {type: RuntimeDefault}
     persistence:
       size: 1Gi
     resources:
