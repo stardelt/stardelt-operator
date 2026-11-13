@@ -18,8 +18,9 @@ chart/
 cargo run -p stardelt-operator --bin crdgen
 ```
 
-Helm installs everything in `crds/` on `helm install` (not on `helm upgrade`; apply
-them explicitly if they change).
+Helm installs everything in `crds/` on `helm install`. On `helm upgrade` the operator applies
+its own CRDs from its binary at start (server-side, field manager `stardelt-operator`), so an
+upgrade needs no manual step.
 
 ## Install
 

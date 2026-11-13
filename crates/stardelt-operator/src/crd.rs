@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::CustomResource;
+use kube::CustomResourceExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -3249,10 +3251,28 @@ pub struct Condition {
     pub observed_generation: Option<i64>,
 }
 
+/// Every CRD this operator serves, in one place: the startup apply
+/// ([`crate::controller::apply_crds`]) and `bin/crdgen.rs` both read this list, so the
+/// binary, `chart/crds/` and the live cluster cannot disagree about which kinds exist.
+pub fn crd_documents() -> Vec<CustomResourceDefinition> {
+    vec![
+        PlatformInstance::crd(),
+        Lakehouse::crd(),
+        IngestionSource::crd(),
+        Pipeline::crd(),
+        Connection::crd(),
+        Volume::crd(),
+        ServicePrincipal::crd(),
+        StreamApp::crd(),
+        Catalog::crd(),
+        SqlWarehouse::crd(),
+        SparkCluster::crd(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kube::CustomResourceExt;
 
     /// A CRD field must be structural: a `type`, a `$ref`, a combinator, or the preserve flag. The
     /// API server refuses the whole CRD otherwise ("must not be empty for specified object fields",
@@ -3293,6 +3313,46 @@ mod tests {
         let schema = serde_json::to_value(schemars::schema_for!(PlatformInstance))
             .expect("the CRD schema serialises");
         assert_structural("#", &schema);
+    }
+
+    #[test]
+    fn crd_documents_lists_every_served_kind() {
+        let docs = crd_documents();
+        let mut names: Vec<String> = docs
+            .iter()
+            .map(|crd| crd.metadata.name.clone().expect("a CRD name"))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "catalogs.stardelt.io",
+                "connections.stardelt.io",
+                "ingestionsources.stardelt.io",
+                "lakehouses.stardelt.io",
+                "pipelines.stardelt.io",
+                "platforminstances.stardelt.io",
+                "serviceprincipals.stardelt.io",
+                "sparkclusters.stardelt.io",
+                "sqlwarehouses.stardelt.io",
+                "streamapps.stardelt.io",
+                "volumes.stardelt.io",
+            ]
+        );
+        for crd in &docs {
+            assert_eq!(crd.spec.group, "stardelt.io");
+            assert_eq!(
+                crd.spec.versions.len(),
+                1,
+                "{}",
+                crd.metadata.name.clone().unwrap()
+            );
+            assert_eq!(crd.spec.versions[0].name, "v1alpha1");
+            assert!(
+                crd.spec.names.singular.is_some(),
+                "crdgen derives the schema filename from spec.names.singular"
+            );
+        }
     }
 
     #[test]

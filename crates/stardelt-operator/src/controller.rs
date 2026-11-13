@@ -14,11 +14,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use futures::StreamExt;
+// Not under `k8s_openapi::api` (the rest of the group-version types are); the ticket's step 2
+// put it in that block and it does not resolve there.
 use k8s_openapi::api::{
     apps::v1::{Deployment, StatefulSet},
     core::v1::{ConfigMap, PersistentVolumeClaim, Secret},
 };
+use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::{
     Api, Client, ResourceExt,
     api::{DeleteParams, ListParams, Patch, PatchParams},
@@ -64,6 +68,7 @@ pub struct Context {
 
 pub async fn run() -> anyhow::Result<()> {
     let client = Client::try_default().await?;
+    apply_crds(&client).await?;
     // Leader election (#75): only the replica that holds the Lease reconciles. Outside a
     // pod (`cargo run`) there is no POD_NAME and every controller starts at once.
     if let Some((pod, namespace)) = crate::leader::identity() {
@@ -158,6 +163,29 @@ pub async fn run() -> anyhow::Result<()> {
             _ = catalogs.next() => {}
         }
     }
+}
+
+/// Apply every CRD this operator serves, server-side, before the controllers watch them
+/// (operator#606). `chart/crds/` stays for a fresh `helm install`, where the kinds must exist
+/// before this pod can run; both paths are idempotent server-side applies.
+///
+/// A failure is returned, not swallowed: in a pod the caller exits non-zero and the container
+/// restarts, so a schema the API server refuses is visible instead of silently skipped.
+pub async fn apply_crds(client: &Client) -> anyhow::Result<()> {
+    let api: Api<CustomResourceDefinition> = Api::all(client.clone());
+    let params = PatchParams::apply("stardelt-operator").force();
+    for crd in crate::crd::crd_documents() {
+        let name = crd
+            .metadata
+            .name
+            .clone()
+            .expect("a generated CRD carries its name");
+        api.patch(&name, &params, &Patch::Apply(&crd))
+            .await
+            .with_context(|| format!("applying CRD {name}"))?;
+        tracing::info!(crd = %name, "CRD applied");
+    }
+    Ok(())
 }
 
 /// The Ready condition for a phase. Keeps the previous transition time while the status is unchanged.
