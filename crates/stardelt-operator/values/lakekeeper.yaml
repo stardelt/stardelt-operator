@@ -19,6 +19,19 @@ authz:
   backend: allowall
 internalOpenFGA: false
 catalog:
+  # Pod Security `restricted` (platform#1096 question 5, twin of platform#1196). Both keys are the
+  # chart's camelCase catalog keys; each REPLACES the chart's block for the catalog Deployment, its
+  # `check-db` init container and the `lakekeeper-db-migration-<revision>` Job. The chart keeps
+  # `runAsUser: 65532` / `runAsGroup: 65534` from `catalog.image.uid/gid`, and `restricted` does not
+  # constrain `fsGroup`; `runAsNonRoot` and `seccompProfile` are what complete the profile. This
+  # path runs with `authz.backend: allowall`, so it renders no `opa` sidecar and no exception.
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    capabilities: {drop: ["ALL"]}
+    seccompProfile: {type: RuntimeDefault}
   prometheus:
     # The chart adds a `metrics` port (9000) to the `lakekeeper` Service and the
     # scrape annotations to the pod; the metrics server itself is always on (#607).
