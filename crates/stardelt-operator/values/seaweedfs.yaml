@@ -36,6 +36,12 @@ s3:
   enabled: true
   enableAuth: true
   existingConfigSecret: seaweedfs-s3-config
+  # platform#1219: the gateway holds ~1.44 Mi of live Go heap per Mi it serves, so a
+  # 2.89 GB Iceberg scan needs ~4.1 Gi and OOM-kills a 1 Gi container. Keep in step
+  # with stardelt-platform/helm-values/seaweedfs.yaml.
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits:   { cpu: "2",    memory: "5.5Gi" }
   createBuckets:
   - name: lakehouse
     anonymousRead: false
