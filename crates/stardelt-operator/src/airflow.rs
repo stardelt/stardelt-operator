@@ -22,8 +22,13 @@ use crate::keycloak::IdentitySecret;
 /// Role that lets Airflow read the `Pipeline` and `ServicePrincipal` resources it turns into DAGs.
 pub const PIPELINE_READER_ROLE: &str = "airflow-pipeline-reader";
 /// The ServiceAccounts of the Airflow chart that read them: the DAG processor, which builds the
-/// DAGs, and the worker, which runs the tasks.
-pub const PIPELINE_READERS: [&str; 2] = ["airflow-dag-processor", "airflow-worker"];
+/// DAGs, the worker, which runs the tasks, and the scheduler, which parses the bundle in Airflow 3
+/// (so `airflow dags test` in the scheduler pod works — platform#1170).
+pub const PIPELINE_READERS: [&str; 3] = [
+    "airflow-dag-processor",
+    "airflow-worker",
+    "airflow-scheduler",
+];
 
 fn meta(name: &str, namespace: &str) -> ObjectMeta {
     ObjectMeta {
@@ -519,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn the_binding_names_the_two_airflow_service_accounts_in_the_namespace() {
+    fn the_binding_names_the_three_airflow_service_accounts_in_the_namespace() {
         let binding = pipeline_reader_binding("lab");
         assert_eq!(binding.metadata.namespace.as_deref(), Some("lab"));
         assert_eq!(binding.role_ref.kind, "Role");
@@ -530,7 +535,14 @@ mod tests {
         );
         let subjects = binding.subjects.expect("subjects");
         let names: Vec<_> = subjects.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["airflow-dag-processor", "airflow-worker"]);
+        assert_eq!(
+            names,
+            [
+                "airflow-dag-processor",
+                "airflow-worker",
+                "airflow-scheduler"
+            ]
+        );
         for subject in &subjects {
             assert_eq!(subject.kind, "ServiceAccount");
             assert_eq!(subject.namespace.as_deref(), Some("lab"));
