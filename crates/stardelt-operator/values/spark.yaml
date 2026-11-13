@@ -19,6 +19,11 @@ defaults: |
   spark.kubernetes.driver.label.app.kubernetes.io/name   spark-connect
   spark.kubernetes.executor.label.app.kubernetes.io/name spark-connect
   spark.kubernetes.executor.podNamePrefix                spark-connect-exec
+  # Executors run user code and carry the platform's S3 key; the driver mounts this
+  # file and Spark merges it into every executor pod (platform#1096 question 5).
+  # The path is inside the driver container; `spark.rs` mounts `executor-pod-template.yaml`
+  # from the same ConfigMap there.
+  spark.kubernetes.executor.podTemplateFile /opt/spark/conf/executor-pod-template.yaml
   spark.kubernetes.namespace.labels                      app.kubernetes.io/part-of=stardelt
   spark.sql.extensions                                   org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
   spark.sql.catalog.spark_catalog                        org.apache.iceberg.spark.SparkCatalog

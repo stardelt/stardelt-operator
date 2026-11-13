@@ -31,6 +31,30 @@ use kube::api::ObjectMeta;
 pub const NAME: &str = "spark-connect";
 pub const CONFIG_MAP: &str = "spark-connect-config";
 
+/// The executor pod template (platform#1096 question 5, twin of
+/// stardelt-platform#1171). Spark reads this file on the driver's filesystem when it
+/// creates an executor pod and merges it into the generated pod; the container name is
+/// Spark's default in the pinned image (`spark-kubernetes-executor`), so no
+/// `spark.kubernetes.executor.podTemplateContainerName` is needed.
+pub const EXECUTOR_POD_TEMPLATE: &str = r#"apiVersion: v1
+kind: Pod
+metadata:
+  name: executor-pod-template
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 185
+    fsGroup: 185
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: spark-kubernetes-executor
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+"#;
+
 /// The driver's Prometheus/UI port (stardelt-platform#1158); ClusterIP only.
 pub const METRICS_PORT: i32 = 4040;
 
@@ -168,6 +192,10 @@ pub fn config_map(namespace: &str) -> ConfigMap {
     golden.defaults = golden.defaults.replace("__NAMESPACE__", namespace);
     let mut data = BTreeMap::new();
     data.insert("spark-defaults.conf".to_string(), golden.defaults);
+    data.insert(
+        "executor-pod-template.yaml".to_string(),
+        EXECUTOR_POD_TEMPLATE.to_string(),
+    );
     ConfigMap {
         metadata: meta_with_name_labels(CONFIG_MAP, namespace),
         data: Some(data),
@@ -308,6 +336,13 @@ pub fn deployment(namespace: &str) -> Deployment {
                                 name: "spark-defaults".into(),
                                 mount_path: "/opt/spark/conf/spark-defaults.conf".into(),
                                 sub_path: Some("spark-defaults.conf".into()),
+                                read_only: Some(true),
+                                ..VolumeMount::default()
+                            },
+                            VolumeMount {
+                                name: "spark-defaults".into(),
+                                mount_path: "/opt/spark/conf/executor-pod-template.yaml".into(),
+                                sub_path: Some("executor-pod-template.yaml".into()),
                                 read_only: Some(true),
                                 ..VolumeMount::default()
                             },
@@ -556,6 +591,67 @@ mod tests {
         assert!(conf.contains("spark.ui.enabled                                       true"));
         assert!(conf.contains("spark.ui.prometheus.enabled                            true"));
         assert!(!conf.contains("spark.ui.enabled                                       false"));
+    }
+
+    #[test]
+    fn the_config_map_carries_the_executor_pod_template() {
+        let cm = config_map("stardelt-op");
+        let data = cm.data.expect("data");
+        assert!(data.contains_key("spark-defaults.conf"));
+        let template = data
+            .get("executor-pod-template.yaml")
+            .expect("executor-pod-template.yaml");
+        assert!(template.contains("spark-kubernetes-executor"));
+        assert!(template.contains("runAsNonRoot: true"));
+        assert!(!template.contains("__NAMESPACE__"));
+    }
+
+    #[test]
+    fn the_deployment_mounts_the_executor_pod_template() {
+        let dep = deployment("stardelt");
+        let container = container_of(&dep);
+        let mounts = container.volume_mounts.expect("volume_mounts");
+        let mount = mounts
+            .iter()
+            .find(|m| m.mount_path == "/opt/spark/conf/executor-pod-template.yaml")
+            .expect("the driver mounts the executor pod template");
+        assert_eq!(
+            mount.sub_path.as_deref(),
+            Some("executor-pod-template.yaml")
+        );
+        assert_eq!(mount.read_only, Some(true));
+        assert_eq!(mount.name, "spark-defaults");
+
+        let pod = dep.spec.template.spec.expect("pod spec");
+        let volumes = pod.volumes.expect("volumes");
+        let volume = volumes
+            .iter()
+            .find(|v| v.name == "spark-defaults")
+            .expect("the spark-defaults volume");
+        assert_eq!(volume.config_map.as_ref().unwrap().name, CONFIG_MAP);
+    }
+
+    #[test]
+    fn the_executor_pod_template_declares_the_restricted_fields() {
+        let pod: k8s_openapi::api::core::v1::Pod =
+            serde_yaml::from_str(EXECUTOR_POD_TEMPLATE).expect("valid Pod YAML");
+        let spec = pod.spec.expect("spec");
+        let sc = spec.security_context.expect("pod securityContext");
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(185));
+        assert_eq!(sc.fs_group, Some(185));
+        assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "RuntimeDefault");
+
+        let containers = spec.containers;
+        assert_eq!(containers.len(), 1);
+        let c = &containers[0];
+        assert_eq!(c.name, "spark-kubernetes-executor");
+        let csc = c.security_context.as_ref().unwrap();
+        assert_eq!(csc.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            csc.capabilities.as_ref().unwrap().drop.as_ref().unwrap(),
+            &vec!["ALL".to_string()]
+        );
     }
 
     #[test]
