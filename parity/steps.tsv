@@ -3,6 +3,7 @@ step-preflight	not-planned	-	checks the administrator's shell; the operator repo
 step-reloader	not-planned	-	D-op-3: the operator restarts workloads itself
 step-cnpg	built	cnpg	-
 step-cnpg-cluster	built	ensure_catalog_database	-
+step-barman-cloud-plugin	built	ensure_barman_cloud	-
 step-storage	built	seaweedfs	-
 step-openfga	built	openfga	-
 step-catalog-clients	built	ensure_catalog_principals	-

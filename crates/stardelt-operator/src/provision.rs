@@ -31,7 +31,7 @@ use crate::{
     },
     identity, ingress, kafka, keycloak, network_policy, nova,
     objects::{
-        apply, apply_cluster, apply_dynamic, apply_dynamic_cluster,
+        apply, apply_cluster, apply_dynamic, apply_dynamic_cluster, barman_object_store_resource,
         cert_manager_certificate_resource, cert_manager_issuer_resource, cnpg_cluster_resource,
         cnpg_scheduled_backup_resource, kafka_node_pool_resource, kafka_resource, labels, own,
         owner_reference,
@@ -39,11 +39,12 @@ use crate::{
     pg_dump,
     prerequisites::{
         CATALOG_CLUSTER, DEFAULT_BUCKET, NOVA_CLUSTER, S3_CONFIG_SECRET, S3_SECRET, S3Keys,
-        S3Location, archive_bucket_job, archive_bucket_job_name, archive_cron_job, bootstrap_job,
-        bootstrap_job_name, catalog_cluster, catalog_pg_backup, discovery_config_map,
-        discovery_config_map_name, keycloak_pg_backup, keycloak_pg_cluster, notebooks_bucket_job,
-        notebooks_bucket_job_name, nova_pg_backup, nova_pg_cluster, openfga_pg_backup,
-        openfga_pg_cluster, s3_creds_secret, s3_endpoint, seaweedfs_config_secret,
+        S3Location, archive_bucket_job, archive_bucket_job_name, archive_cron_job,
+        barman_cloud_object_stores, bootstrap_job, bootstrap_job_name, catalog_cluster,
+        catalog_pg_backup, discovery_config_map, discovery_config_map_name, keycloak_pg_backup,
+        keycloak_pg_cluster, notebooks_bucket_job, notebooks_bucket_job_name, nova_pg_backup,
+        nova_pg_cluster, openfga_pg_backup, openfga_pg_cluster, s3_creds_secret, s3_endpoint,
+        seaweedfs_config_secret,
     },
     secrets, spark, superset,
 };
@@ -1031,6 +1032,44 @@ pub async fn ensure_keycloak_pg(
             keycloak_pg_backup(namespace),
         )
         .await,
+    )
+}
+
+/// The four barman-cloud `ObjectStore`s (platform#1234 twin). Applied after the plan, so the
+/// plugin release has created its CRD in the same reconcile. No owner reference: a `Cluster`
+/// that is retained when the instance is deleted (D18) must keep the store it names.
+pub async fn ensure_barman_cloud(ctx: &Context, spec: &PlatformInstanceSpec) -> ComponentStatus {
+    if spec.dry_run {
+        return status(
+            "barman-cloud-backups",
+            false,
+            "planned (dry-run): four ObjectStores",
+        );
+    }
+    for store in barman_cloud_object_stores(&spec.namespace) {
+        if let Err(error) = apply_dynamic(
+            &ctx.client,
+            &spec.namespace,
+            &barman_object_store_resource(),
+            &store,
+            false,
+        )
+        .await
+        {
+            return match error {
+                kube::Error::Api(e) if e.code == 404 => status(
+                    "barman-cloud-backups",
+                    false,
+                    "the barman-cloud plugin is not installed yet: its ObjectStore CRD is missing",
+                ),
+                other => status("barman-cloud-backups", false, other.to_string()),
+            };
+        }
+    }
+    status(
+        "barman-cloud-backups",
+        true,
+        "four ObjectStores applied (no Cluster names one yet)",
     )
 }
 
@@ -3120,6 +3159,29 @@ mod tests {
         let backup: serde_json::Value = serde_json::from_str(&patches[1].2).expect("JSON body");
         assert_eq!(backup["kind"], "ScheduledBackup");
         assert_eq!(backup["spec"]["cluster"]["name"], "keycloak-pg");
+    }
+
+    #[tokio::test]
+    async fn barman_cloud_applies_the_four_object_stores() {
+        let (client, requests) = mock_client(true);
+        let status = ensure_barman_cloud(&context(client), &platform("platform", false)).await;
+        assert_eq!(status.name, "barman-cloud-backups");
+        assert!(status.ready);
+        let requests = requests.lock().expect("requests poisoned");
+        let paths: Vec<_> = requests
+            .iter()
+            .filter(|(method, _, _)| method == "PATCH")
+            .map(|(_, path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/apis/barmancloud.cnpg.io/v1/namespaces/stardelt/objectstores/nova-pg-backups",
+                "/apis/barmancloud.cnpg.io/v1/namespaces/stardelt/objectstores/lakekeeper-pg-backups",
+                "/apis/barmancloud.cnpg.io/v1/namespaces/stardelt/objectstores/openfga-pg-backups",
+                "/apis/barmancloud.cnpg.io/v1/namespaces/stardelt/objectstores/keycloak-pg-backups",
+            ]
+        );
     }
 
     #[tokio::test]

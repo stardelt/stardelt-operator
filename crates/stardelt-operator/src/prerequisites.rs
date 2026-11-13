@@ -289,6 +289,43 @@ pub fn catalog_pg_backup(lakehouse: &str, namespace: &str) -> DynamicObject {
     }
 }
 
+/// The barman-cloud `ObjectStore`s, one per platform database (platform#1234, the operator twin):
+/// the plugin form of each `Cluster`'s backup configuration. The destination path, the credentials
+/// Secret, the gzip settings and the 14-day retention are the same values the native
+/// `barmanObjectStore` blocks carry ([`continuous_backup`]); the plugin writes under
+/// `s3://backups/<cluster>/` as well, so both forms continue the same archive chain. No `Cluster`
+/// names one yet — that is platform#1236, one cluster at a time.
+pub fn barman_cloud_object_stores(namespace: &str) -> Vec<DynamicObject> {
+    ["nova-pg", "lakekeeper-pg", "openfga-pg", "keycloak-pg"]
+        .iter()
+        .map(|cluster| barman_cloud_object_store(namespace, cluster))
+        .collect()
+}
+
+fn barman_cloud_object_store(namespace: &str, cluster: &str) -> DynamicObject {
+    DynamicObject {
+        types: Some(TypeMeta {
+            api_version: "barmancloud.cnpg.io/v1".into(),
+            kind: "ObjectStore".into(),
+        }),
+        metadata: platform_meta(&format!("{cluster}-backups"), namespace, cluster),
+        data: json!({"spec": {
+            "retentionPolicy": "14d",
+            "configuration": {
+                "destinationPath": "s3://backups/",
+                "endpointURL": s3_endpoint(namespace),
+                "s3Credentials": {
+                    "accessKeyId": {"name": S3_SECRET, "key": "access-key"},
+                    "secretAccessKey": {"name": S3_SECRET, "key": "secret-key"},
+                    "region": {"name": S3_SECRET, "key": "region"},
+                },
+                "wal": {"compression": "gzip", "maxParallel": 2},
+                "data": {"compression": "gzip"},
+            },
+        }}),
+    }
+}
+
 /// CloudNative-PG `Cluster` that stores Nova's state (saved queries, settings, the query log).
 pub const NOVA_CLUSTER: &str = "nova-pg";
 
@@ -798,6 +835,8 @@ pub fn bootstrap_job(lakehouse: &str, namespace: &str, name: &str, owner: OwnerR
 
 #[cfg(test)]
 mod tests {
+    use kube::ResourceExt;
+
     use super::*;
 
     fn keys() -> S3Keys {
@@ -1056,6 +1095,44 @@ mod tests {
             keycloak_pg_backup("stardelt").data["spec"]["schedule"],
             nova_pg_backup("stardelt").data["spec"]["schedule"]
         );
+    }
+
+    #[test]
+    fn barman_cloud_object_stores_mirror_the_platform_manifest() {
+        let stores = barman_cloud_object_stores("stardelt");
+        let names: Vec<_> = stores.iter().map(|s| s.name_any()).collect();
+        assert_eq!(
+            names,
+            [
+                "nova-pg-backups",
+                "lakekeeper-pg-backups",
+                "openfga-pg-backups",
+                "keycloak-pg-backups"
+            ]
+        );
+        for store in &stores {
+            assert_eq!(store.types.as_ref().unwrap().kind, "ObjectStore");
+            assert_eq!(
+                store.types.as_ref().unwrap().api_version,
+                "barmancloud.cnpg.io/v1"
+            );
+            let spec = &store.data["spec"];
+            assert_eq!(spec["retentionPolicy"], json!("14d"));
+            assert_eq!(
+                spec["configuration"]["destinationPath"],
+                json!("s3://backups/")
+            );
+            assert_eq!(
+                spec["configuration"]["endpointURL"],
+                json!("http://seaweedfs-s3.stardelt.svc.cluster.local:8333")
+            );
+            assert_eq!(
+                spec["configuration"]["s3Credentials"]["accessKeyId"]["name"],
+                json!(S3_SECRET)
+            );
+            assert_eq!(spec["configuration"]["wal"]["maxParallel"], json!(2));
+            assert_eq!(spec["configuration"]["data"]["compression"], json!("gzip"));
+        }
     }
 
     #[test]
