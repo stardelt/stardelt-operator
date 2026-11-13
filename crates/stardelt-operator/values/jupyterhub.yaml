@@ -115,6 +115,13 @@ proxy:
         cpu: 50m
         memory: 128Mi
 singleuser:
+  # z2jh appends a privileged `block-cloud-metadata` init container (runAsUser 0, NET_ADMIN)
+  # unless this is false, and a `restricted` Pod Security namespace refuses the whole notebook
+  # pod over it. The single-user NetworkPolicy below is deny-by-default and excludes
+  # 169.254.169.254/32, so the metadata endpoint stays unreachable without the container.
+  # Twin: stardelt-platform helm-values/jupyterhub.yaml (platform#1217).
+  cloudMetadata:
+    blockWithIptables: false
   cpu:
     guarantee: 0.1
     limit: 1
