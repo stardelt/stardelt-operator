@@ -1754,7 +1754,7 @@ mod tests {
         let rules = single["networkPolicy"]["egress"]
             .as_array()
             .expect("egress rules");
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 4);
         assert_eq!(
             rules[1]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
             serde_json::json!("spark-connect")
@@ -1765,6 +1765,15 @@ mod tests {
             serde_json::json!("openbao")
         );
         assert_eq!(rules[2]["ports"][0]["port"], serde_json::json!(8200));
+        assert_eq!(
+            single["extraEnv"]["STARDELT_NOVA_API_URL"],
+            serde_json::json!("http://nova.data.svc.cluster.local:8080")
+        );
+        assert_eq!(
+            rules[3]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            serde_json::json!("nova")
+        );
+        assert_eq!(rules[3]["ports"][0]["port"], serde_json::json!(8080));
     }
 
     #[test]

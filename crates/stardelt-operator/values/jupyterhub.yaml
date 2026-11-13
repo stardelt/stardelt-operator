@@ -135,6 +135,12 @@ singleuser:
           name: stardelt-identity
           key: publicUrl
           optional: true
+    # The same Nova by its in-cluster Service, for the notebook's own HTTP calls
+    # (`stardelt.publish()`, `stardelt.api.Client`): a visitor's pod has no public
+    # egress (stardelt-platform#1101), so the public origin above is unreachable from
+    # it (stardelt-platform#1229). The public origin stays — it is also the hub's
+    # `frame-ancestors` origin (`15-framing`). Twin: stardelt-platform#1254.
+    STARDELT_NOVA_API_URL: http://nova.__NAMESPACE__.svc.cluster.local:8080
   image:
     # The digest is a copy of the platform's pin and must be bumped in both repositories; the
     # test `notebook_task_image_matches_the_single_user_image` fails when values/airflow.yaml
@@ -195,4 +201,14 @@ singleuser:
                 app.kubernetes.io/name: openbao
         ports:
           - port: 8200
+            protocol: TCP
+      # Nova's API, in-cluster (stardelt-platform#1229): the public origin is unreachable
+      # from a visitor's pod (platform#1101), so the notebook calls the Service. Same
+      # namespace, so no namespaceSelector.
+      - to:
+          - podSelector:
+              matchLabels:
+                app.kubernetes.io/name: nova
+        ports:
+          - port: 8080
             protocol: TCP
