@@ -5,12 +5,6 @@
 use std::path::Path;
 
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
-use kube::CustomResourceExt;
-
-use stardelt_operator::crd::{
-    Catalog, Connection, IngestionSource, Lakehouse, Pipeline, PlatformInstance, ServicePrincipal,
-    SparkCluster, SqlWarehouse, StreamApp, Volume,
-};
 
 fn main() -> anyhow::Result<()> {
     let dir = Path::new("chart/crds");
@@ -18,94 +12,20 @@ fn main() -> anyhow::Result<()> {
     let schema_dir = Path::new("schemas");
     std::fs::create_dir_all(schema_dir)?;
 
-    let platform_crd = PlatformInstance::crd();
-    write(dir, "stardelt.io_platforminstances.yaml", &platform_crd)?;
-    write_schema(
-        schema_dir,
-        "platforminstance.schema.json",
-        "PlatformInstance",
-        &platform_crd,
-    )?;
-
-    let lakehouse_crd = Lakehouse::crd();
-    write(dir, "stardelt.io_lakehouses.yaml", &lakehouse_crd)?;
-    write_schema(
-        schema_dir,
-        "lakehouse.schema.json",
-        "Lakehouse",
-        &lakehouse_crd,
-    )?;
-
-    let ingestion_crd = IngestionSource::crd();
-    write(dir, "stardelt.io_ingestionsources.yaml", &ingestion_crd)?;
-    write_schema(
-        schema_dir,
-        "ingestionsource.schema.json",
-        "IngestionSource",
-        &ingestion_crd,
-    )?;
-
-    let pipeline_crd = Pipeline::crd();
-    write(dir, "stardelt.io_pipelines.yaml", &pipeline_crd)?;
-    write_schema(
-        schema_dir,
-        "pipeline.schema.json",
-        "Pipeline",
-        &pipeline_crd,
-    )?;
-
-    let connection_crd = Connection::crd();
-    write(dir, "stardelt.io_connections.yaml", &connection_crd)?;
-    write_schema(
-        schema_dir,
-        "connection.schema.json",
-        "Connection",
-        &connection_crd,
-    )?;
-
-    let volume_crd = Volume::crd();
-    write(dir, "stardelt.io_volumes.yaml", &volume_crd)?;
-    write_schema(schema_dir, "volume.schema.json", "Volume", &volume_crd)?;
-
-    let principal_crd = ServicePrincipal::crd();
-    write(dir, "stardelt.io_serviceprincipals.yaml", &principal_crd)?;
-    write_schema(
-        schema_dir,
-        "serviceprincipal.schema.json",
-        "ServicePrincipal",
-        &principal_crd,
-    )?;
-
-    let stream_crd = StreamApp::crd();
-    write(dir, "stardelt.io_streamapps.yaml", &stream_crd)?;
-    write_schema(
-        schema_dir,
-        "streamapp.schema.json",
-        "StreamApp",
-        &stream_crd,
-    )?;
-
-    let catalog_crd = Catalog::crd();
-    write(dir, "stardelt.io_catalogs.yaml", &catalog_crd)?;
-    write_schema(schema_dir, "catalog.schema.json", "Catalog", &catalog_crd)?;
-
-    let warehouse_crd = SqlWarehouse::crd();
-    write(dir, "stardelt.io_sqlwarehouses.yaml", &warehouse_crd)?;
-    write_schema(
-        schema_dir,
-        "sqlwarehouse.schema.json",
-        "SqlWarehouse",
-        &warehouse_crd,
-    )?;
-
-    let spark_crd = SparkCluster::crd();
-    write(dir, "stardelt.io_sparkclusters.yaml", &spark_crd)?;
-    write_schema(
-        schema_dir,
-        "sparkcluster.schema.json",
-        "SparkCluster",
-        &spark_crd,
-    )?;
+    for crd in stardelt_operator::crd::crd_documents() {
+        let names = crd.spec.names.clone();
+        let singular = names
+            .singular
+            .clone()
+            .expect("a generated CRD carries spec.names.singular");
+        write(dir, &format!("stardelt.io_{}.yaml", names.plural), &crd)?;
+        write_schema(
+            schema_dir,
+            &format!("{singular}.schema.json"),
+            &names.kind,
+            &crd,
+        )?;
+    }
 
     println!(
         "wrote CRDs to {} and schemas to {}",
