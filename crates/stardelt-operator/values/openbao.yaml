@@ -12,6 +12,15 @@ injector:
 csi:
   enabled: false
 server:
+  # Pod Security `restricted` (platform#1096 question 5, twin of platform#1191): the chart's pod
+  # block is already correct (`runAsNonRoot`, uid 100, seccomp); the container declares the two
+  # missing fields. stardelt-platform/helm-values/openbao.yaml carries the same block.
+  statefulSet:
+    securityContext:
+      container:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: ["ALL"]}
+        seccompProfile: {type: RuntimeDefault}
   # The chart puts a checksum of the server config on the pod template only with this flag; without
   # it a changed config (the audit device of D27) would wait for the next restart before taking
   # effect. With it, `make openbao` rolls the pod and the static seal opens it again by itself.

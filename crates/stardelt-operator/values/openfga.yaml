@@ -13,6 +13,18 @@
 # subchart): this install already runs CloudNative-PG and a second Postgres operator is
 # the wrong shape for one node. CNPG creates Secret `openfga-pg-app`; the chart reads the
 # DSN from its `uri` key.
+# Pod Security `restricted` (platform#1096 question 5, twin of platform#1191). The image's own
+# user is 65532 (`docker image inspect openfga/openfga:v1.22.1 --format '{{.Config.User}}'`);
+# `securityContext` is the chart key for the serving container AND the `migrate-database` init
+# container. stardelt-platform/helm-values/openfga.yaml carries the same two blocks.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  seccompProfile: {type: RuntimeDefault}
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: {drop: ["ALL"]}
+  seccompProfile: {type: RuntimeDefault}
 image:
   repository: openfga/openfga
   # Explicit, so a chart bump cannot silently move the application: Lakekeeper 0.12.2

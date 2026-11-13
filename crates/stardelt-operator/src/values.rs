@@ -331,6 +331,29 @@ mod tests {
     }
 
     #[test]
+    fn openfga_golden_values_declare_the_restricted_pod_fields() {
+        // Both keys replace the chart's empty blocks (platform#1191); the id is the image's own
+        // (`docker image inspect openfga/openfga:v1.22.1` → User=65532).
+        let values = effective_values("openfga", Profile::Full, None, None);
+        assert_eq!(
+            values["podSecurityContext"],
+            serde_json::json!({
+                "runAsNonRoot": true,
+                "runAsUser": 65532,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert_eq!(
+            values["securityContext"],
+            serde_json::json!({
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+    }
+
+    #[test]
     fn the_openfga_values_keep_the_platform_shape() {
         // stardelt-platform/helm-values/openfga.yaml carries the same block (#516). This test
         // cannot read the other repository; it only states the shape the two must share.
@@ -1735,5 +1758,19 @@ mod tests {
         assert!(config.contains("unauthenticated_metrics_access = true"));
         assert!(config.contains("prometheus_retention_time = \"30s\""));
         assert_eq!(config.matches("telemetry {").count(), 2);
+    }
+
+    #[test]
+    fn openbao_golden_values_declare_the_restricted_container_fields() {
+        // The chart's pod block is already correct; only the container needed the two fields.
+        let values = effective_values("openbao", Profile::Full, None, None);
+        assert_eq!(
+            values["server"]["statefulSet"]["securityContext"]["container"],
+            serde_json::json!({
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
     }
 }
