@@ -30,7 +30,11 @@ use crate::objects::FIELD_MANAGER;
 pub const JOB_PREFIX: &str = "maint-";
 /// The CLI image (stardelt/stardelt-python#62), pinned by digest: the digest is what runs and
 /// the `:dev` tag is kept for readability only, as in `values/*.yaml`.
-pub const IMAGE: &str = "ghcr.io/stardelt/stardelt-cli:dev@sha256:b1aa1d35b0392061248cf03a5b53ee7621a18c8be1bce227fb2475dd160a8d82";
+///
+/// This is the build of stardelt-python `9360548` (PR #109): `_fetch_token` posts with
+/// `verify=certifi.where()`, so the identity endpoint's public certificate verifies while the
+/// Trino connection keeps `REQUESTS_CA_BUNDLE` (operator#653).
+pub const IMAGE: &str = "ghcr.io/stardelt/stardelt-cli:dev@sha256:cc5b51f213e9a4619dc4d599d378463ccd4b5a71b06fa5a2feb504a3c73a6b27";
 
 pub fn job_name(catalog: &str) -> String {
     format!("{JOB_PREFIX}{catalog}")
