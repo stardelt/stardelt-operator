@@ -400,6 +400,16 @@ mod tests {
             j["hub"]["networkPolicy"]["ingress"][0]["ports"][0]["port"],
             8081
         );
+        assert_eq!(
+            j["hub"]["authenticatePrometheus"],
+            serde_json::json!(false),
+            "the hub serves /hub/metrics without a token; the NetworkPolicy is the gate"
+        );
+        assert_eq!(
+            j["hub"]["networkPolicy"]["ingress"][1]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            serde_json::json!("prometheus"),
+            "only a scraper pod may read the hub's metrics port"
+        );
         assert_eq!(j["cull"]["timeout"].as_i64(), Some(3600));
     }
 
