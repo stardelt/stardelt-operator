@@ -531,6 +531,52 @@ pub fn pipeline_notebook_egress(namespace: &str) -> NetworkPolicy {
     }
 }
 
+/// The public internet for **members'** notebook pods (stardelt-platform#1101). A
+/// public-demo visitor's pod carries `stardelt.io/group.visitors=true` and is not selected,
+/// so it reaches no public address; members' pods are selected and keep the egress the
+/// chart's `nonPrivateIPs` default used to grant everyone. NetworkPolicies only add rights,
+/// so the chart's default is off in `values/jupyterhub.yaml`. Mirrors
+/// stardelt-platform/manifests/notebook-public-egress.yaml.
+pub const NOTEBOOK_PUBLIC_EGRESS_POLICY: &str = "notebook-public-egress";
+
+pub fn notebook_public_egress(namespace: &str) -> NetworkPolicy {
+    NetworkPolicy {
+        metadata: meta(NOTEBOOK_PUBLIC_EGRESS_POLICY, namespace),
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "component".to_string(),
+                    "singleuser-server".to_string(),
+                )])),
+                // Visitors are excluded: only a member's pod carries no visitors label.
+                match_expressions: Some(vec![LabelSelectorRequirement {
+                    key: "stardelt.io/group.visitors".to_string(),
+                    operator: "DoesNotExist".to_string(),
+                    values: None,
+                }]),
+            }),
+            policy_types: Some(vec!["Egress".to_string()]),
+            ingress: None,
+            egress: Some(vec![NetworkPolicyEgressRule {
+                to: Some(vec![NetworkPolicyPeer {
+                    ip_block: Some(IPBlock {
+                        cidr: "0.0.0.0/0".to_string(),
+                        except: Some(vec![
+                            "10.0.0.0/8".to_string(),
+                            "172.16.0.0/12".to_string(),
+                            "192.168.0.0/16".to_string(),
+                            "169.254.0.0/16".to_string(),
+                            "100.64.0.0/10".to_string(),
+                        ]),
+                    }),
+                    ..NetworkPolicyPeer::default()
+                }]),
+                ports: None,
+            }]),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,6 +1139,52 @@ mod tests {
             ]
         );
         assert!(rules[3].ports.is_none());
+    }
+
+    #[test]
+    fn notebook_public_egress_selects_members_only_and_excepts_every_private_range() {
+        let policy = notebook_public_egress("data");
+        // The literal, not the constant: the platform's manifest carries this name.
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("notebook-public-egress")
+        );
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some(NOTEBOOK_PUBLIC_EGRESS_POLICY)
+        );
+        let spec = policy.spec.as_ref().unwrap();
+        assert_eq!(
+            spec.policy_types.as_ref().unwrap(),
+            &vec!["Egress".to_string()]
+        );
+        assert!(spec.ingress.is_none());
+        let selector = spec.pod_selector.as_ref().unwrap();
+        let labels = selector.match_labels.as_ref().unwrap();
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels.get("component").unwrap(), "singleuser-server");
+        let expressions = selector.match_expressions.as_ref().unwrap();
+        assert_eq!(expressions.len(), 1);
+        assert_eq!(expressions[0].key, "stardelt.io/group.visitors");
+        assert_eq!(expressions[0].operator, "DoesNotExist");
+        assert!(expressions[0].values.is_none());
+        let rules = spec.egress.as_ref().unwrap();
+        assert_eq!(rules.len(), 1);
+        let peers = rules[0].to.as_ref().unwrap();
+        assert_eq!(peers.len(), 1);
+        let block = peers[0].ip_block.as_ref().unwrap();
+        assert_eq!(block.cidr, "0.0.0.0/0");
+        assert_eq!(
+            block.except.as_ref().unwrap(),
+            &vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+                "169.254.0.0/16".to_string(),
+                "100.64.0.0/10".to_string(),
+            ]
+        );
+        assert!(rules[0].ports.is_none());
     }
 
     #[test]

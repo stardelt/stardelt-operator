@@ -927,6 +927,34 @@ pub async fn ensure_pipeline_notebook_egress(
     Some(status(NAME, true, "applied: pipeline-notebook-egress"))
 }
 
+/// The public internet for members' notebook pods only (stardelt-platform#1101, twin of the
+/// platform's manifest): a visitor's pod is not selected and reaches no public address.
+pub async fn ensure_notebook_public_egress(
+    ctx: &Context,
+    lh: &Lakehouse,
+    namespace: &str,
+) -> Option<ComponentStatus> {
+    const NAME: &str = "notebook-public-egress";
+    if let Err(e) = apply::<NetworkPolicy>(
+        &ctx.client,
+        namespace,
+        &network_policy::notebook_public_egress(namespace),
+        lh.spec.dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if lh.spec.dry_run {
+        return Some(status(
+            NAME,
+            false,
+            "planned (dry-run): NetworkPolicy notebook-public-egress",
+        ));
+    }
+    Some(status(NAME, true, "applied: notebook-public-egress"))
+}
+
 /// `<lakehouse>-discovery`: the ConfigMap that tells consumers where the catalog, the
 /// object store and Trino are. Published once the warehouse is bootstrapped, with
 /// server-side apply on every reconcile, and owned by the Lakehouse (it is derived
