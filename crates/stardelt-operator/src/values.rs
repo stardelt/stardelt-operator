@@ -1108,6 +1108,29 @@ mod tests {
     }
 
     #[test]
+    fn values_seaweedfs_parity() {
+        // The S3 gateway's memory limit is a measured number, not a guess: a Trino query
+        // reading one 2.89 GB Iceberg table OOM-killed the 1 Gi gateway at ~700 MB read
+        // and died with ICEBERG_CANNOT_OPEN_SPLIT (stardelt-platform#1219). The platform
+        // path carries the same block (helm-values/seaweedfs.yaml); this test cannot read
+        // the other repository, it only states the shape both must share.
+        let s = golden_values("seaweedfs");
+        assert_eq!(s["s3"]["resources"]["limits"]["memory"], "5.5Gi");
+        assert_eq!(s["s3"]["resources"]["requests"]["memory"], "256Mi");
+        assert_eq!(s["s3"]["resources"]["limits"]["cpu"], "2");
+        assert_eq!(s["s3"]["resources"]["requests"]["cpu"], "100m");
+        // Every profile keeps the cap: the profile sizes storage, it does not replace s3.
+        for profile in [Profile::Demo, Profile::Full, Profile::Airgap] {
+            let values = effective_values("seaweedfs", profile, None, None);
+            assert_eq!(
+                values.pointer("/s3/resources/limits/memory"),
+                Some(&serde_json::json!("5.5Gi")),
+                "profile {profile:?} dropped the S3 gateway's memory limit"
+            );
+        }
+    }
+
+    #[test]
     fn the_golden_airflow_values_run_tasks_as_pods_and_name_the_operators_secrets() {
         let values = golden_values("airflow");
         assert_eq!(values["executor"], "KubernetesExecutor");
