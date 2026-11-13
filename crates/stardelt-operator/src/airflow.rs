@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Capabilities, ConfigMap, ConfigMapVolumeSource, Container, EnvVar, EnvVarSource, PodSpec,
-    PodTemplateSpec, ResourceRequirements, SecretKeySelector, SecurityContext, ServiceAccount,
-    Volume, VolumeMount,
+    Capabilities, ConfigMap, ConfigMapVolumeSource, Container, EnvVar, EnvVarSource,
+    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SeccompProfile,
+    SecretKeySelector, SecurityContext, ServiceAccount, Volume, VolumeMount,
 };
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -248,6 +248,15 @@ pub fn group_roles_cron_job(namespace: &str, image: &str) -> CronJob {
                         spec: Some(PodSpec {
                             restart_policy: Some("Never".to_string()),
                             service_account_name: Some(GROUP_ROLES_JOB.to_string()),
+                            security_context: Some(PodSecurityContext {
+                                run_as_non_root: Some(true),
+                                run_as_user: Some(50000),
+                                seccomp_profile: Some(SeccompProfile {
+                                    type_: "RuntimeDefault".into(),
+                                    localhost_profile: None,
+                                }),
+                                ..PodSecurityContext::default()
+                            }),
                             containers: vec![container],
                             volumes: Some(vec![Volume {
                                 name: "scripts".to_string(),
@@ -338,6 +347,34 @@ mod tests {
         };
         assert_eq!(container.image.as_deref(), Some(expected.as_str()));
         assert_eq!(image(), expected);
+    }
+
+    #[test]
+    fn the_group_roles_job_declares_the_restricted_pod_fields() {
+        let job = group_roles_cron_job("stardelt", &image());
+        let pod = job
+            .spec
+            .job_template
+            .spec
+            .as_ref()
+            .unwrap()
+            .template
+            .spec
+            .as_ref()
+            .unwrap();
+        let sc = pod.security_context.as_ref().expect("pod securityContext");
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.run_as_user, Some(50000));
+        assert_eq!(sc.seccomp_profile.as_ref().unwrap().type_, "RuntimeDefault");
+        let csc = pod.containers[0]
+            .security_context
+            .as_ref()
+            .expect("container securityContext");
+        assert_eq!(csc.allow_privilege_escalation, Some(false));
+        assert_eq!(
+            csc.capabilities.as_ref().unwrap().drop.as_ref().unwrap(),
+            &vec!["ALL".to_string()]
+        );
     }
 
     #[test]
