@@ -569,6 +569,30 @@ mod tests {
     }
 
     #[test]
+    fn trino_golden_values_declare_the_restricted_pod_fields() {
+        // Both keys replace the chart's block (platform#1190): the ids and the two container
+        // fields must stay explicit or the render changes uid or loses capabilities.
+        let values = effective_values("trino", Profile::Full, None, None);
+        assert_eq!(
+            values["securityContext"],
+            serde_json::json!({
+                "runAsUser": 1000,
+                "runAsGroup": 1000,
+                "runAsNonRoot": true,
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+        assert_eq!(
+            values["containerSecurityContext"],
+            serde_json::json!({
+                "allowPrivilegeEscalation": false,
+                "capabilities": {"drop": ["ALL"]},
+                "seccompProfile": {"type": "RuntimeDefault"}
+            })
+        );
+    }
+
+    #[test]
     fn trino_golden_values_carry_the_warehouse_catalog() {
         for profile in [Profile::Demo, Profile::Full, Profile::Airgap] {
             let trino = effective_values("trino", profile, None, None);
