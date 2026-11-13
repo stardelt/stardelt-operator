@@ -31,6 +31,10 @@ use kube::api::ObjectMeta;
 pub const NAME: &str = "spark-connect";
 pub const CONFIG_MAP: &str = "spark-connect-config";
 
+/// The ServiceAccount a batch `SparkApplication`'s driver runs as (platform#1208). Never the
+/// Connect executor's `spark-executor`: that one mounts no token and cannot create pods.
+pub const BATCH_DRIVER: &str = "spark-batch-driver";
+
 /// The executor pod template (platform#1096 question 5, twin of
 /// stardelt-platform#1171). Spark reads this file on the driver's filesystem when it
 /// creates an executor pod and merges it into the generated pod; the container name is
@@ -105,6 +109,23 @@ fn meta_with_name_labels(name: &str, namespace: &str) -> ObjectMeta {
     }
 }
 
+/// The metadata of the objects that carry their own name in `app.kubernetes.io/name`, like
+/// [`executor_service_account`]: the batch driver is not the `spark-connect` Deployment.
+fn meta_named_after_itself(name: &str, namespace: &str) -> ObjectMeta {
+    ObjectMeta {
+        name: Some(name.into()),
+        namespace: Some(namespace.into()),
+        labels: Some(BTreeMap::from([
+            ("app.kubernetes.io/name".to_string(), name.to_string()),
+            (
+                "app.kubernetes.io/part-of".to_string(),
+                "stardelt".to_string(),
+            ),
+        ])),
+        ..ObjectMeta::default()
+    }
+}
+
 /// The identity Spark Connect's pod runs as.
 pub fn service_account(namespace: &str) -> ServiceAccount {
     ServiceAccount {
@@ -138,35 +159,42 @@ pub fn executor_service_account(namespace: &str) -> ServiceAccount {
 /// `deletecollection` on ConfigMaps (platform#1121, #1096 slice 3): a client's code runs
 /// in the driver, and those verbs would rewrite or remove another workload's ConfigMap.
 /// The two verbs that remain are bounded to `spark-*-conf-map` by `config_map_guard_policy`.
+///
+/// The same rules serve the batch driver ([`batch_driver_role`]): a `SparkApplication`'s
+/// driver creates executor pods and turns its state into a ConfigMap too.
+fn pod_and_config_map_rules() -> Vec<PolicyRule> {
+    vec![
+        PolicyRule {
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec!["pods".into()]),
+            verbs: vec![
+                "get".into(),
+                "list".into(),
+                "watch".into(),
+                "create".into(),
+                "delete".into(),
+                "deletecollection".into(),
+            ],
+            ..PolicyRule::default()
+        },
+        PolicyRule {
+            api_groups: Some(vec!["".into()]),
+            resources: Some(vec!["configmaps".into()]),
+            verbs: vec![
+                "get".into(),
+                "list".into(),
+                "create".into(),
+                "delete".into(),
+            ],
+            ..PolicyRule::default()
+        },
+    ]
+}
+
 pub fn role(namespace: &str) -> Role {
     Role {
         metadata: meta_with_name_labels(NAME, namespace),
-        rules: Some(vec![
-            PolicyRule {
-                api_groups: Some(vec!["".into()]),
-                resources: Some(vec!["pods".into()]),
-                verbs: vec![
-                    "get".into(),
-                    "list".into(),
-                    "watch".into(),
-                    "create".into(),
-                    "delete".into(),
-                    "deletecollection".into(),
-                ],
-                ..PolicyRule::default()
-            },
-            PolicyRule {
-                api_groups: Some(vec!["".into()]),
-                resources: Some(vec!["configmaps".into()]),
-                verbs: vec![
-                    "get".into(),
-                    "list".into(),
-                    "create".into(),
-                    "delete".into(),
-                ],
-                ..PolicyRule::default()
-            },
-        ]),
+        rules: Some(pod_and_config_map_rules()),
     }
 }
 
@@ -183,6 +211,40 @@ pub fn role_binding(namespace: &str) -> RoleBinding {
             api_group: Some("rbac.authorization.k8s.io".into()),
             kind: "Role".into(),
             name: NAME.into(),
+        },
+    }
+}
+
+/// The identity a batch `SparkApplication`'s driver runs as (platform#1208). It keeps the default
+/// `automountServiceAccountToken`: unlike [`executor_service_account`], the driver creates pods.
+pub fn batch_driver_service_account(namespace: &str) -> ServiceAccount {
+    ServiceAccount {
+        metadata: meta_named_after_itself(BATCH_DRIVER, namespace),
+        ..ServiceAccount::default()
+    }
+}
+
+/// The batch driver's Role: the Connect driver's rules, not a copy, so the two cannot drift.
+pub fn batch_driver_role(namespace: &str) -> Role {
+    Role {
+        metadata: meta_named_after_itself(BATCH_DRIVER, namespace),
+        rules: Some(pod_and_config_map_rules()),
+    }
+}
+
+pub fn batch_driver_role_binding(namespace: &str) -> RoleBinding {
+    RoleBinding {
+        metadata: meta_named_after_itself(BATCH_DRIVER, namespace),
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".into(),
+            name: BATCH_DRIVER.into(),
+            namespace: Some(namespace.into()),
+            ..Subject::default()
+        }]),
+        role_ref: RoleRef {
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            kind: "Role".into(),
+            name: BATCH_DRIVER.into(),
         },
     }
 }
@@ -887,6 +949,39 @@ mod tests {
             assert!(!resources.contains(&"persistentvolumeclaims".to_string()));
             assert!(!rule.verbs.contains(&"update".to_string()));
         }
+    }
+
+    #[test]
+    fn the_batch_driver_has_the_executor_rules_but_keeps_its_token() {
+        let sa = batch_driver_service_account("stardelt");
+        assert_eq!(sa.metadata.name.as_deref(), Some("spark-batch-driver"));
+        assert_eq!(sa.metadata.namespace.as_deref(), Some("stardelt"));
+        let labels = sa.metadata.labels.as_ref().expect("labels");
+        assert_eq!(labels["app.kubernetes.io/name"], "spark-batch-driver");
+        assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
+        assert_eq!(
+            sa.automount_service_account_token, None,
+            "the batch driver creates pods, so it keeps the default and mounts its token"
+        );
+        let batch = batch_driver_role("stardelt");
+        assert_eq!(batch.metadata.name.as_deref(), Some("spark-batch-driver"));
+        assert_eq!(
+            batch.rules,
+            role("stardelt").rules,
+            "the batch driver holds the Connect driver's rules, not a copy of them"
+        );
+    }
+
+    #[test]
+    fn the_batch_driver_binding_names_its_own_service_account() {
+        let binding = batch_driver_role_binding("stardelt");
+        assert_eq!(binding.role_ref.kind, "Role");
+        assert_eq!(binding.role_ref.name, "spark-batch-driver");
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+        assert_eq!(subjects[0].name, "spark-batch-driver");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("stardelt"));
     }
 
     #[test]

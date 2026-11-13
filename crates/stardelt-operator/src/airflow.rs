@@ -30,6 +30,12 @@ pub const PIPELINE_READERS: [&str; 3] = [
     "airflow-scheduler",
 ];
 
+/// Role that lets the Airflow worker submit a batch `SparkApplication` (platform#1208).
+pub const SPARK_SUBMITTER_ROLE: &str = "airflow-spark-submitter";
+/// The one Airflow ServiceAccount that submits: the worker runs the task. The dag-processor
+/// and the scheduler parse the DAG and submit nothing.
+pub const SPARK_SUBMITTER: &str = "airflow-worker";
+
 fn meta(name: &str, namespace: &str) -> ObjectMeta {
     ObjectMeta {
         name: Some(name.into()),
@@ -81,6 +87,44 @@ pub fn pipeline_reader_binding(namespace: &str) -> RoleBinding {
                 })
                 .collect(),
         ),
+    }
+}
+
+/// Submit a batch `SparkApplication` and nothing else (platform#1208). No `update`, no `patch`
+/// and no `sparkapplications/finalizers`: the Spark operator owns those.
+pub fn spark_submitter_role(namespace: &str) -> Role {
+    Role {
+        metadata: meta(SPARK_SUBMITTER_ROLE, namespace),
+        rules: Some(vec![PolicyRule {
+            api_groups: Some(vec!["sparkoperator.k8s.io".into()]),
+            resources: Some(vec!["sparkapplications".into()]),
+            verbs: vec![
+                "create".into(),
+                "get".into(),
+                "list".into(),
+                "watch".into(),
+                "delete".into(),
+            ],
+            ..PolicyRule::default()
+        }]),
+    }
+}
+
+/// The binding of [`spark_submitter_role`] to [`SPARK_SUBMITTER`].
+pub fn spark_submitter_binding(namespace: &str) -> RoleBinding {
+    RoleBinding {
+        metadata: meta(SPARK_SUBMITTER_ROLE, namespace),
+        role_ref: RoleRef {
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            kind: "Role".into(),
+            name: SPARK_SUBMITTER_ROLE.into(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".into(),
+            name: SPARK_SUBMITTER.into(),
+            namespace: Some(namespace.into()),
+            ..Subject::default()
+        }]),
     }
 }
 
@@ -547,6 +591,41 @@ mod tests {
             assert_eq!(subject.kind, "ServiceAccount");
             assert_eq!(subject.namespace.as_deref(), Some("lab"));
         }
+    }
+
+    #[test]
+    fn the_spark_submitter_may_create_and_delete_but_not_change() {
+        let role = spark_submitter_role("stardelt");
+        assert_eq!(
+            role.metadata.name.as_deref(),
+            Some("airflow-spark-submitter")
+        );
+        let rules = role.rules.expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].api_groups,
+            Some(vec!["sparkoperator.k8s.io".to_string()])
+        );
+        assert_eq!(
+            rules[0].resources,
+            Some(vec!["sparkapplications".to_string()])
+        );
+        let verbs = &rules[0].verbs;
+        assert_eq!(verbs, &["create", "get", "list", "watch", "delete"]);
+        assert!(!verbs.contains(&"update".to_string()));
+        assert!(!verbs.contains(&"patch".to_string()));
+    }
+
+    #[test]
+    fn the_spark_submitter_binding_names_the_worker_only() {
+        let binding = spark_submitter_binding("stardelt");
+        assert_eq!(binding.role_ref.kind, "Role");
+        assert_eq!(binding.role_ref.name, "airflow-spark-submitter");
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+        assert_eq!(subjects[0].name, "airflow-worker");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("stardelt"));
     }
 
     #[test]
