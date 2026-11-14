@@ -528,6 +528,10 @@ fn group_list_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::S
     {
         "rule": "!has(self.mcp) || !has(self.mcp.callsPerMinute) || (self.mcp.callsPerMinute >= 1 && self.mcp.callsPerMinute <= 600)",
         "message": "mcp.callsPerMinute is from 1 to 600"
+    },
+    {
+        "rule": "!has(self.mcp) || !has(self.mcp.auditRetentionDays) || (self.mcp.auditRetentionDays >= 0 && self.mcp.auditRetentionDays <= 3650)",
+        "message": "mcp.auditRetentionDays is from 0 to 3650 (0 keeps the rows)"
     }
 ]))]
 pub struct PlatformInstanceSpec {
@@ -628,6 +632,14 @@ pub struct McpSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub calls_per_minute: Option<u32>,
+    /// Days the `mcp_call` audit rows are kept (`NOVA_MCP_AUDIT_RETENTION_DAYS`); 0–3650.
+    /// Empty = Nova's own default (30); `0` keeps the rows and switches the purge off.
+    #[serde(
+        default,
+        rename = "auditRetentionDays",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub audit_retention_days: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -3640,6 +3652,8 @@ mod tests {
         let crd = serde_json::to_string(&PlatformInstance::crd()).unwrap();
         assert!(crd.contains("mcp.callsPerMinute is from 1 to 600"));
         assert!(crd.contains("\"callsPerMinute\""));
+        assert!(crd.contains("mcp.auditRetentionDays is from 0 to 3650 (0 keeps the rows)"));
+        assert!(crd.contains("\"auditRetentionDays\""));
     }
 
     #[test]

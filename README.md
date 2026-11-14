@@ -81,6 +81,9 @@ list accepts every client the audience accepts, and Nova refuses a caller whose 
 `azp` once the list is set.
 `mcp.callsPerMinute` (1–600) renders `NOVA_MCP_CALLS_PER_MINUTE`, the `tools/call`s one person may make per
 minute on `/mcp`; leave it out and Nova uses its own default (60).
+`mcp.auditRetentionDays` (0–3650) renders `NOVA_MCP_AUDIT_RETENTION_DAYS`, the days the stored
+`/mcp` audit rows are kept; leave it out and Nova keeps them 30 days, and `0` keeps them and switches
+the hourly purge off.
 
 ### Secrets
 
