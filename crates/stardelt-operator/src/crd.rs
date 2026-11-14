@@ -568,7 +568,8 @@ pub struct PlatformInstanceSpec {
     /// The customer's Prometheus: the scrape objects, or a condition that says why not.
     #[serde(default)]
     pub monitoring: MonitoringSpec,
-    /// The hosted MCP endpoint (`stardelt-nova#112`, `operator#69` slice 1). Off by default.
+    /// The hosted MCP endpoint on Nova: whether it answers, the audience its tokens carry, the
+    /// row cap and timeout of `sql_read`, and the client ids allowed to call it. Off by default.
     #[serde(default)]
     pub mcp: McpSpec,
 }
