@@ -55,6 +55,7 @@ spec:
   pillars: { notebooks: true }      # adds JupyterHub to the cluster-scoped plan
   namespace: stardelt               # where the platform's own components are installed (default)
   baseDomain: data.example.com      # Nova answers here, every other application on a subdomain
+  mcp: { enabled: false }           # hosted MCP endpoint for AI agents; audience defaults to https://<baseDomain>/mcp
   identity:                         # where users sign in (decision D20)
     mode: external                  # none (default) | platform (Keycloak at id.<baseDomain>) | external
     provider: oidc                  # external only: oidc (default) | entra
@@ -68,6 +69,11 @@ spec:
     adminGroup: stardelt-admins     # default
   dryRun: true                      # plan first; flip to apply
 ```
+
+`spec.mcp` turns on the hosted MCP endpoint on Nova (`POST /mcp`), which AI agents sign in to with
+their own identity; it is off by default. `mcp.enabled: true` renders `NOVA_MCP_ENABLED` and
+`NOVA_MCP_AUDIENCE`, and the audience defaults to `https://<baseDomain>/mcp` — the value the realm
+client `stardelt-mcp` mints — unless `mcp.audience` names another one.
 
 ### Secrets
 

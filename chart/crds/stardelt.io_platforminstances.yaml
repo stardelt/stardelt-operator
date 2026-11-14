@@ -234,6 +234,22 @@ spec:
                   rule: size(self.allowedCidrs) <= 64
                 - message: 'ingress.allowedCidrs: each entry is a CIDR such as 203.0.113.0/24'
                   rule: self.allowedCidrs.all(c, c.matches('^[0-9a-fA-F:.]+/[0-9]{1,3}$'))
+              mcp:
+                default:
+                  enabled: false
+                description: The hosted MCP endpoint (`stardelt-nova#112`, `operator#69` slice 1). Off by default.
+                properties:
+                  audience:
+                    description: |-
+                      The resource identifier tokens must carry. Empty = `https://<baseDomain>/mcp`, the
+                      value the realm client `stardelt-mcp`'s `aud-mcp` mapper mints.
+                    nullable: true
+                    type: string
+                  enabled:
+                    default: false
+                    description: Render `NOVA_MCP_ENABLED`/`NOVA_MCP_AUDIENCE` into Nova. Off by default.
+                    type: boolean
+                type: object
               monitoring:
                 default:
                   enabled: false
@@ -436,6 +452,8 @@ spec:
               rule: '!has(self.secrets) || !has(self.secrets.groups) || self.secrets.groups.all(g, g.matches(''^[a-z0-9]([-a-z0-9]{0,38}[a-z0-9])?$''))'
             - message: secrets.groups is only allowed with secrets.mode platform
               rule: '!has(self.secrets) || !has(self.secrets.groups) || size(self.secrets.groups) == 0 || (has(self.secrets.mode) && self.secrets.mode == ''platform'')'
+            - message: mcp.enabled needs baseDomain (the default audience is https://<baseDomain>/mcp) or an explicit mcp.audience
+              rule: '!has(self.mcp) || !has(self.mcp.enabled) || !self.mcp.enabled || has(self.baseDomain) || (has(self.mcp.audience) && self.mcp.audience.size() > 0)'
           status:
             nullable: true
             properties:

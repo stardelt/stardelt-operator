@@ -512,6 +512,10 @@ fn group_list_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::S
     {
         "rule": "!has(self.secrets) || !has(self.secrets.groups) || size(self.secrets.groups) == 0 || (has(self.secrets.mode) && self.secrets.mode == 'platform')",
         "message": "secrets.groups is only allowed with secrets.mode platform"
+    },
+    {
+        "rule": "!has(self.mcp) || !has(self.mcp.enabled) || !self.mcp.enabled || has(self.baseDomain) || (has(self.mcp.audience) && self.mcp.audience.size() > 0)",
+        "message": "mcp.enabled needs baseDomain (the default audience is https://<baseDomain>/mcp) or an explicit mcp.audience"
     }
 ]))]
 pub struct PlatformInstanceSpec {
@@ -556,6 +560,9 @@ pub struct PlatformInstanceSpec {
     /// The customer's Prometheus: the scrape objects, or a condition that says why not.
     #[serde(default)]
     pub monitoring: MonitoringSpec,
+    /// The hosted MCP endpoint (`stardelt-nova#112`, `operator#69` slice 1). Off by default.
+    #[serde(default)]
+    pub mcp: McpSpec,
 }
 
 /// The customer's Prometheus (operator#607, decision of 2026-11-12T20:27Z).
@@ -570,6 +577,18 @@ pub struct MonitoringSpec {
     /// (for example `release: kube-prometheus-stack`).
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+}
+
+/// The hosted MCP endpoint: `POST /mcp` on Nova, validated against `NOVA_MCP_AUDIENCE`.
+#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+pub struct McpSpec {
+    /// Render `NOVA_MCP_ENABLED`/`NOVA_MCP_AUDIENCE` into Nova. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The resource identifier tokens must carry. Empty = `https://<baseDomain>/mcp`, the
+    /// value the realm client `stardelt-mcp`'s `aud-mcp` mapper mints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -3545,6 +3564,39 @@ mod tests {
         assert!(crd.contains("ingress.allowedCidrs: at most 64 entries"));
         assert!(crd.contains("ingress.allowedCidrs: each entry is a CIDR such as 203.0.113.0/24"));
         assert!(crd.contains("\"allowedCidrs\""));
+    }
+
+    /// `spec.mcp` is off by default and its CEL rule refuses "enabled without an audience".
+    #[test]
+    fn mcp_defaults_to_disabled() {
+        let pi: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {}
+        }))
+        .expect("deserialize PlatformInstance");
+        let spec = pi.spec;
+        assert!(!spec.mcp.enabled);
+        assert!(spec.mcp.audience.is_none());
+
+        let on: PlatformInstance = serde_json::from_value(serde_json::json!({
+            "apiVersion": "stardelt.io/v1alpha1",
+            "kind": "PlatformInstance",
+            "metadata": { "name": "cluster" },
+            "spec": {
+                "mcp": {
+                    "enabled": true,
+                    "audience": "https://data.example.com/mcp"
+                }
+            }
+        }))
+        .expect("deserialize PlatformInstance");
+        assert!(on.spec.mcp.enabled);
+        assert_eq!(
+            on.spec.mcp.audience.as_deref(),
+            Some("https://data.example.com/mcp")
+        );
     }
 
     #[test]

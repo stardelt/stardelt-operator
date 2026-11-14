@@ -333,6 +333,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert!(!without.pillars.notebooks, "notebooks stay opt-in");
         assert_eq!(
@@ -367,6 +368,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert_eq!(names(&plan_platform(&base)), vec!["cnpg", "barman-cloud"]);
     }
@@ -385,6 +387,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         let plan_external = plan_platform(&PlatformInstanceSpec {
             secrets: SecretsSpec {
@@ -464,6 +467,7 @@ mod tests {
             },
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert_eq!(
             names(&plan_platform(&base)),
@@ -489,6 +493,7 @@ mod tests {
             },
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert_eq!(
             names(&plan_platform(&base)),
@@ -519,6 +524,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert!(!base.pillars.pipelines, "pipelines stay opt-in");
         let plan = plan_platform(&PlatformInstanceSpec {
@@ -567,6 +573,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert!(!base.pillars.dashboards, "dashboards stay opt-in");
         let plan = plan_platform(&PlatformInstanceSpec {
@@ -609,6 +616,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         let plan = plan_platform(&with);
         let kafka = plan
@@ -658,6 +666,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         };
         assert_eq!(names(&plan_platform(&pi)), vec!["cnpg", "barman-cloud"]);
         // It must not leak into a per-Lakehouse plan.
@@ -701,6 +710,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
             .into_iter()
@@ -730,6 +740,7 @@ mod tests {
             secrets: Default::default(),
             ingress: Default::default(),
             monitoring: Default::default(),
+            mcp: Default::default(),
         });
         for c in plan_lakehouse(&spec(CatalogImpl::Lakekeeper, StorageImpl::Seaweedfs))
             .into_iter()

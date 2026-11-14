@@ -2431,6 +2431,7 @@ pub async fn ensure_nova(
         NOVA_IMAGE,
         spec.base_domain.as_deref(),
         spec.pillars.pipelines,
+        &spec.mcp,
     );
     let applied =
         match apply_owned::<Deployment>(client, namespace, owner, &deployment, dry_run).await {

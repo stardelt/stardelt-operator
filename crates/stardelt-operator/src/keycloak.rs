@@ -585,6 +585,43 @@ mod tests {
         );
     }
 
+    /// `stardelt-mcp` is the client MCP agents sign in with (operator#69 slice 1): public, PKCE
+    /// and device grant, and its `aud-mcp` mapper mints the audience Nova's `/mcp` validates.
+    #[test]
+    fn the_realm_creates_the_mcp_client() {
+        let realm = realm_config_map(&spec(Some("data.example.com")))
+            .expect("a ConfigMap")
+            .data
+            .expect("data")
+            .remove("stardelt-realm.json")
+            .expect("the realm");
+        let parsed: serde_json::Value = serde_json::from_str(&realm).expect("the realm is JSON");
+        let client = parsed["clients"]
+            .as_array()
+            .expect("clients")
+            .iter()
+            .find(|c| c["clientId"] == "stardelt-mcp")
+            .expect("the realm has no stardelt-mcp client");
+        assert_eq!(client["publicClient"].as_bool(), Some(true));
+        assert_eq!(
+            client["attributes"]["oauth2.device.authorization.grant.enabled"],
+            "true"
+        );
+        let mappers = client["protocolMappers"].as_array().expect("mappers");
+        let mapper = |name: &str| {
+            mappers
+                .iter()
+                .find(|m| m["name"] == name)
+                .unwrap_or_else(|| panic!("the client has no {name} mapper"))
+        };
+        assert_eq!(
+            mapper("aud-mcp")["config"]["included.custom.audience"],
+            "https://data.example.com/mcp"
+        );
+        mapper("aud-trino");
+        mapper("groups");
+    }
+
     #[test]
     fn the_realm_follows_the_base_domain_and_needs_one() {
         let realm = realm_config_map(&spec(Some("lab.example.org")))
