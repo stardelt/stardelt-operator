@@ -269,6 +269,13 @@
               "nullable": true,
               "type": "string"
             },
+            "auditRetentionDays": {
+              "description": "Days the `mcp_call` audit rows are kept (`NOVA_MCP_AUDIT_RETENTION_DAYS`); 0–3650.\nEmpty = Nova's own default (30); `0` keeps the rows and switches the purge off.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "nullable": true,
+              "type": "integer"
+            },
             "callsPerMinute": {
               "description": "`tools/call`s one person may make per minute on `/mcp`; 1–600. Empty = Nova's own default (60).",
               "format": "uint32",
@@ -555,6 +562,10 @@
         {
           "message": "mcp.callsPerMinute is from 1 to 600",
           "rule": "!has(self.mcp) || !has(self.mcp.callsPerMinute) || (self.mcp.callsPerMinute >= 1 && self.mcp.callsPerMinute <= 600)"
+        },
+        {
+          "message": "mcp.auditRetentionDays is from 0 to 3650 (0 keeps the rows)",
+          "rule": "!has(self.mcp) || !has(self.mcp.auditRetentionDays) || (self.mcp.auditRetentionDays >= 0 && self.mcp.auditRetentionDays <= 3650)"
         }
       ]
     },
