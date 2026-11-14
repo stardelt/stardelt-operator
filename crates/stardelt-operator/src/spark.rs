@@ -36,6 +36,11 @@ pub const CONFIG_MAP: &str = "spark-connect-config";
 /// Connect executor's `spark-executor`: that one mounts no token and cannot create pods.
 pub const BATCH_DRIVER: &str = "spark-batch-driver";
 
+/// The StreamApp driver's identity (platform#1210 option B). Only stardelt's own
+/// `stream_job.py` runs in it, which is what makes the `sp-pipeline-*` Secret read on its
+/// executors safe; the shared Connect driver keeps the narrower rule.
+pub const STREAM_DRIVER: &str = "spark-stream-driver";
+
 /// The executor pod template (platform#1096 question 5, twin of
 /// stardelt-platform#1171). Spark reads this file on the driver's filesystem when it
 /// creates an executor pod and merges it into the generated pod; the container name is
@@ -255,6 +260,41 @@ pub fn batch_driver_role_binding(namespace: &str) -> RoleBinding {
             api_group: Some("rbac.authorization.k8s.io".into()),
             kind: "Role".into(),
             name: BATCH_DRIVER.into(),
+        },
+    }
+}
+
+/// The identity a `StreamApp`'s driver runs as (platform#1210 option B): its own, so the
+/// admission policies can tell stardelt's `stream_job.py` apart from user code in the shared
+/// Connect driver. It keeps the default `automountServiceAccountToken`: the driver creates pods.
+pub fn stream_driver_service_account(namespace: &str) -> ServiceAccount {
+    ServiceAccount {
+        metadata: meta_part_of_only(STREAM_DRIVER, namespace),
+        ..ServiceAccount::default()
+    }
+}
+
+/// The stream driver's Role: the same rules as the batch driver's ([`pod_and_config_map_rules`]).
+pub fn stream_driver_role(namespace: &str) -> Role {
+    Role {
+        metadata: meta_part_of_only(STREAM_DRIVER, namespace),
+        rules: Some(pod_and_config_map_rules()),
+    }
+}
+
+pub fn stream_driver_role_binding(namespace: &str) -> RoleBinding {
+    RoleBinding {
+        metadata: meta_part_of_only(STREAM_DRIVER, namespace),
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".into(),
+            name: STREAM_DRIVER.into(),
+            namespace: Some(namespace.into()),
+            ..Subject::default()
+        }]),
+        role_ref: RoleRef {
+            api_group: Some("rbac.authorization.k8s.io".into()),
+            kind: "Role".into(),
+            name: STREAM_DRIVER.into(),
         },
     }
 }
@@ -654,6 +694,9 @@ pub fn service(namespace: &str) -> Service {
 /// namespace cut over from `make install` keeps one policy object.
 pub const POD_GUARD: &str = "spark-connect-executor-pods";
 
+/// Cluster-scoped policy name for StreamApp executor pods.
+pub const STREAM_POD_GUARD: &str = "spark-stream-executor-pods";
+
 pub const CONFIG_MAP_GUARD: &str = "spark-connect-configmaps";
 
 fn validation(expression: &str, message: &str) -> Validation {
@@ -729,6 +772,75 @@ pub fn pod_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
         // k8s-openapi 0.29's `latest` (v1.37), so they are not wrapped in `Some`.
         spec: ValidatingAdmissionPolicyBindingSpec {
             policy_name: POD_GUARD.into(),
+            validation_actions: vec!["Deny".into()],
+            match_resources: Some(MatchResources {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        namespace.to_string(),
+                    )])),
+                    match_expressions: None,
+                }),
+                ..MatchResources::default()
+            }),
+            ..ValidatingAdmissionPolicyBindingSpec::default()
+        },
+    }
+}
+
+/// What a pod created by the StreamApp driver may be (platform#1210 option B): the Connect
+/// policy's allow-list, except that the identity is [`STREAM_DRIVER`] and an executor may read
+/// the stream's own `sp-pipeline-<group>` catalog Secret — its Iceberg client refreshes the
+/// token there. Only stardelt's `stream_job.py` runs as that identity, which is what keeps the
+/// wider rule safe; the shared Connect driver keeps [`pod_guard_policy`]'s narrow one.
+pub fn stream_pod_guard_policy() -> ValidatingAdmissionPolicy {
+    ValidatingAdmissionPolicy {
+        metadata: ObjectMeta {
+            name: Some(STREAM_POD_GUARD.into()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ValidatingAdmissionPolicySpec {
+            failure_policy: Some("Fail".into()),
+            match_constraints: Some(MatchResources {
+                resource_rules: Some(vec![
+                    rule(&["pods"], &["CREATE"]),
+                    rule(&["pods/ephemeralcontainers"], &["UPDATE"]),
+                ]),
+                ..MatchResources::default()
+            }),
+            match_conditions: Some(vec![MatchCondition {
+                name: "created-by-spark-stream-driver".into(),
+                expression: "request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':spark-stream-driver'".into(),
+            }]),
+            validations: Some(vec![
+                validation("object.spec.serviceAccountName == 'spark-executor'", "a pod created by the Spark Connect driver must run as ServiceAccount spark-executor"),
+                validation("!has(object.spec.hostNetwork) || object.spec.hostNetwork == false", "the Spark Connect driver may not create a host-network pod"),
+                validation("!has(object.spec.hostPID) || object.spec.hostPID == false", "the Spark Connect driver may not create a host-PID pod"),
+                validation("!has(object.spec.hostIPC) || object.spec.hostIPC == false", "the Spark Connect driver may not create a host-IPC pod"),
+                validation("!has(object.spec.initContainers) || object.spec.initContainers.size() == 0", "the Spark Connect driver may not create a pod with init containers"),
+                validation("!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0", "the Spark Connect driver may not add an ephemeral container"),
+                validation("object.spec.containers.all(c, c.image.startsWith('ghcr.io/stardelt/spark:'))", "every container a Spark Connect driver creates must use the stardelt Spark image"),
+                validation("object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged != true)", "the Spark Connect driver may not create a privileged container"),
+                validation("object.spec.containers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))", "the Spark Connect driver may not bind a host port"),
+                validation("!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.configMap) || has(v.emptyDir))", "executor pods may mount only configMap and emptyDir volumes (no secret, hostPath, PVC, projected or csi volume)"),
+                validation("object.spec.containers.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == 'stardelt-s3-creds' || e.valueFrom.secretKeyRef.name.startsWith('sp-pipeline-')))", "a StreamApp executor may read only Secret stardelt-s3-creds and sp-pipeline-* (secretKeyRef)"),
+                validation("object.spec.containers.all(c, !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) || e.secretRef.name == 'stardelt-s3-creds' || e.secretRef.name.startsWith('sp-pipeline-')))", "a StreamApp executor may read only Secret stardelt-s3-creds and sp-pipeline-* (envFrom)"),
+            ]),
+            ..ValidatingAdmissionPolicySpec::default()
+        }),
+        status: None,
+    }
+}
+
+/// The stream policy's binding, per namespace like [`pod_guard_binding`].
+pub fn stream_pod_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
+    ValidatingAdmissionPolicyBinding {
+        metadata: ObjectMeta {
+            name: Some(format!("{STREAM_POD_GUARD}-{namespace}")),
+            ..ObjectMeta::default()
+        },
+        spec: ValidatingAdmissionPolicyBindingSpec {
+            policy_name: STREAM_POD_GUARD.into(),
             validation_actions: vec!["Deny".into()],
             match_resources: Some(MatchResources {
                 namespace_selector: Some(LabelSelector {
@@ -1170,6 +1282,95 @@ mod tests {
         assert_eq!(subjects[0].kind, "ServiceAccount");
         assert_eq!(subjects[0].name, "spark-batch-driver");
         assert_eq!(subjects[0].namespace.as_deref(), Some("stardelt"));
+    }
+
+    #[test]
+    fn the_stream_policy_matches_only_the_stream_driver() {
+        let policy = stream_pod_guard_policy();
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("spark-stream-executor-pods")
+        );
+        assert!(policy.metadata.namespace.is_none());
+        let spec = policy.spec.as_ref().expect("spec");
+        let conditions = spec.match_conditions.as_ref().expect("match conditions");
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].name, "created-by-spark-stream-driver");
+        assert!(conditions[0].expression.contains("spark-stream-driver"));
+        assert!(!conditions[0].expression.contains(":spark-connect'"));
+        let expressions: Vec<String> = spec
+            .validations
+            .as_ref()
+            .expect("validations")
+            .iter()
+            .map(|v| v.expression.clone())
+            .collect();
+        let secret_rules: Vec<&String> = expressions
+            .iter()
+            .filter(|e| e.contains("secretKeyRef") || e.contains("secretRef"))
+            .collect();
+        assert_eq!(secret_rules.len(), 2);
+        for rule in secret_rules {
+            assert!(
+                rule.contains("startsWith('sp-pipeline-')"),
+                "a StreamApp executor may read its own catalog Secret: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connect_policy_does_not_allow_catalog_secrets() {
+        let policy = pod_guard_policy();
+        let expressions: Vec<String> = policy
+            .spec
+            .as_ref()
+            .expect("spec")
+            .validations
+            .as_ref()
+            .expect("validations")
+            .iter()
+            .map(|v| v.expression.clone())
+            .collect();
+        for expression in &expressions {
+            assert!(
+                !expression.contains("sp-pipeline-"),
+                "the shared Connect driver must never admit a catalog Secret: {expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stream_driver_has_the_batch_driver_rules() {
+        assert_eq!(
+            stream_driver_role("stardelt").rules,
+            batch_driver_role("stardelt").rules,
+            "the stream driver holds the batch driver's rules, so the two cannot drift"
+        );
+        let sa = stream_driver_service_account("stardelt");
+        assert_eq!(sa.metadata.name.as_deref(), Some("spark-stream-driver"));
+        assert_eq!(sa.metadata.namespace.as_deref(), Some("stardelt"));
+        let labels = sa.metadata.labels.as_ref().expect("labels");
+        assert_eq!(
+            labels.get("app.kubernetes.io/name"),
+            None,
+            "the platform twin carries no name label (D44)"
+        );
+        assert_eq!(labels["app.kubernetes.io/part-of"], "stardelt");
+        assert_eq!(
+            sa.automount_service_account_token, None,
+            "the stream driver creates pods, so it keeps the default and mounts its token"
+        );
+        let binding = stream_driver_role_binding("stardelt");
+        assert_eq!(binding.role_ref.kind, "Role");
+        assert_eq!(binding.role_ref.name, "spark-stream-driver");
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].name, "spark-stream-driver");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("stardelt"));
+        assert_eq!(
+            stream_pod_guard_binding("data").metadata.name.as_deref(),
+            Some("spark-stream-executor-pods-data")
+        );
     }
 
     #[test]

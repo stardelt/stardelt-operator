@@ -674,6 +674,36 @@ pub async fn ensure_spark(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply::<ServiceAccount>(
+        client,
+        namespace,
+        &spark::stream_driver_service_account(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<Role>(
+        client,
+        namespace,
+        &spark::stream_driver_role(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply::<RoleBinding>(
+        client,
+        namespace,
+        &spark::stream_driver_role_binding(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if let Err(e) = apply::<Role>(client, namespace, &spark::role(namespace), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
@@ -754,6 +784,14 @@ pub async fn ensure_spark(
         return Some(status(NAME, false, e.to_string()));
     }
     if let Err(e) = apply_cluster(client, &spark::pod_guard_binding(namespace), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply_cluster(client, &spark::stream_pod_guard_policy(), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) =
+        apply_cluster(client, &spark::stream_pod_guard_binding(namespace), dry_run).await
+    {
         return Some(status(NAME, false, e.to_string()));
     }
     if let Err(e) = apply_cluster(client, &spark::config_map_guard_policy(), dry_run).await {
@@ -5449,6 +5487,9 @@ mod tests {
             "/api/v1/namespaces/data/serviceaccounts/spark-batch-driver",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-batch-driver",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-batch-driver",
+            "/api/v1/namespaces/data/serviceaccounts/spark-stream-driver",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-stream-driver",
+            "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-stream-driver",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/roles/spark-connect",
             "/apis/rbac.authorization.k8s.io/v1/namespaces/data/rolebindings/spark-connect",
             "/api/v1/namespaces/data/configmaps/spark-connect-config",
@@ -5461,6 +5502,8 @@ mod tests {
             "/apis/networking.k8s.io/v1/namespaces/data/networkpolicies/spark-connect-ingress",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-connect-executor-pods",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-connect-executor-pods-data",
+            "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-stream-executor-pods",
+            "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-stream-executor-pods-data",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-connect-configmaps",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-connect-configmaps-data",
             "/apis/apps/v1/namespaces/data/deployments/spark-connect",
