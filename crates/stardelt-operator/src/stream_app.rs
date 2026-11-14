@@ -287,7 +287,10 @@ pub fn spark_application(
                     "coreLimit": "1200m",
                     "memory": "2g",
                     "memoryOverhead": "1g",
-                    "serviceAccount": "spark-connect",
+                    // The platform-authored stream identity (platform#1210 option B): its executors may
+                    // read the stream's own sp-pipeline-<group> catalog Secret, which the shared Connect
+                    // driver must never be able to hand to user code.
+                    "serviceAccount": spark::STREAM_DRIVER,
                     // Pod Security `restricted` (platform#1096 question 5). The image's own uid
                     // is 185, so this declares what already happens; the four fields are what an
                     // enforcing namespace checks.
@@ -2189,9 +2192,17 @@ mod tests {
             TOKEN_URL,
         )
         .expect("ok");
-        // The driver keeps the ServiceAccount that may create executor pods; it is also what
-        // the executor admission policy matches on.
-        assert_eq!(a.data["spec"]["driver"]["serviceAccount"], "spark-connect");
+        // The driver runs as the platform-authored stream identity, not the shared Connect one:
+        // only stardelt's `stream_job.py` runs there, which is what makes the executor's
+        // `sp-pipeline-*` catalog Secret read safe (platform#1210 option B).
+        assert_eq!(
+            a.data["spec"]["driver"]["serviceAccount"],
+            "spark-stream-driver"
+        );
+        assert_ne!(
+            a.data["spec"]["driver"]["serviceAccount"], "spark-connect",
+            "the shared Connect identity must never run user-reachable stream code (#1210)"
+        );
         assert_eq!(
             a.data["spec"]["executor"]["serviceAccount"],
             crate::spark::EXECUTOR
