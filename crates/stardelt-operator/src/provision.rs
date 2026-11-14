@@ -794,6 +794,25 @@ pub async fn ensure_spark(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply_cluster(client, &spark::batch_pod_guard_policy(), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply_cluster(client, &spark::batch_pod_guard_binding(namespace), dry_run).await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply_cluster(client, &spark::batch_config_map_guard_policy(), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply_cluster(
+        client,
+        &spark::batch_config_map_guard_binding(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if let Err(e) = apply_cluster(client, &spark::config_map_guard_policy(), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
