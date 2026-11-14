@@ -524,6 +524,10 @@ fn group_list_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::S
     {
         "rule": "!has(self.mcp) || !has(self.mcp.queryTimeoutSeconds) || (self.mcp.queryTimeoutSeconds >= 1 && self.mcp.queryTimeoutSeconds <= 300)",
         "message": "mcp.queryTimeoutSeconds is from 1 to 300"
+    },
+    {
+        "rule": "!has(self.mcp) || !has(self.mcp.callsPerMinute) || (self.mcp.callsPerMinute >= 1 && self.mcp.callsPerMinute <= 600)",
+        "message": "mcp.callsPerMinute is from 1 to 600"
     }
 ]))]
 pub struct PlatformInstanceSpec {
@@ -617,6 +621,13 @@ pub struct McpSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_clients: Option<Vec<String>>,
+    /// `tools/call`s one person may make per minute on `/mcp`; 1–600. Empty = Nova's own default (60).
+    #[serde(
+        default,
+        rename = "callsPerMinute",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub calls_per_minute: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
@@ -3625,6 +3636,10 @@ mod tests {
             on.spec.mcp.audience.as_deref(),
             Some("https://data.example.com/mcp")
         );
+
+        let crd = serde_json::to_string(&PlatformInstance::crd()).unwrap();
+        assert!(crd.contains("mcp.callsPerMinute is from 1 to 600"));
+        assert!(crd.contains("\"callsPerMinute\""));
     }
 
     #[test]

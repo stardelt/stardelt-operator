@@ -79,6 +79,8 @@ client `stardelt-mcp` mints — unless `mcp.audience` names another one.
 `mcp.allowedClients` (a list of client ids) renders `NOVA_MCP_ALLOWED_CLIENTS`; an empty or absent
 list accepts every client the audience accepts, and Nova refuses a caller whose token carries no
 `azp` once the list is set.
+`mcp.callsPerMinute` (1–600) renders `NOVA_MCP_CALLS_PER_MINUTE`, the `tools/call`s one person may make per
+minute on `/mcp`; leave it out and Nova uses its own default (60).
 
 ### Secrets
 

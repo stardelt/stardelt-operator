@@ -389,6 +389,9 @@ fn env(namespace: &str, base_domain: Option<&str>, airflow: bool, mcp: &McpSpec)
         if let Some(clients) = mcp.allowed_clients.as_ref().filter(|c| !c.is_empty()) {
             env.push(value_env("NOVA_MCP_ALLOWED_CLIENTS", &clients.join(",")));
         }
+        if let Some(calls) = mcp.calls_per_minute {
+            env.push(value_env("NOVA_MCP_CALLS_PER_MINUTE", &calls.to_string()));
+        }
     }
     env
 }
@@ -993,6 +996,7 @@ mod tests {
                 enabled: true,
                 max_rows: Some(500),
                 query_timeout_seconds: Some(30),
+                calls_per_minute: Some(120),
                 ..McpSpec::default()
             },
         ));
@@ -1007,6 +1011,11 @@ mod tests {
             Some("30")
         );
         assert!(!tuned.iter().any(|e| e.name == "NOVA_MCP_ALLOWED_CLIENTS"));
+        assert!(!custom.iter().any(|e| e.name == "NOVA_MCP_CALLS_PER_MINUTE"));
+        assert_eq!(
+            named(&tuned, "NOVA_MCP_CALLS_PER_MINUTE").value.as_deref(),
+            Some("120")
+        );
 
         let limited = env_of(&deployment(
             "stardelt",
