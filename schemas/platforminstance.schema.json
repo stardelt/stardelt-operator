@@ -250,6 +250,25 @@
             }
           ]
         },
+        "mcp": {
+          "default": {
+            "enabled": false
+          },
+          "description": "The hosted MCP endpoint (`stardelt-nova#112`, `operator#69` slice 1). Off by default.",
+          "properties": {
+            "audience": {
+              "description": "The resource identifier tokens must carry. Empty = `https://<baseDomain>/mcp`, the\nvalue the realm client `stardelt-mcp`'s `aud-mcp` mapper mints.",
+              "nullable": true,
+              "type": "string"
+            },
+            "enabled": {
+              "default": false,
+              "description": "Render `NOVA_MCP_ENABLED`/`NOVA_MCP_AUDIENCE` into Nova. Off by default.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
         "monitoring": {
           "default": {
             "enabled": false,
@@ -491,6 +510,10 @@
         {
           "message": "secrets.groups is only allowed with secrets.mode platform",
           "rule": "!has(self.secrets) || !has(self.secrets.groups) || size(self.secrets.groups) == 0 || (has(self.secrets.mode) && self.secrets.mode == 'platform')"
+        },
+        {
+          "message": "mcp.enabled needs baseDomain (the default audience is https://<baseDomain>/mcp) or an explicit mcp.audience",
+          "rule": "!has(self.mcp) || !has(self.mcp.enabled) || !self.mcp.enabled || has(self.baseDomain) || (has(self.mcp.audience) && self.mcp.audience.size() > 0)"
         }
       ]
     },

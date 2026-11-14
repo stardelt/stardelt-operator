@@ -26,6 +26,7 @@ use k8s_openapi::apimachinery::pkg::{
 use kube::api::ObjectMeta;
 
 use crate::{
+    crd::McpSpec,
     keycloak::IdentitySecret,
     prerequisites::{S3_SECRET, WAREHOUSE, s3_endpoint},
 };
@@ -288,7 +289,7 @@ fn identity_env(name: &str, key: &str) -> EnvVar {
 /// the Trino CA, the events token) is optional, so Nova starts without it and runs in
 /// development mode; only the state store and the object-store keys are required. The settings
 /// for the catalog client, the secret store and Airflow arrive with those components.
-fn env(namespace: &str, base_domain: Option<&str>, airflow: bool) -> Vec<EnvVar> {
+fn env(namespace: &str, base_domain: Option<&str>, airflow: bool, mcp: &McpSpec) -> Vec<EnvVar> {
     let mut env = vec![
         identity_env("NOVA_TRINO_URL", "trinoUrl"),
         secret_env("NOVA_TRINO_CA_PEM", "trino-ca", "tls.crt", true),
@@ -366,6 +367,17 @@ fn env(namespace: &str, base_domain: Option<&str>, airflow: bool) -> Vec<EnvVar>
             false,
         ));
     }
+    // The hosted MCP endpoint (operator#69 slice 1). Nothing is rendered when it is off.
+    if mcp.enabled {
+        let audience = mcp
+            .audience
+            .clone()
+            .filter(|a| !a.trim().is_empty())
+            .or_else(|| base_domain.map(|domain| format!("https://{domain}/mcp")))
+            .expect("the CRD rule requires baseDomain or mcp.audience when mcp.enabled");
+        env.push(value_env("NOVA_MCP_ENABLED", "1"));
+        env.push(value_env("NOVA_MCP_AUDIENCE", &audience));
+    }
     env
 }
 
@@ -376,7 +388,13 @@ fn quantities(values: [(&str, &str); 2]) -> std::collections::BTreeMap<String, Q
         .collect()
 }
 
-fn container(image: &str, namespace: &str, base_domain: Option<&str>, airflow: bool) -> Container {
+fn container(
+    image: &str,
+    namespace: &str,
+    base_domain: Option<&str>,
+    airflow: bool,
+    mcp: &McpSpec,
+) -> Container {
     let port = |name: &str, container_port: i32| ContainerPort {
         name: Some(name.into()),
         container_port,
@@ -389,7 +407,7 @@ fn container(image: &str, namespace: &str, base_domain: Option<&str>, airflow: b
         // the registry is unreachable.
         image_pull_policy: Some("IfNotPresent".into()),
         ports: Some(vec![port("http", 8080), port("internal", 8081)]),
-        env: Some(env(namespace, base_domain, airflow)),
+        env: Some(env(namespace, base_domain, airflow, mcp)),
         readiness_probe: Some(Probe {
             http_get: Some(HTTPGetAction {
                 path: Some("/api/health".into()),
@@ -422,12 +440,14 @@ fn container(image: &str, namespace: &str, base_domain: Option<&str>, airflow: b
 /// read-only filesystem. `image` is the reference to run (pinned by digest in a real install);
 /// `base_domain` is the domain the applications are served under, used for the links Nova shows
 /// to the other applications (none when it is `None`). `airflow` adds the three variables that
-/// point Nova at the Airflow of the `pipelines` pillar.
+/// point Nova at the Airflow of the `pipelines` pillar; `mcp` adds the two of the hosted MCP
+/// endpoint when it is enabled.
 pub fn deployment(
     namespace: &str,
     image: &str,
     base_domain: Option<&str>,
     airflow: bool,
+    mcp: &McpSpec,
 ) -> Deployment {
     let mut labels = name_selector();
     labels.extend(part_of());
@@ -464,7 +484,7 @@ pub fn deployment(
                     image_pull_secrets: Some(vec![LocalObjectReference {
                         name: "ghcr-creds".into(),
                     }]),
-                    containers: vec![container(image, namespace, base_domain, airflow)],
+                    containers: vec![container(image, namespace, base_domain, airflow, mcp)],
                     ..PodSpec::default()
                 }),
             },
@@ -658,7 +678,7 @@ mod tests {
 
     #[test]
     fn the_deployment_runs_the_given_image_as_the_nova_service_account() {
-        let deployment = deployment("stardelt", IMAGE, None, false);
+        let deployment = deployment("stardelt", IMAGE, None, false, &McpSpec::default());
         assert_eq!(deployment.metadata.name.as_deref(), Some("nova"));
         assert_eq!(deployment.metadata.namespace.as_deref(), Some("stardelt"));
         let spec = deployment.spec.clone();
@@ -685,7 +705,7 @@ mod tests {
 
     #[test]
     fn the_pod_is_locked_down() {
-        let deployment = deployment("stardelt", IMAGE, None, false);
+        let deployment = deployment("stardelt", IMAGE, None, false, &McpSpec::default());
         let pod = deployment.spec.clone().template.spec.expect("pod");
         let pod_security = pod.security_context.expect("pod security");
         assert_eq!(pod_security.run_as_non_root, Some(true));
@@ -708,7 +728,13 @@ mod tests {
 
     #[test]
     fn the_container_ports_are_the_ones_the_service_targets() {
-        let container = container_of(&deployment("stardelt", IMAGE, None, false));
+        let container = container_of(&deployment(
+            "stardelt",
+            IMAGE,
+            None,
+            false,
+            &McpSpec::default(),
+        ));
         let ports: Vec<_> = container
             .ports
             .expect("ports")
@@ -730,7 +756,13 @@ mod tests {
 
     #[test]
     fn the_environment_is_exactly_the_core_set() {
-        let env = env_of(&deployment("stardelt", IMAGE, None, false));
+        let env = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            None,
+            false,
+            &McpSpec::default(),
+        ));
         let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(
             names,
@@ -766,7 +798,13 @@ mod tests {
 
     #[test]
     fn only_the_state_store_and_the_object_store_keys_are_required() {
-        let env = env_of(&deployment("stardelt", IMAGE, None, false));
+        let env = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            None,
+            false,
+            &McpSpec::default(),
+        ));
         let mut required = Vec::new();
         for var in &env {
             let Some(source) = &var.value_from else {
@@ -793,7 +831,13 @@ mod tests {
 
     #[test]
     fn the_secrets_are_read_from_the_names_the_platform_uses() {
-        let env = env_of(&deployment("stardelt", IMAGE, None, false));
+        let env = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            None,
+            false,
+            &McpSpec::default(),
+        ));
         let secret = |name: &str| {
             let selector = named(&env, name)
                 .value_from
@@ -844,7 +888,7 @@ mod tests {
 
     #[test]
     fn the_addresses_follow_the_namespace() {
-        let env = env_of(&deployment("lab", IMAGE, None, false));
+        let env = env_of(&deployment("lab", IMAGE, None, false, &McpSpec::default()));
         let value = |name: &str| named(&env, name).value.expect(name);
         assert_eq!(
             value("NOVA_LAKEKEEPER_URL"),
@@ -862,13 +906,20 @@ mod tests {
 
     #[test]
     fn the_base_domain_is_set_only_when_given() {
-        let without = env_of(&deployment("stardelt", IMAGE, None, false));
+        let without = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            None,
+            false,
+            &McpSpec::default(),
+        ));
         assert!(without.iter().all(|e| e.name != "NOVA_BASE_DOMAIN"));
         let with = env_of(&deployment(
             "stardelt",
             IMAGE,
             Some("data.example.com"),
             false,
+            &McpSpec::default(),
         ));
         assert_eq!(
             named(&with, "NOVA_BASE_DOMAIN").value.as_deref(),
@@ -878,10 +929,53 @@ mod tests {
     }
 
     #[test]
+    fn mcp_env_is_rendered_only_when_enabled() {
+        let off = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+            &McpSpec::default(),
+        ));
+        assert!(!off.iter().any(|e| e.name.starts_with("NOVA_MCP_")));
+
+        let on = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+            &McpSpec {
+                enabled: true,
+                audience: None,
+            },
+        ));
+        assert_eq!(named(&on, "NOVA_MCP_ENABLED").value.as_deref(), Some("1"));
+        assert_eq!(
+            named(&on, "NOVA_MCP_AUDIENCE").value.as_deref(),
+            Some("https://data.example.com/mcp")
+        );
+
+        let custom = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+            &McpSpec {
+                enabled: true,
+                audience: Some("https://agents.example.com".into()),
+            },
+        ));
+        assert_eq!(
+            named(&custom, "NOVA_MCP_AUDIENCE").value.as_deref(),
+            Some("https://agents.example.com")
+        );
+    }
+
+    #[test]
     fn with_the_pipelines_pillar_nova_gets_the_airflow_address_user_and_password() {
-        let without = env_of(&deployment("lab", IMAGE, None, false));
+        let without = env_of(&deployment("lab", IMAGE, None, false, &McpSpec::default()));
         assert!(without.iter().all(|e| !e.name.starts_with("NOVA_AIRFLOW")));
-        let env = env_of(&deployment("lab", IMAGE, None, true));
+        let env = env_of(&deployment("lab", IMAGE, None, true, &McpSpec::default()));
         let added: Vec<&str> = env
             .iter()
             .map(|e| e.name.as_str())
