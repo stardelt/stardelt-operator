@@ -239,6 +239,15 @@ spec:
                   enabled: false
                 description: The hosted MCP endpoint (`stardelt-nova#112`, `operator#69` slice 1). Off by default.
                 properties:
+                  allowedClients:
+                    description: |-
+                      Client ids (`azp`) allowed to call `/mcp`, comma separated in the Deployment.
+                      Empty = every client the audience accepts. Nova refuses a token without an `azp`
+                      while this list is set.
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
                   audience:
                     description: |-
                       The resource identifier tokens must carry. Empty = `https://<baseDomain>/mcp`, the

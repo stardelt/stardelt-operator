@@ -386,6 +386,9 @@ fn env(namespace: &str, base_domain: Option<&str>, airflow: bool, mcp: &McpSpec)
                 &seconds.to_string(),
             ));
         }
+        if let Some(clients) = mcp.allowed_clients.as_ref().filter(|c| !c.is_empty()) {
+            env.push(value_env("NOVA_MCP_ALLOWED_CLIENTS", &clients.join(",")));
+        }
     }
     env
 }
@@ -1002,6 +1005,23 @@ mod tests {
                 .value
                 .as_deref(),
             Some("30")
+        );
+        assert!(!tuned.iter().any(|e| e.name == "NOVA_MCP_ALLOWED_CLIENTS"));
+
+        let limited = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+            &McpSpec {
+                enabled: true,
+                allowed_clients: Some(vec!["stardelt-mcp".into(), "stardelt-cli".into()]),
+                ..McpSpec::default()
+            },
+        ));
+        assert_eq!(
+            named(&limited, "NOVA_MCP_ALLOWED_CLIENTS").value.as_deref(),
+            Some("stardelt-mcp,stardelt-cli")
         );
     }
 

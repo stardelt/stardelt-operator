@@ -76,6 +76,9 @@ their own identity; it is off by default. `mcp.enabled: true` renders `NOVA_MCP_
 client `stardelt-mcp` mints — unless `mcp.audience` names another one.
 `mcp.maxRows` (1–1000) and `mcp.queryTimeoutSeconds` (1–300) render `NOVA_MCP_MAX_ROWS` and
 `NOVA_MCP_QUERY_TIMEOUT_SECS`; leave either out and Nova uses its own default (200 rows / 60 s).
+`mcp.allowedClients` (a list of client ids) renders `NOVA_MCP_ALLOWED_CLIENTS`; an empty or absent
+list accepts every client the audience accepts, and Nova refuses a caller whose token carries no
+`azp` once the list is set.
 
 ### Secrets
 

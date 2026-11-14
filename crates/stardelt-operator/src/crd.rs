@@ -607,6 +607,15 @@ pub struct McpSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub query_timeout_seconds: Option<u32>,
+    /// Client ids (`azp`) allowed to call `/mcp`, comma separated in the Deployment.
+    /// Empty = every client the audience accepts. Nova refuses a token without an `azp`
+    /// while this list is set.
+    #[serde(
+        default,
+        rename = "allowedClients",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_clients: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
