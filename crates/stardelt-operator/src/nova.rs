@@ -389,6 +389,9 @@ fn env(namespace: &str, base_domain: Option<&str>, airflow: bool, mcp: &McpSpec)
         if let Some(clients) = mcp.allowed_clients.as_ref().filter(|c| !c.is_empty()) {
             env.push(value_env("NOVA_MCP_ALLOWED_CLIENTS", &clients.join(",")));
         }
+        if let Some(groups) = mcp.allowed_groups.as_ref().filter(|g| !g.is_empty()) {
+            env.push(value_env("NOVA_MCP_ALLOWED_GROUPS", &groups.join(",")));
+        }
         if let Some(calls) = mcp.calls_per_minute {
             env.push(value_env("NOVA_MCP_CALLS_PER_MINUTE", &calls.to_string()));
         }
@@ -1050,6 +1053,23 @@ mod tests {
             named(&limited, "NOVA_MCP_ALLOWED_CLIENTS").value.as_deref(),
             Some("stardelt-mcp,stardelt-cli")
         );
+
+        let grouped = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+            &McpSpec {
+                enabled: true,
+                allowed_groups: Some(vec!["agents".into(), "data-eng".into()]),
+                ..McpSpec::default()
+            },
+        ));
+        assert_eq!(
+            named(&grouped, "NOVA_MCP_ALLOWED_GROUPS").value.as_deref(),
+            Some("agents,data-eng")
+        );
+        assert!(!custom.iter().any(|e| e.name == "NOVA_MCP_ALLOWED_GROUPS"));
     }
 
     #[test]

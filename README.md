@@ -79,6 +79,9 @@ client `stardelt-mcp` mints — unless `mcp.audience` names another one.
 `mcp.allowedClients` (a list of client ids) renders `NOVA_MCP_ALLOWED_CLIENTS`; an empty or absent
 list accepts every client the audience accepts, and Nova refuses a caller whose token carries no
 `azp` once the list is set.
+`mcp.allowedGroups` (a list of group names) renders `NOVA_MCP_ALLOWED_GROUPS`; an empty or absent list
+accepts every group the audience accepts, and while the list is set Nova refuses a caller whose token
+names none of the groups.
 `mcp.callsPerMinute` (1–600) renders `NOVA_MCP_CALLS_PER_MINUTE`, the `tools/call`s one person may make per
 minute on `/mcp`; leave it out and Nova uses its own default (60).
 `mcp.auditRetentionDays` (0–3650) renders `NOVA_MCP_AUDIT_RETENTION_DAYS`, the days the stored

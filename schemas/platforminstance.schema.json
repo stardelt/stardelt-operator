@@ -264,6 +264,14 @@
               "nullable": true,
               "type": "array"
             },
+            "allowedGroups": {
+              "description": "Groups (`groups` claim) whose members may call `/mcp`, comma separated in the\nDeployment. Empty = every group the audience accepts. Nova refuses a caller whose\ntoken names none of them while this list is set.",
+              "items": {
+                "type": "string"
+              },
+              "nullable": true,
+              "type": "array"
+            },
             "audience": {
               "description": "The resource identifier tokens must carry. Empty = `https://<baseDomain>/mcp`, the\nvalue the realm client `stardelt-mcp`'s `aud-mcp` mapper mints.",
               "nullable": true,
