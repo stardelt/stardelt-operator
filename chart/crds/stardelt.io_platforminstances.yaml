@@ -256,6 +256,12 @@ spec:
                       value the realm client `stardelt-mcp`'s `aud-mcp` mapper mints.
                     nullable: true
                     type: string
+                  callsPerMinute:
+                    description: '`tools/call`s one person may make per minute on `/mcp`; 1–600. Empty = Nova''s own default (60).'
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   enabled:
                     default: false
                     description: Render `NOVA_MCP_ENABLED`/`NOVA_MCP_AUDIENCE` into Nova. Off by default.
@@ -481,6 +487,8 @@ spec:
               rule: '!has(self.mcp) || !has(self.mcp.maxRows) || (self.mcp.maxRows >= 1 && self.mcp.maxRows <= 1000)'
             - message: mcp.queryTimeoutSeconds is from 1 to 300
               rule: '!has(self.mcp) || !has(self.mcp.queryTimeoutSeconds) || (self.mcp.queryTimeoutSeconds >= 1 && self.mcp.queryTimeoutSeconds <= 300)'
+            - message: mcp.callsPerMinute is from 1 to 600
+              rule: '!has(self.mcp) || !has(self.mcp.callsPerMinute) || (self.mcp.callsPerMinute >= 1 && self.mcp.callsPerMinute <= 600)'
           status:
             nullable: true
             properties:
