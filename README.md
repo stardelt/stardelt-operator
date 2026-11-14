@@ -74,6 +74,8 @@ spec:
 their own identity; it is off by default. `mcp.enabled: true` renders `NOVA_MCP_ENABLED` and
 `NOVA_MCP_AUDIENCE`, and the audience defaults to `https://<baseDomain>/mcp` — the value the realm
 client `stardelt-mcp` mints — unless `mcp.audience` names another one.
+`mcp.maxRows` (1–1000) and `mcp.queryTimeoutSeconds` (1–300) render `NOVA_MCP_MAX_ROWS` and
+`NOVA_MCP_QUERY_TIMEOUT_SECS`; leave either out and Nova uses its own default (200 rows / 60 s).
 
 ### Secrets
 

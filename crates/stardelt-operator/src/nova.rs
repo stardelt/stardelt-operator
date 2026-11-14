@@ -377,6 +377,15 @@ fn env(namespace: &str, base_domain: Option<&str>, airflow: bool, mcp: &McpSpec)
             .expect("the CRD rule requires baseDomain or mcp.audience when mcp.enabled");
         env.push(value_env("NOVA_MCP_ENABLED", "1"));
         env.push(value_env("NOVA_MCP_AUDIENCE", &audience));
+        if let Some(rows) = mcp.max_rows {
+            env.push(value_env("NOVA_MCP_MAX_ROWS", &rows.to_string()));
+        }
+        if let Some(seconds) = mcp.query_timeout_seconds {
+            env.push(value_env(
+                "NOVA_MCP_QUERY_TIMEOUT_SECS",
+                &seconds.to_string(),
+            ));
+        }
     }
     env
 }
@@ -947,6 +956,7 @@ mod tests {
             &McpSpec {
                 enabled: true,
                 audience: None,
+                ..McpSpec::default()
             },
         ));
         assert_eq!(named(&on, "NOVA_MCP_ENABLED").value.as_deref(), Some("1"));
@@ -963,11 +973,35 @@ mod tests {
             &McpSpec {
                 enabled: true,
                 audience: Some("https://agents.example.com".into()),
+                ..McpSpec::default()
             },
         ));
         assert_eq!(
             named(&custom, "NOVA_MCP_AUDIENCE").value.as_deref(),
             Some("https://agents.example.com")
+        );
+
+        let tuned = env_of(&deployment(
+            "stardelt",
+            IMAGE,
+            Some("data.example.com"),
+            false,
+            &McpSpec {
+                enabled: true,
+                max_rows: Some(500),
+                query_timeout_seconds: Some(30),
+                ..McpSpec::default()
+            },
+        ));
+        assert_eq!(
+            named(&tuned, "NOVA_MCP_MAX_ROWS").value.as_deref(),
+            Some("500")
+        );
+        assert_eq!(
+            named(&tuned, "NOVA_MCP_QUERY_TIMEOUT_SECS")
+                .value
+                .as_deref(),
+            Some("30")
         );
     }
 
