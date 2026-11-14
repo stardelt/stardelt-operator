@@ -254,7 +254,7 @@
           "default": {
             "enabled": false
           },
-          "description": "The hosted MCP endpoint (`stardelt-nova#112`, `operator#69` slice 1). Off by default.",
+          "description": "The hosted MCP endpoint on Nova: whether it answers, the audience its tokens carry, the\nrow cap and timeout of `sql_read`, and the client ids allowed to call it. Off by default.",
           "properties": {
             "allowedClients": {
               "description": "Client ids (`azp`) allowed to call `/mcp`, comma separated in the Deployment.\nEmpty = every client the audience accepts. Nova refuses a token without an `azp`\nwhile this list is set.",
