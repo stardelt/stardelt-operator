@@ -699,6 +699,12 @@ pub const STREAM_POD_GUARD: &str = "spark-stream-executor-pods";
 
 pub const CONFIG_MAP_GUARD: &str = "spark-connect-configmaps";
 
+/// The batch path's pod guard (platform#1296 family, D44): a `SparkApplication`'s driver runs the
+/// pipeline's Spark code, so its executor pods may read only `stardelt-s3-creds`.
+pub const BATCH_POD_GUARD: &str = "spark-batch-executor-pods";
+/// The batch path's ConfigMap guard: one `spark-exec-<hash>-conf-map` per application, nothing else.
+pub const BATCH_CONFIG_MAP_GUARD: &str = "spark-batch-configmaps";
+
 fn validation(expression: &str, message: &str) -> Validation {
     Validation {
         expression: expression.into(),
@@ -841,6 +847,127 @@ pub fn stream_pod_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBin
         },
         spec: ValidatingAdmissionPolicyBindingSpec {
             policy_name: STREAM_POD_GUARD.into(),
+            validation_actions: vec!["Deny".into()],
+            match_resources: Some(MatchResources {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        namespace.to_string(),
+                    )])),
+                    match_expressions: None,
+                }),
+                ..MatchResources::default()
+            }),
+            ..ValidatingAdmissionPolicyBindingSpec::default()
+        },
+    }
+}
+
+/// What a pod created by the batch driver may be (platform#1296, D44): [`pod_guard_policy`]'s
+/// allow-list, except that the identity is [`BATCH_DRIVER`]. A `SparkApplication`'s driver runs
+/// the pipeline's Spark code, so the batch identity gets no `sp-pipeline-*` arm: that Secret
+/// belongs to a platform-authored stream job, not to a user's batch code.
+pub fn batch_pod_guard_policy() -> ValidatingAdmissionPolicy {
+    ValidatingAdmissionPolicy {
+        metadata: ObjectMeta {
+            name: Some(BATCH_POD_GUARD.into()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ValidatingAdmissionPolicySpec {
+            failure_policy: Some("Fail".into()),
+            match_constraints: Some(MatchResources {
+                resource_rules: Some(vec![
+                    rule(&["pods"], &["CREATE"]),
+                    rule(&["pods/ephemeralcontainers"], &["UPDATE"]),
+                ]),
+                ..MatchResources::default()
+            }),
+            match_conditions: Some(vec![MatchCondition {
+                name: "created-by-spark-batch-driver".into(),
+                expression: "request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':spark-batch-driver'".into(),
+            }]),
+            validations: Some(vec![
+                validation("object.spec.serviceAccountName == 'spark-executor'", "a pod created by the Spark Connect driver must run as ServiceAccount spark-executor"),
+                validation("!has(object.spec.hostNetwork) || object.spec.hostNetwork == false", "the Spark Connect driver may not create a host-network pod"),
+                validation("!has(object.spec.hostPID) || object.spec.hostPID == false", "the Spark Connect driver may not create a host-PID pod"),
+                validation("!has(object.spec.hostIPC) || object.spec.hostIPC == false", "the Spark Connect driver may not create a host-IPC pod"),
+                validation("!has(object.spec.initContainers) || object.spec.initContainers.size() == 0", "the Spark Connect driver may not create a pod with init containers"),
+                validation("!has(object.spec.ephemeralContainers) || object.spec.ephemeralContainers.size() == 0", "the Spark Connect driver may not add an ephemeral container"),
+                validation("object.spec.containers.all(c, c.image.startsWith('ghcr.io/stardelt/spark:'))", "every container a Spark Connect driver creates must use the stardelt Spark image"),
+                validation("object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.privileged) || c.securityContext.privileged != true)", "the Spark Connect driver may not create a privileged container"),
+                validation("object.spec.containers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))", "the Spark Connect driver may not bind a host port"),
+                validation("!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.configMap) || has(v.emptyDir))", "executor pods may mount only configMap and emptyDir volumes (no secret, hostPath, PVC, projected or csi volume)"),
+                validation("object.spec.containers.all(c, !has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef) || e.valueFrom.secretKeyRef.name == 'stardelt-s3-creds'))", "executor pods may read only Secret stardelt-s3-creds (secretKeyRef)"),
+                validation("object.spec.containers.all(c, !has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef) || e.secretRef.name == 'stardelt-s3-creds'))", "executor pods may read only Secret stardelt-s3-creds (envFrom)"),
+            ]),
+            ..ValidatingAdmissionPolicySpec::default()
+        }),
+        status: None,
+    }
+}
+
+/// The batch policy's binding, per namespace like [`pod_guard_binding`].
+pub fn batch_pod_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
+    ValidatingAdmissionPolicyBinding {
+        metadata: ObjectMeta {
+            name: Some(format!("{BATCH_POD_GUARD}-{namespace}")),
+            ..ObjectMeta::default()
+        },
+        spec: ValidatingAdmissionPolicyBindingSpec {
+            policy_name: BATCH_POD_GUARD.into(),
+            validation_actions: vec!["Deny".into()],
+            match_resources: Some(MatchResources {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        namespace.to_string(),
+                    )])),
+                    match_expressions: None,
+                }),
+                ..MatchResources::default()
+            }),
+            ..ValidatingAdmissionPolicyBindingSpec::default()
+        },
+    }
+}
+
+/// What ConfigMaps the batch driver may create or delete: the batch driver runs the pipeline's
+/// Spark code, so without the name filter it could delete `trino-catalog` or `keycloak-realm`.
+pub fn batch_config_map_guard_policy() -> ValidatingAdmissionPolicy {
+    ValidatingAdmissionPolicy {
+        metadata: ObjectMeta {
+            name: Some(BATCH_CONFIG_MAP_GUARD.into()),
+            ..ObjectMeta::default()
+        },
+        spec: Some(ValidatingAdmissionPolicySpec {
+            failure_policy: Some("Fail".into()),
+            match_constraints: Some(MatchResources {
+                resource_rules: Some(vec![rule(&["configmaps"], &["CREATE", "DELETE"])]),
+                ..MatchResources::default()
+            }),
+            match_conditions: Some(vec![MatchCondition {
+                name: "created-by-spark-batch-driver".into(),
+                expression: "request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':spark-batch-driver'".into(),
+            }]),
+            validations: Some(vec![validation(
+                "request.name.startsWith('spark-') && request.name.endsWith('-conf-map')",
+                "the Spark Connect driver may create or delete only its own spark-*-conf-map ConfigMaps",
+            )]),
+            ..ValidatingAdmissionPolicySpec::default()
+        }),
+        status: None,
+    }
+}
+
+/// The batch ConfigMap policy's binding, per namespace like [`config_map_guard_binding`].
+pub fn batch_config_map_guard_binding(namespace: &str) -> ValidatingAdmissionPolicyBinding {
+    ValidatingAdmissionPolicyBinding {
+        metadata: ObjectMeta {
+            name: Some(format!("{BATCH_CONFIG_MAP_GUARD}-{namespace}")),
+            ..ObjectMeta::default()
+        },
+        spec: ValidatingAdmissionPolicyBindingSpec {
+            policy_name: BATCH_CONFIG_MAP_GUARD.into(),
             validation_actions: vec!["Deny".into()],
             match_resources: Some(MatchResources {
                 namespace_selector: Some(LabelSelector {
@@ -1316,6 +1443,109 @@ mod tests {
                 "a StreamApp executor may read its own catalog Secret: {rule}"
             );
         }
+    }
+
+    #[test]
+    fn the_batch_policy_matches_only_the_batch_driver() {
+        let policy = batch_pod_guard_policy();
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("spark-batch-executor-pods")
+        );
+        assert!(policy.metadata.namespace.is_none());
+        let spec = policy.spec.as_ref().expect("spec");
+        let conditions = spec.match_conditions.as_ref().expect("match conditions");
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].name, "created-by-spark-batch-driver");
+        assert!(conditions[0].expression.contains(":spark-batch-driver'"));
+        assert!(!conditions[0].expression.contains(":spark-connect'"));
+        assert!(!conditions[0].expression.contains(":spark-stream-driver'"));
+        assert_eq!(
+            batch_pod_guard_binding("data").metadata.name.as_deref(),
+            Some("spark-batch-executor-pods-data")
+        );
+        assert_eq!(
+            batch_pod_guard_binding("data").spec.policy_name,
+            "spark-batch-executor-pods"
+        );
+    }
+
+    #[test]
+    fn the_batch_policy_does_not_allow_catalog_secrets() {
+        fn expressions(policy: &ValidatingAdmissionPolicy) -> Vec<String> {
+            policy
+                .spec
+                .as_ref()
+                .expect("spec")
+                .validations
+                .as_ref()
+                .expect("validations")
+                .iter()
+                .map(|v| v.expression.clone())
+                .collect()
+        }
+        fn secret_expressions(policy: &ValidatingAdmissionPolicy) -> Vec<String> {
+            expressions(policy)
+                .into_iter()
+                .filter(|e| e.contains("secretKeyRef") || e.contains("secretRef"))
+                .collect()
+        }
+        let batch = expressions(&batch_pod_guard_policy());
+        let batch_secrets = secret_expressions(&batch_pod_guard_policy());
+        assert_eq!(batch_secrets.len(), 2);
+        assert_eq!(
+            batch_secrets,
+            secret_expressions(&pod_guard_policy()),
+            "the batch driver gets the Connect driver's two Secret rules unchanged"
+        );
+        for expression in &batch {
+            assert!(
+                !expression.contains("startsWith('sp-pipeline-')"),
+                "a batch driver must never admit a catalog Secret: {expression}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_batch_config_map_policy_matches_only_the_batch_driver() {
+        let policy = batch_config_map_guard_policy();
+        assert_eq!(
+            policy.metadata.name.as_deref(),
+            Some("spark-batch-configmaps")
+        );
+        assert!(policy.metadata.namespace.is_none());
+        let spec = policy.spec.as_ref().expect("spec");
+        let conditions = spec.match_conditions.as_ref().expect("match conditions");
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].name, "created-by-spark-batch-driver");
+        assert!(conditions[0].expression.contains(":spark-batch-driver'"));
+        assert!(!conditions[0].expression.contains(":spark-connect'"));
+        assert!(!conditions[0].expression.contains(":spark-stream-driver'"));
+        let validations: Vec<String> = spec
+            .validations
+            .as_ref()
+            .expect("validations")
+            .iter()
+            .map(|v| v.expression.clone())
+            .collect();
+        assert_eq!(
+            validations,
+            vec![
+                "request.name.startsWith('spark-') && request.name.endsWith('-conf-map')"
+                    .to_string()
+            ]
+        );
+        assert_eq!(
+            batch_config_map_guard_binding("data")
+                .metadata
+                .name
+                .as_deref(),
+            Some("spark-batch-configmaps-data")
+        );
+        assert_eq!(
+            batch_config_map_guard_binding("data").spec.policy_name,
+            "spark-batch-configmaps"
+        );
     }
 
     #[test]
