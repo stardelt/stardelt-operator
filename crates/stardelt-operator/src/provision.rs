@@ -794,6 +794,18 @@ pub async fn ensure_spark(
     {
         return Some(status(NAME, false, e.to_string()));
     }
+    if let Err(e) = apply_cluster(client, &spark::stream_config_map_guard_policy(), dry_run).await {
+        return Some(status(NAME, false, e.to_string()));
+    }
+    if let Err(e) = apply_cluster(
+        client,
+        &spark::stream_config_map_guard_binding(namespace),
+        dry_run,
+    )
+    .await
+    {
+        return Some(status(NAME, false, e.to_string()));
+    }
     if let Err(e) = apply_cluster(client, &spark::batch_pod_guard_policy(), dry_run).await {
         return Some(status(NAME, false, e.to_string()));
     }
@@ -5523,6 +5535,8 @@ mod tests {
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-connect-executor-pods-data",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-stream-executor-pods",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-stream-executor-pods-data",
+            "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-stream-configmaps",
+            "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-stream-configmaps-data",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-batch-executor-pods",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicybindings/spark-batch-executor-pods-data",
             "/apis/admissionregistration.k8s.io/v1/validatingadmissionpolicies/spark-batch-configmaps",
