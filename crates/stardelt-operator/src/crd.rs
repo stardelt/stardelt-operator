@@ -516,6 +516,14 @@ fn group_list_schema(_: &mut schemars::generate::SchemaGenerator) -> schemars::S
     {
         "rule": "!has(self.mcp) || !has(self.mcp.enabled) || !self.mcp.enabled || has(self.baseDomain) || (has(self.mcp.audience) && self.mcp.audience.size() > 0)",
         "message": "mcp.enabled needs baseDomain (the default audience is https://<baseDomain>/mcp) or an explicit mcp.audience"
+    },
+    {
+        "rule": "!has(self.mcp) || !has(self.mcp.maxRows) || (self.mcp.maxRows >= 1 && self.mcp.maxRows <= 1000)",
+        "message": "mcp.maxRows is from 1 to 1000"
+    },
+    {
+        "rule": "!has(self.mcp) || !has(self.mcp.queryTimeoutSeconds) || (self.mcp.queryTimeoutSeconds >= 1 && self.mcp.queryTimeoutSeconds <= 300)",
+        "message": "mcp.queryTimeoutSeconds is from 1 to 300"
     }
 ]))]
 pub struct PlatformInstanceSpec {
@@ -589,6 +597,16 @@ pub struct McpSpec {
     /// value the realm client `stardelt-mcp`'s `aud-mcp` mapper mints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audience: Option<String>,
+    /// Rows one `sql_read` call may return; 1–1000. Empty = Nova's own default (200).
+    #[serde(default, rename = "maxRows", skip_serializing_if = "Option::is_none")]
+    pub max_rows: Option<u32>,
+    /// Seconds one `sql_read` call may run before it is cancelled; 1–300. Empty = Nova's own default (60).
+    #[serde(
+        default,
+        rename = "queryTimeoutSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub query_timeout_seconds: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
