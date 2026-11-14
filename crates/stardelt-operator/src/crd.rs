@@ -625,6 +625,15 @@ pub struct McpSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_clients: Option<Vec<String>>,
+    /// Groups (`groups` claim) whose members may call `/mcp`, comma separated in the
+    /// Deployment. Empty = every group the audience accepts. Nova refuses a caller whose
+    /// token names none of them while this list is set.
+    #[serde(
+        default,
+        rename = "allowedGroups",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub allowed_groups: Option<Vec<String>>,
     /// `tools/call`s one person may make per minute on `/mcp`; 1–600. Empty = Nova's own default (60).
     #[serde(
         default,
